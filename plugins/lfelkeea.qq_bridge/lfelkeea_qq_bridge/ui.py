@@ -7,8 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtCore import Qt, QPoint, QTimer, QUrl
+from PySide6.QtGui import QCursor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizeGrip,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -52,7 +53,12 @@ FONT = "Microsoft YaHei UI"
 
 STYLE = f"""
 QDialog {{
+    background: transparent;
+}}
+QFrame#card {{
     background-color: {BG};
+    border: 1px solid {BORDER};
+    border-radius: 14px;
 }}
 QScrollArea {{
     border: none;
@@ -268,15 +274,45 @@ def _line() -> QFrame:
     return line
 
 
+class _DragHeader(QWidget):
+    """无边框窗口的拖动区域。"""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._drag_origin: QPoint | None = None
+        self._window_origin: QPoint | None = None
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = event.globalPosition().toPoint()
+            self._window_origin = self.window().pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_origin is not None and self._window_origin is not None:
+            delta = event.globalPosition().toPoint() - self._drag_origin
+            self.window().move(self._window_origin + delta)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_origin = None
+        self._window_origin = None
+        super().mouseReleaseEvent(event)
+
+
 class QQBridgeDialog(QDialog):
     def __init__(self, service: Any, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.service = service
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("QQ 桥接 · 设置")
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setStyleSheet(STYLE)
-        self.resize(840, 700)
-        self.setMinimumSize(720, 600)
+        self.setMinimumSize(600, 420)
 
         self._build()
         self._load_settings()
@@ -287,14 +323,54 @@ class QQBridgeDialog(QDialog):
         self._timer.timeout.connect(self._refresh_status)
         self._timer.start()
 
+    # ---------- 位置与尺寸 ----------
+
+    def _place(self) -> None:
+        """按当前屏幕可用区域决定大小：不超过屏幕，并整体落在屏幕内。"""
+        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        width = min(900, max(600, area.width() - 80))
+        height = min(760, max(420, area.height() - 80))
+        self.resize(width, height)
+
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            center = parent.frameGeometry().center()
+        else:
+            center = area.center()
+        x = center.x() - width // 2
+        y = center.y() - height // 2
+        x = max(area.left(), min(x, area.right() - width + 1))
+        y = max(area.top(), min(y, area.bottom() - height + 1))
+        self.move(x, y)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not getattr(self, "_placed", False):
+            self._placed = True
+            self._place()
+
     # ---------- 布局 ----------
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 14, 16, 14)
-        outer.setSpacing(10)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(0)
 
-        header = QHBoxLayout()
+        card = QFrame()
+        card.setObjectName("card")
+        outer.addWidget(card)
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
+
+        header = _DragHeader(card)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
         title = QLabel("QQ 桥接")
@@ -304,23 +380,36 @@ class QQBridgeDialog(QDialog):
         title_box.addWidget(subtitle)
         self.state_label = QLabel("")
         self.state_label.setObjectName("state")
-        header.addLayout(title_box, 1)
-        header.addWidget(self.state_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        outer.addLayout(header)
-        outer.addWidget(_line())
+        close_btn = QPushButton("×")
+        close_btn.setObjectName("ghost")
+        close_btn.setFixedSize(26, 26)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ font-size: 16px; color: {MUTED}; background: transparent; border: none; }}"
+            f"QPushButton:hover {{ color: #ffffff; background: {ACCENT}; border-radius: 6px; }}"
+        )
+        close_btn.clicked.connect(self.accept)
+        header_layout.addLayout(title_box, 1)
+        header_layout.addWidget(self.state_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(header)
+        layout.addWidget(_line())
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_connection(), "连接")
-        self.tabs.addTab(self._build_whitelist(), "白名单")
-        self.tabs.addTab(self._build_persona(), "人格")
-        self.tabs.addTab(self._build_memory(), "记忆")
-        self.tabs.addTab(self._build_slang(), "黑话")
-        self.tabs.addTab(self._build_habits(), "习惯")
-        self.tabs.addTab(self._build_qzone(), "QQ 空间")
-        self.tabs.addTab(self._build_voice(), "语音")
-        self.tabs.addTab(self._build_advanced(), "高级")
-        self.tabs.addTab(self._build_diagnostics(), "诊断")
-        outer.addWidget(self.tabs, 1)
+        for builder, label in (
+            (self._build_connection, "连接"),
+            (self._build_whitelist, "白名单"),
+            (self._build_persona, "人格"),
+            (self._build_memory, "记忆"),
+            (self._build_slang, "黑话"),
+            (self._build_habits, "习惯"),
+            (self._build_qzone, "QQ 空间"),
+            (self._build_voice, "语音"),
+            (self._build_advanced, "高级"),
+            (self._build_diagnostics, "诊断"),
+        ):
+            self.tabs.addTab(self._scroll_page(builder()), label)
+        layout.addWidget(self.tabs, 1)
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
@@ -339,7 +428,10 @@ class QQBridgeDialog(QDialog):
         bottom.addWidget(folder_btn)
         bottom.addWidget(apply_btn)
         bottom.addWidget(close_btn)
-        outer.addLayout(bottom)
+        grip = QSizeGrip(card)
+        grip.setFixedSize(14, 14)
+        bottom.addWidget(grip, 0, Qt.AlignmentFlag.AlignBottom)
+        layout.addLayout(bottom)
 
     def _page(self) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
@@ -466,7 +558,7 @@ class QQBridgeDialog(QDialog):
             )
         )
         layout.addStretch(1)
-        return self._scroll_page(page)
+        return page
 
     # ---------- 白名单 ----------
 
@@ -550,8 +642,16 @@ class QQBridgeDialog(QDialog):
     def _build_memory(self) -> QWidget:
         page, layout = self._page()
         layout.addWidget(
-            _hint("长期记忆会随聊天自动积累。可以手动补充重要信息，或删掉不想要的内容。")
+            _hint("长期记忆会随聊天自动积累。可以点“立即整理”手动总结，也可以补充或删除内容。")
         )
+        status_row = QHBoxLayout()
+        self.memory_status = QLabel("")
+        self.memory_status.setObjectName("hint")
+        compact_btn = QPushButton("立即整理")
+        compact_btn.clicked.connect(self._compact_memory)
+        status_row.addWidget(self.memory_status, 1)
+        status_row.addWidget(compact_btn)
+        layout.addLayout(status_row)
         self.memory_list = QListWidget()
         layout.addWidget(self.memory_list, 1)
         row = QHBoxLayout()
@@ -566,9 +666,6 @@ class QQBridgeDialog(QDialog):
         row.addWidget(add_btn)
         row.addWidget(del_btn)
         layout.addLayout(row)
-        self.memory_status = QLabel("")
-        self.memory_status.setObjectName("hint")
-        layout.addWidget(self.memory_status)
         return page
 
     # ---------- 黑话 ----------
@@ -611,7 +708,7 @@ class QQBridgeDialog(QDialog):
     def _build_habits(self) -> QWidget:
         page, layout = self._page()
         layout.addWidget(
-            _hint("这里统计各个会话的消息习惯。插件会根据这些数据调整回复长度和表情概率，只读。")
+            _hint("这里统计各个会话的消息习惯。插件会根据这些数据调整回复长度和表情概率，不需要的会话可以删掉。")
         )
         self.habit_table = QTableWidget(0, 6)
         self.habit_table.setHorizontalHeaderLabels(
@@ -626,11 +723,15 @@ class QQBridgeDialog(QDialog):
         self.habit_table.verticalHeader().setVisible(False)
         self.habit_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.habit_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.habit_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         layout.addWidget(self.habit_table, 1)
         row = QHBoxLayout()
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self._refresh_habits)
+        del_btn = QPushButton("删除选中")
+        del_btn.clicked.connect(self._delete_habit)
         row.addStretch(1)
+        row.addWidget(del_btn)
         row.addWidget(refresh_btn)
         layout.addLayout(row)
         return page
@@ -1150,12 +1251,13 @@ class QQBridgeDialog(QDialog):
         rows = self.service.habit_rows()
         self.habit_table.setRowCount(len(rows))
         for row, item in enumerate(rows):
+            conversation = str(item.get("conversation", ""))
             updated = float(item.get("updated_at", 0) or 0)
             stamp = (
                 time.strftime("%m-%d %H:%M", time.localtime(updated)) if updated else "-"
             )
             values = [
-                str(item.get("conversation", "")),
+                conversation,
                 str(item.get("count", 0)),
                 f"{float(item.get('short_rate', 0)) * 100:.0f}%",
                 str(item.get("question", 0)),
@@ -1163,7 +1265,10 @@ class QQBridgeDialog(QDialog):
                 stamp,
             ]
             for column, value in enumerate(values):
-                self.habit_table.setItem(row, column, QTableWidgetItem(value))
+                cell = QTableWidgetItem(value)
+                if column == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, conversation)
+                self.habit_table.setItem(row, column, cell)
 
     def _refresh_diagnostics(self) -> None:
         self._refresh_status()
@@ -1296,6 +1401,41 @@ class QQBridgeDialog(QDialog):
         self._refresh_memory()
         self._refresh_status()
         self._notify(message)
+
+    def _compact_memory(self) -> None:
+        self.memory_status.setText("正在整理聊天记录…")
+
+        def done(text: str) -> None:
+            self._refresh_memory()
+            self._refresh_slang()
+            self._refresh_status()
+            self._notify(text, not text.startswith("整理失败"))
+
+        self.service.compact_now(done)
+
+    def _delete_habit(self) -> None:
+        row = self.habit_table.currentRow()
+        if row < 0:
+            self._notify("先选中要删除的会话。", False)
+            return
+        cell = self.habit_table.item(row, 0)
+        conversation = str(cell.data(Qt.ItemDataRole.UserRole) or cell.text()) if cell else ""
+        if not conversation:
+            self._notify("没读到会话，刷新后再试。", False)
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除聊天习惯",
+            f"删除 {conversation} 的习惯统计？\n长期记忆和黑话库不受影响。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        message = self.service.remove_habit(conversation)
+        self._refresh_habits()
+        self._refresh_status()
+        self._notify(message, message.startswith("已"))
 
     def _add_slang(self) -> None:
         term = self.slang_term.text().strip()

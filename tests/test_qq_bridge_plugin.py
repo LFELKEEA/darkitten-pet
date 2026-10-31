@@ -287,6 +287,22 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("小明：好耶", prompt)
         self.assertIn("旧词", prompt)
 
+    def test_compaction_salvages_truncated_json(self) -> None:
+        raw = (
+            '{"memories":["主人养了两只猫","主人喜欢冰美式"],'
+            '"slang":[{"term":"好耶","meaning":"赞同"},{"term":"绝了","mean'
+        )
+        memories, slang = analysis.parse_compaction(raw)
+        self.assertEqual(memories, ["主人养了两只猫", "主人喜欢冰美式"])
+        self.assertEqual(slang[0]["term"], "好耶")
+        self.assertTrue(analysis.looks_like_compaction(raw))
+
+    def test_compaction_ignores_prose(self) -> None:
+        memories, slang = analysis.parse_compaction("好的，我已经整理完了。")
+        self.assertEqual(memories, [])
+        self.assertEqual(slang, [])
+        self.assertFalse(analysis.looks_like_compaction("好的，我已经整理完了。"))
+
 
 class CommandTests(unittest.TestCase):
     def test_parse(self) -> None:
@@ -532,6 +548,38 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("好耶", service.store.slang_terms())
         self.assertEqual(len(service.store.inbox()), 3)
 
+    def test_compaction_keeps_inbox_when_reply_is_prose(self) -> None:
+        api, service = self.make_service()
+        for index in range(5):
+            service.store.append_inbox("group:1", "user", f"消息{index}", name="小明")
+        api.reply = "好的，我整理好了。"
+        messages: list[str] = []
+        service._maybe_compact(force=True, callback=messages.append)
+        self.assertFalse(service._compacting)
+        self.assertEqual(len(service.store.inbox()), 5)
+        self.assertTrue(any("没有返回可用的 JSON" in line for line in api.logs))
+        self.assertTrue(messages[-1].startswith("整理失败"))
+
+    def test_compaction_accepts_empty_result(self) -> None:
+        api, service = self.make_service()
+        for index in range(3):
+            service.store.append_inbox("group:1", "user", f"消息{index}")
+        api.reply = '{"memories": [], "slang": []}'
+        service._maybe_compact(force=True)
+        self.assertFalse(service._compacting)
+        self.assertEqual(len(service.store.inbox()), 3)
+        self.assertTrue(any("没有新的可记内容" in line for line in api.logs))
+
+    def test_compaction_retries_transient_error(self) -> None:
+        api, service = self.make_service()
+        for index in range(5):
+            service.store.append_inbox("group:1", "user", f"消息{index}")
+        api.chat_error = "网络连接失败：timed out"
+        service._maybe_compact(force=True)
+        self.assertEqual(len(api.chat_calls), 2)
+        self.assertFalse(service._compacting)
+        self.assertEqual(len(service.store.inbox()), 5)
+
     def test_format_qzone(self) -> None:
         self.assertIn("今天的猫", _format_qzone([{"tid": "1", "content": "今天的猫"}]))
         self.assertIn("没有读到", _format_qzone(None))
@@ -594,6 +642,16 @@ class ServiceTests(unittest.TestCase):
         service.compact_now(messages.append)
         self.assertTrue(messages)
         self.assertIn("太少", messages[-1])
+
+    def test_remove_habit(self) -> None:
+        api, service = self.make_service()
+        service.store.observe("group:1", "在吗")
+        service.store.observe("private:2", "你好")
+        self.assertTrue(service.remove_habit("group:1").startswith("已删除"))
+        self.assertEqual(
+            [row["conversation"] for row in service.habit_rows()], ["private:2"]
+        )
+        self.assertIn("没找到", service.remove_habit("group:1"))
 
     def test_ui_send_and_qzone_guards(self) -> None:
         api, service = self.make_service({"qzone_enabled": False})

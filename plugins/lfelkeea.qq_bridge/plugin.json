@@ -1,7 +1,7 @@
 {
   "id": "lfelkeea.qq_bridge",
   "name": "QQ 桥接（SnowLuma）",
-  "version": "1.4.0",
+  "version": "1.4.2",
   "api_version": 1,
   "entry": "main.py",
   "description": "通过 SnowLuma 把 QQ 私聊和群聊接进桌宠：可视化设置面板、人格卡、长期记忆、黑话库、白名单、习惯化回复、表情、QQ 空间、SnowLuma 自动启停、聊天图片识别和语音包发送。",

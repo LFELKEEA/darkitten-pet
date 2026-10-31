@@ -226,17 +226,17 @@ def compaction_prompt(inbox: Iterable[dict[str, Any]] | None, existing_terms: It
     existing_line = "、".join(existing[:60]) if existing else "（暂无）"
     lines = [
         "下面是一段 QQ 聊天记录。请整理出值得长期记住的信息，以及可能有特殊含义的黑话。",
-        "只输出一个 JSON 对象，不要解释，不要代码块标记。格式：",
-        '{"memories": ["一句话一条，最多 6 条"], "slang": [{"term": "词", "meaning": "含义", "example": "原句"}]}',
+        "只输出一个 JSON 对象，单行，不要解释，不要代码块标记，不要多余文字。格式：",
+        '{"memories": ["一句话一条，最多 4 条"], "slang": [{"term": "词", "meaning": "含义"}]}',
         "规则：",
         "1. memories 只记稳定的事实、偏好、称呼、约定、重要事件；不要记寒暄和一次性内容。",
-        "2. slang 只收 2 到 8 个字、确实有特殊含义或圈内用法的词；普通词、地名、人名不要收。",
-        "3. 没有可整理的内容就返回 {\"memories\": [], \"slang\": []}。",
+        "2. slang 最多 3 条，只收 2 到 8 个字、确实有特殊含义或圈内用法的词；普通词、地名、人名不要收。",
+        "3. 没有可整理的内容就返回 {\"memories\": [], \"slang\": []}，不要写别的。",
         f"4. 已经收录的黑话（不要重复）：{existing_line}",
         "",
         "聊天记录：",
     ]
-    for item in list(inbox or [])[-120:]:
+    for item in list(inbox or [])[-80:]:
         if not isinstance(item, dict):
             continue
         body = _clean(item.get("text"), 240)
@@ -248,13 +248,25 @@ def compaction_prompt(inbox: Iterable[dict[str, Any]] | None, existing_terms: It
 
 
 def parse_compaction(text: str, max_items: int = 6, max_terms: int = 6) -> tuple[list[str], list[dict[str, str]]]:
-    """从模型输出里取出 memories 和 slang，尽量容错。"""
+    """从模型输出里取出 memories 和 slang，尽量容错。
+
+    模型经常加解释、套代码块，或者输出到一半被 max_tokens 截断。
+    这里先用 JSON 解析，失败再按字段名抽取，避免整理结果整个丢掉。
+    """
+    limit_items = max(1, int(max_items))
+    limit_terms = max(1, int(max_terms))
     payload = _extract_json(text)
     memories: list[str] = []
     slang: list[dict[str, str]] = []
 
+    if isinstance(payload, list):
+        payload = {"memories": payload}
     if isinstance(payload, dict):
         raw_memories = payload.get("memories")
+        if raw_memories is None:
+            raw_memories = payload.get("记忆")
+        if isinstance(raw_memories, str):
+            raw_memories = [raw_memories]
         if isinstance(raw_memories, list):
             for item in raw_memories:
                 if isinstance(item, dict):
@@ -264,9 +276,11 @@ def parse_compaction(text: str, max_items: int = 6, max_terms: int = 6) -> tuple
                 clean = _clean(value, 200)
                 if clean and clean not in memories:
                     memories.append(clean)
-                if len(memories) >= max(1, int(max_items)):
+                if len(memories) >= limit_items:
                     break
         raw_slang = payload.get("slang")
+        if raw_slang is None:
+            raw_slang = payload.get("黑话")
         if isinstance(raw_slang, dict):
             raw_slang = [
                 {"term": key, "meaning": value} for key, value in raw_slang.items()
@@ -283,9 +297,107 @@ def parse_compaction(text: str, max_items: int = 6, max_terms: int = 6) -> tuple
                 entry = {"term": term, "meaning": meaning, "example": example}
                 if all(value["term"] != term for value in slang):
                     slang.append(entry)
-                if len(slang) >= max(1, int(max_terms)):
+                if len(slang) >= limit_terms:
                     break
+
+    # JSON 整体解析失败（常见于被截断）时，按字段名抢救能读到的部分。
+    if not memories:
+        memories = _salvage_memories(text, limit_items)
+    if not slang:
+        slang = _salvage_slang(text, limit_terms)
     return memories, slang
+
+
+def looks_like_compaction(text: str) -> bool:
+    """判断模型输出是否包含整理结果的结构，哪怕是空的。"""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    payload = _extract_json(value)
+    if isinstance(payload, dict):
+        return any(key in payload for key in ("memories", "slang", "记忆", "黑话"))
+    if isinstance(payload, list):
+        return True
+    return bool(re.search(r'"(?:memories|slang|记忆|黑话)"\s*:', value))
+
+
+def transient_ai_error(error: str) -> bool:
+    """网络抖动、限流和 5xx 值得重试一次，配置错误之类的重试也没用。"""
+    value = str(error or "").lower()
+    return any(
+        key in value
+        for key in (
+            "超时",
+            "timeout",
+            "网络",
+            "连接失败",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "rate limit",
+            "try again",
+            "temporarily",
+        )
+    )
+
+
+def _salvage_memories(text: str, limit: int) -> list[str]:
+    block = re.search(r'"(?:memories|记忆)"\s*:\s*\[(.*)', str(text or ""), re.S)
+    if block is None:
+        return []
+    chunk = block.group(1)
+    end = chunk.find("]")
+    if end != -1:
+        chunk = chunk[:end]
+    result: list[str] = []
+    for match in re.finditer(r'"((?:[^"\\]|\\.)*)"', chunk):
+        value = _unescape(match.group(1))
+        clean = _clean(value, 200)
+        if clean and clean not in result:
+            result.append(clean)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _salvage_slang(text: str, limit: int) -> list[dict[str, str]]:
+    block = re.search(r'"(?:slang|黑话)"\s*:\s*\[(.*)', str(text or ""), re.S)
+    if block is None:
+        return []
+    chunk = block.group(1)
+    result: list[dict[str, str]] = []
+    # 最后一个对象可能被截断，允许没有右花括号。
+    for match in re.finditer(r'\{([^{}]*)\}?', chunk):
+        body = match.group(1)
+        term = _clean(_field(body, ("term", "word", "词", "术语")), 16)
+        meaning = _clean(_field(body, ("meaning", "desc", "含义", "意思")), 80)
+        example = _clean(_field(body, ("example", "sample", "例句")), 120)
+        if not _valid_term(term, meaning):
+            continue
+        if all(item["term"] != term for item in result):
+            result.append({"term": term, "meaning": meaning, "example": example})
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _field(body: str, names: tuple[str, ...]) -> str:
+    for name in names:
+        match = re.search(
+            r'"' + re.escape(name) + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', body
+        )
+        if match is not None:
+            return _unescape(match.group(1))
+    return ""
+
+
+def _unescape(value: str) -> str:
+    try:
+        return str(json.loads('"' + value + '"'))
+    except ValueError:
+        return value
 
 
 def _valid_term(term: str, meaning: str) -> bool:

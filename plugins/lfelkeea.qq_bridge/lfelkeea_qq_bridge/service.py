@@ -830,6 +830,15 @@ class QQBridgeService(QObject):
         rows.sort(key=lambda item: item["updated_at"], reverse=True)
         return rows[: max(1, int(limit))]
 
+    def remove_habit(self, conversation: str) -> str:
+        key = str(conversation or "").strip()
+        if not key:
+            return "会话为空，没有删除。"
+        if not self.store.remove_habit(key):
+            return "没找到这个会话的习惯数据。"
+        self.store.flush()
+        return f"已删除 {key} 的聊天习惯。"
+
     def log_tail(self, limit: int = 40) -> str:
         path = Path(getattr(self.api.manager, "log_path", ""))
         try:
@@ -1481,13 +1490,19 @@ class QQBridgeService(QObject):
     # ---------- 记忆整理 ----------
 
     def _maybe_compact(self, force: bool = False, callback: Callable[[str], None] | None = None) -> None:
+        def report(text: str) -> None:
+            if callback is None:
+                return
+            try:
+                callback(text)
+            except Exception as exc:
+                self._log(f"整理回调出错：{exc}")
+
         if self._compacting:
-            if callback is not None:
-                callback("已经在整理中了，稍等。")
+            report("已经在整理中了，稍等。")
             return
         if not (self.settings["memory_enabled"] or self.settings["slang_enabled"]):
-            if callback is not None:
-                callback("长期记忆和黑话库都关着，先在“高级”页打开。")
+            report("长期记忆和黑话库都关着，先在“高级”页打开。")
             return
         now = time.time()
         if not force and now < self._compact_cooldown_until:
@@ -1498,68 +1513,101 @@ class QQBridgeService(QObject):
             if force and self._compact_notify:
                 self._reply_local(self._compact_notify, "聊天记录太少，先不用整理。")
                 self._compact_notify = ""
-            if callback is not None:
-                callback("聊天记录太少，先不用整理。")
+            report("聊天记录太少，先不用整理。")
             return
         last = float(self.store.runtime.get("last_compact_at", 0) or 0)
         interval = self.settings["memory_interval_minutes"] * 60
         if not force and now - last < interval:
             return
 
-        batch = inbox[-self.settings["memory_batch_size"] :]
+        # 单次整理的记录不宜太多：模型回复上限有限，输入太长也更容易超时。
+        batch_size = max(3, min(int(self.settings["memory_batch_size"]), 30))
+        batch = inbox[-batch_size:]
         prompt = analysis.compaction_prompt(batch, self.store.slang_terms().keys())
         self._compacting = True
         self._compact_started_at = now
+        attempts = 0
 
-        def on_done(reply: str | None, error: str | None) -> None:
-            self._compacting = False
-            notify = self._compact_notify
-            self._compact_notify = ""
-            if error:
-                self._compact_cooldown_until = time.time() + 300
-                self._log(f"记忆整理失败：{error}")
-                if notify:
-                    self._reply_local(notify, f"整理失败：{error}")
-                if callback is not None:
-                    callback(f"整理失败：{error}")
-                return
-            memories, slang = analysis.parse_compaction(reply or "")
-            for text in memories:
-                self.store.add_memory(text, importance=45, source="auto")
-            for item in slang:
-                self.store.add_slang(
-                    item.get("term", ""),
-                    item.get("meaning", ""),
-                    item.get("example", ""),
-                    source="auto",
-                )
-            self.store.prune_memory(self.settings["memory_max_items"])
-            self.store.prune_slang(self.settings["slang_max_terms"])
-            self.store.clear_inbox(keep=3)
-            self.store.mark_compacted()
-            self.store.flush()
-            self._log(f"记忆整理完成：新增 {len(memories)} 条记忆、{len(slang)} 条黑话。")
-            summary = f"整理完成：新增 {len(memories)} 条记忆、{len(slang)} 条黑话。"
-            if notify:
-                self._reply_local(notify, summary)
-            if callback is not None:
-                callback(summary)
-
-        try:
-            self.api.chat(
-                [
-                    {
-                        "role": "system",
-                        "content": "你是聊天记录整理助手，只输出 JSON，不要输出其他内容。",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                on_done,
-            )
-        except Exception as exc:
+        def fail(reason: str) -> None:
             self._compacting = False
             self._compact_cooldown_until = time.time() + 300
-            self._log(f"发起记忆整理失败：{exc}")
+            self._log(f"记忆整理失败：{reason}")
+            notify = self._compact_notify
+            self._compact_notify = ""
+            if notify:
+                self._reply_local(notify, f"整理失败：{reason}")
+            report(f"整理失败：{reason}")
+
+        def request() -> None:
+            nonlocal attempts
+            attempts += 1
+
+            def on_done(reply: str | None, error: str | None) -> None:
+                if error:
+                    # 网络抖动、限流、5xx 重试一次；输入太长导致的超时也能借此恢复。
+                    if attempts < 2 and analysis.transient_ai_error(error):
+                        self._log(f"记忆整理失败，重试一次：{error}")
+                        request()
+                        return
+                    fail(error)
+                    return
+
+                content = reply or ""
+                memories, slang = analysis.parse_compaction(content)
+                if not memories and not slang and not analysis.looks_like_compaction(content):
+                    # 模型没按 JSON 返回时不能清空聊天记录，否则这批内容就永久丢了。
+                    fail("模型没有返回可用的 JSON，聊天记录已保留，稍后再试")
+                    return
+
+                try:
+                    for text in memories:
+                        self.store.add_memory(text, importance=45, source="auto")
+                    for item in slang:
+                        self.store.add_slang(
+                            item.get("term", ""),
+                            item.get("meaning", ""),
+                            item.get("example", ""),
+                            source="auto",
+                        )
+                    self.store.prune_memory(self.settings["memory_max_items"])
+                    self.store.prune_slang(self.settings["slang_max_terms"])
+                    self.store.clear_inbox(keep=3)
+                    self.store.mark_compacted()
+                    self.store.flush()
+                except Exception as exc:
+                    fail(f"保存整理结果出错：{exc}")
+                    return
+
+                self._compacting = False
+                if memories or slang:
+                    self._log(
+                        f"记忆整理完成：新增 {len(memories)} 条记忆、{len(slang)} 条黑话。"
+                    )
+                    summary = f"整理完成：新增 {len(memories)} 条记忆、{len(slang)} 条黑话。"
+                else:
+                    self._log("记忆整理完成：没有新的可记内容。")
+                    summary = "整理完成：没有新的可记内容。"
+                notify = self._compact_notify
+                self._compact_notify = ""
+                if notify:
+                    self._reply_local(notify, summary)
+                report(summary)
+
+            try:
+                self.api.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": "你是聊天记录整理助手，只输出 JSON，不要输出其他内容。",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    on_done,
+                )
+            except Exception as exc:
+                fail(f"发起请求失败：{exc}")
+
+        request()
 
 
 def _tail_after_first(rest: str) -> str:

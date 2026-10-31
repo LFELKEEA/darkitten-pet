@@ -359,8 +359,9 @@ def prepare_update(
     if not (payload / "_internal").is_dir():
         raise UpdateError("更新包缺少 _internal 目录")
     try:
-        if exe.open("rb").read(2) != b"MZ":
-            raise UpdateError("更新包里的 LFELKEEA.exe 不是有效的 Windows 程序")
+        with exe.open("rb") as handle:
+            if handle.read(2) != b"MZ":
+                raise UpdateError("更新包里的 LFELKEEA.exe 不是有效的 Windows 程序")
     except OSError as exc:
         raise UpdateError(f"读取更新包失败：{exc}") from exc
     packed = _read_packed_version(payload)

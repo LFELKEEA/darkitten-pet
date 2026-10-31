@@ -358,6 +358,17 @@ class JsonStore:
         data = self.habits["conversations"].get(str(conversation or ""))
         return dict(data) if isinstance(data, dict) else _empty_habit()
 
+    def remove_habit(self, conversation: str) -> bool:
+        key = str(conversation or "").strip()
+        if not key:
+            return False
+        conversations = self.habits["conversations"]
+        if key not in conversations:
+            return False
+        del conversations[key]
+        self._dirty.add("habits")
+        return True
+
     # ---------- 运行状态 ----------
 
     def append_recent(
