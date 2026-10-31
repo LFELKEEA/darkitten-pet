@@ -4,6 +4,10 @@
 
 当前源码版本：`1.2.0`。
 
+- 下载安装包：[pet-v1.2.0](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.2.0)
+- 插件库：[lfelkeea.github.io/darkitten-launcher/plugins.html](https://lfelkeea.github.io/darkitten-launcher/plugins.html)
+- 插件源码：[`plugins/`](plugins)（示例插件、专注守护、QQ 桥接）
+
 ## 功能
 
 - 桌面宠物窗口：拖动、置顶、缩放、睡眠、摸头、戳一戳、动作动画。
