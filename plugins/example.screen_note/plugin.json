@@ -1,0 +1,11 @@
+{
+  "id": "example.screen_note",
+  "name": "示例：屏幕观察补充",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.py",
+  "description": "在屏幕观察时补充一条上下文，让 LFELKEEA 更容易说对话题。",
+  "author": "LFELKEEA",
+  "permissions": ["events"],
+  "settings": {}
+}

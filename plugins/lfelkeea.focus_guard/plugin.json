@@ -1,0 +1,14 @@
+{
+  "id": "lfelkeea.focus_guard",
+  "name": "专注时间",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.py",
+  "description": "专注 50 分钟、休息 5 分钟的循环提醒；结束时让桌宠提醒你站起来活动。",
+  "author": "LFELKEEA",
+  "permissions": ["pet.say", "pet.action", "timer", "settings", "storage"],
+  "settings": {
+    "focus_minutes": 50,
+    "break_minutes": 5
+  }
+}

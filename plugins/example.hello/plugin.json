@@ -1,0 +1,14 @@
+{
+  "id": "example.hello",
+  "name": "示例：定时问候",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.py",
+  "description": "每隔一段时间说一句话，演示 say / every / settings / events 的用法。",
+  "author": "LFELKEEA",
+  "permissions": ["pet.say", "timer", "events", "settings"],
+  "settings": {
+    "interval_minutes": 10,
+    "message": ""
+  }
+}

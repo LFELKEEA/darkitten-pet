@@ -1,0 +1,1603 @@
+from __future__ import annotations
+
+"""QQ 桥接服务：白名单、人格、记忆、黑话、习惯、回复和 QQ 空间。"""
+
+import json
+import logging
+import random
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any, Callable
+
+from PySide6.QtCore import QObject, Signal
+
+from . import analysis, vision, voicepacks
+from .commands import Command, help_text, parse_command
+from .onebot import EventServer, OneBotClient, OneBotError, split_conversation
+from .snowluma import SnowLumaManager
+from .store import JsonStore
+from .text import (
+    build_segments,
+    clean_incoming_text,
+    image_sources,
+    is_addressed,
+    parse_event,
+    parse_face_tags,
+    parse_voice_tag,
+    sanitize_reply,
+    split_text,
+)
+
+
+LOG = logging.getLogger("lfelkeea.qq_bridge")
+PLUGIN_ID = "lfelkeea.qq_bridge"
+
+QZONE_RIGHTS = {"public": 1, "friends": 4, "some": 16, "private": 64, "hide": 128}
+DEFAULT_PERSONA = "# 人格卡\n\n你是一只桌面小猫，说话简短、自然。"
+# 这几个设置会被宿主用内存里的旧配置回写覆盖，额外在插件目录留一份。
+LOCAL_SETTINGS_KEYS = ("auto_start_snowluma", "snowluma_dir", "vision_enabled")
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in ("1", "true", "yes", "on", "是", "开"):
+        return True
+    if text in ("0", "false", "no", "off", "否", "关"):
+        return False
+    return default
+
+
+def _as_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+def _as_float(value: Any, default: float, low: float = 0.0, high: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+def _as_ids(value: Any, digits_only: bool = True) -> list[str]:
+    if isinstance(value, str):
+        raw = value.replace("，", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = []
+    result: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if digits_only:
+            text = "".join(ch for ch in text if ch.isdigit())
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _as_path_list(value: Any, limit: int = 50) -> list[str]:
+    if isinstance(value, str):
+        raw = value.splitlines()
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = []
+    result: list[str] = []
+    for item in raw:
+        text = str(item or "").strip().strip('"')
+        if not text or text in result:
+            continue
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    permission = str(data.get("qzone_permission", "friends") or "friends").strip().lower()
+    if permission not in QZONE_RIGHTS:
+        permission = "friends"
+    trigger = str(data.get("group_trigger", "at") or "at").strip().lower()
+    if trigger not in ("at", "all"):
+        trigger = "at"
+    return {
+        "snowluma_http": str(data.get("snowluma_http", "http://127.0.0.1:3000") or "").strip()
+        or "http://127.0.0.1:3000",
+        "access_token": str(data.get("access_token", "") or "").strip(),
+        "http_port": _as_int(data.get("http_port"), 8766, 1, 65535),
+        "http_host": str(data.get("http_host", "127.0.0.1") or "127.0.0.1").strip(),
+        "event_path": str(data.get("event_path", "/onebot") or "/onebot").strip(),
+        "event_secret": str(data.get("event_secret", "") or "").strip(),
+        "owner_qq": "".join(ch for ch in str(data.get("owner_qq", "") or "") if ch.isdigit()),
+        "allow_private": _as_ids(data.get("allow_private")),
+        "allow_groups": _as_ids(data.get("allow_groups")),
+        "qzone_enabled": _as_bool(data.get("qzone_enabled"), False),
+        "qzone_permission": permission,
+        "qzone_target_uins": _as_ids(data.get("qzone_target_uins")),
+        "group_trigger": trigger,
+        "memory_enabled": _as_bool(data.get("memory_enabled"), True),
+        "slang_enabled": _as_bool(data.get("slang_enabled"), True),
+        "habit_enabled": _as_bool(data.get("habit_enabled"), True),
+        "auto_face": _as_bool(data.get("auto_face"), True),
+        "local_echo": _as_bool(data.get("local_echo"), False),
+        "announce": _as_bool(data.get("announce"), False),
+        "bot_name": str(data.get("bot_name", "小猫") or "小猫").strip()[:20],
+        "command_prefix": str(data.get("command_prefix", "/") or "/").strip()[:3] or "/",
+        "reply_chance": _as_float(data.get("reply_chance"), 0.15),
+        "max_replies_per_minute": _as_int(data.get("max_replies_per_minute"), 6, 1, 60),
+        "max_reply_chars": _as_int(data.get("max_reply_chars"), 300, 40, 1000),
+        "face_ids": [item for item in _as_ids(data.get("face_ids")) if 0 <= int(item) <= 999][:8],
+        "sticker_paths": [
+            str(item).strip()
+            for item in (data.get("sticker_paths") or [])
+            if str(item or "").strip()
+        ][:50]
+        if isinstance(data.get("sticker_paths"), (list, tuple))
+        else [],
+        "face_probability": _as_float(data.get("face_probability"), 0.03, 0.0, 1.0),
+        "sticker_probability": _as_float(data.get("sticker_probability"), 0.03, 0.0, 1.0),
+        "memory_interval_minutes": _as_int(data.get("memory_interval_minutes"), 30, 5, 1440),
+        "memory_min_batch": _as_int(data.get("memory_min_batch"), 8, 3, 100),
+        "memory_batch_size": _as_int(data.get("memory_batch_size"), 40, 10, 200),
+        "memory_max_items": _as_int(data.get("memory_max_items"), 80, 10, 500),
+        "slang_max_terms": _as_int(data.get("slang_max_terms"), 200, 20, 1000),
+        "auto_start_snowluma": _as_bool(data.get("auto_start_snowluma"), True),
+        "snowluma_dir": str(data.get("snowluma_dir", "") or "").strip().strip('"'),
+        "vision_enabled": _as_bool(data.get("vision_enabled"), True),
+        "voice_packs": _as_path_list(data.get("voice_packs")),
+        "voice_reply_enabled": _as_bool(data.get("voice_reply_enabled"), False),
+        "voice_reply_probability": _as_float(
+            data.get("voice_reply_probability"), 0.08, 0.0, 1.0
+        ),
+    }
+
+
+class QQBridgeService(QObject):
+    event_received = Signal(dict)
+    local_say = Signal(str, int)
+    _dispatch = Signal(object)
+
+    def __init__(self, api: Any) -> None:
+        super().__init__()
+        self.api = api
+        self.persona_default = Path(api.info.folder) / "persona.md"
+        self.state_root = Path(api.manager.state_dir) / PLUGIN_ID
+        self.settings = self._initial_settings()
+        self.store = JsonStore(self.state_root, self.persona_default)
+        self.snowluma = SnowLumaManager(
+            self.state_root, self._log, on_ready=self._after_snowluma_ready
+        )
+        self.client: OneBotClient | None = None
+        self.server: EventServer | None = None
+        self.started = False
+
+        self._pending: dict[str, float] = {}
+        self._compacting = False
+        self._compact_started_at = 0.0
+        self._compact_cooldown_until = 0.0
+        self._compact_notify = ""
+        self._reply_times: deque[float] = deque()
+        self._vision_blocked = False
+        self._checking = False
+        self._last_check = 0.0
+
+        self.event_received.connect(self._on_event_main)
+        self.local_say.connect(self._say_main)
+        self._dispatch.connect(self._run_dispatch)
+
+    # ---------- 设置本地备份 ----------
+
+    @property
+    def _local_settings_path(self) -> Path:
+        return self.state_root / "settings.json"
+
+    def _load_local_settings(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self._local_settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {key: data[key] for key in LOCAL_SETTINGS_KEYS if key in data}
+
+    def _persist_local_settings(self, settings: dict[str, Any]) -> None:
+        payload = {key: settings.get(key) for key in LOCAL_SETTINGS_KEYS}
+        try:
+            self.state_root.mkdir(parents=True, exist_ok=True)
+            tmp = self._local_settings_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self._local_settings_path)
+        except OSError as exc:
+            self._log(f"保存本地设置备份失败：{exc}")
+
+    def _initial_settings(self) -> dict[str, Any]:
+        raw = dict(self.api.settings or {})
+        local = self._load_local_settings()
+        if local:
+            settings = normalize_settings({**raw, **local})
+            if any(settings.get(key) != raw.get(key) for key in LOCAL_SETTINGS_KEYS):
+                try:
+                    self.api.save_settings(settings)
+                except Exception:
+                    pass
+            return settings
+        # 旧版本没有本地备份，auto_start_snowluma 很可能是宿主用默认值回写的，
+        # 这里先打开一次，之后用户关掉会写进本地备份。
+        raw["auto_start_snowluma"] = True
+        settings = normalize_settings(raw)
+        self._persist_local_settings(settings)
+        try:
+            self.api.save_settings(settings)
+        except Exception:
+            pass
+        return settings
+
+    # ---------- 生命周期 ----------
+
+    def start(self) -> None:
+        if self.started:
+            return
+        self.settings = normalize_settings(self.api.settings)
+        self.client = OneBotClient(
+            self.settings["snowluma_http"], self.settings["access_token"]
+        )
+        self.server = EventServer(
+            self.settings["http_host"],
+            self.settings["http_port"],
+            self.settings["event_path"],
+            self.settings["event_secret"],
+            on_event=self._on_event_thread,
+            on_error=self._log,
+        )
+        try:
+            port = self.server.start()
+            self._log(f"事件接收已启动：http://{self.settings['http_host']}:{port}{self.settings['event_path']}")
+            self.api.say(
+                f"QQ 桥接已启动，监听端口 {port}。在插件管理里点“设置”填写 SnowLuma 和白名单。",
+                5000,
+            )
+        except Exception as exc:
+            self._log(f"事件端口启动失败：{exc}")
+            self.server = None
+            self.api.say("QQ 桥接的事件端口被占用，请在设置里换一个 http_port。", 6000)
+
+        self.api.every(60_000, self._tick)
+        self.started = True
+        if self.settings["announce"]:
+            self.api.say("QQ 桥接上线了。", 4000)
+        self._log("QQ 桥接已加载")
+        self.snowluma.configure(self.settings, self.settings["snowluma_http"])
+        self.snowluma.start_async()
+        self.check_async()
+
+    def stop(self) -> None:
+        self.snowluma.stop()
+        if self.server is not None:
+            self.server.stop()
+            self.server = None
+        self.store.flush()
+        self._pending.clear()
+        self.started = False
+        self._log("QQ 桥接已停止")
+
+    def _tick(self) -> None:
+        if not self.started:
+            return
+        try:
+            self.store.flush()
+        except Exception as exc:
+            self._log(f"落盘失败：{exc}")
+
+        now = time.time()
+        for conversation, started_at in list(self._pending.items()):
+            if now - started_at > 180:
+                self._pending.pop(conversation, None)
+                self._log(f"{conversation} 的 AI 回复超时，已解除占用。")
+
+        if self._compacting and now - self._compact_started_at > 300:
+            self._compacting = False
+            self._log("记忆整理超时，已重置。")
+        if not self._checking and now - self._last_check >= 300:
+            self.check_async()
+        self._maybe_compact()
+
+    # ---------- 线程投递 ----------
+
+    def _on_event_thread(self, payload: dict[str, Any]) -> None:
+        self.event_received.emit(payload)
+
+    def _run_dispatch(self, callback: Any) -> None:
+        try:
+            callback()
+        except Exception as exc:
+            self._log(f"后台回调出错：{exc}")
+
+    def _after_snowluma_ready(self) -> None:
+        if not self.started:
+            return
+        self._dispatch.emit(self.check_async)
+
+    def snowluma_status(self) -> dict[str, Any]:
+        return self.snowluma.status()
+
+    def takeover_snowluma(self, callback: Callable[[str], None]) -> None:
+        """结束旧的 SnowLuma 并交给插件后台启动（可能耗时，放到线程里）。"""
+
+        def work() -> None:
+            message = self.snowluma.takeover()
+            self._dispatch.emit(lambda: callback(message))
+
+        threading.Thread(target=work, name="qq-bridge-takeover", daemon=True).start()
+
+    def _log(self, message: str) -> None:
+        try:
+            self.api.log(str(message))
+        except Exception:
+            LOG.info(message)
+
+    def _say_main(self, text: str, duration: int = 4000) -> None:
+        try:
+            self.api.say(text, duration)
+        except Exception as exc:
+            self._log(f"桌宠说话失败：{exc}")
+
+    # ---------- 设置与白名单 ----------
+
+    @property
+    def owner(self) -> str:
+        return self.settings["owner_qq"]
+
+    def is_owner(self, user_id: str) -> bool:
+        return bool(self.owner) and str(user_id) == self.owner
+
+    def is_allowed(self, conversation: str, user_id: str = "") -> bool:
+        kind, target = split_conversation(conversation)
+        if kind == "group":
+            return target in self.settings["allow_groups"]
+        if self.is_owner(target) or self.is_owner(user_id):
+            return True
+        return target in self.settings["allow_private"]
+
+    def _save_whitelist(self) -> None:
+        try:
+            self.api.save_settings(
+                {
+                    "allow_private": list(self.settings["allow_private"]),
+                    "allow_groups": list(self.settings["allow_groups"]),
+                }
+            )
+        except Exception as exc:
+            self._log(f"保存白名单失败：{exc}")
+
+    def _allow_target(self, kind: str, target: str, add: bool) -> str:
+        bucket = "allow_groups" if kind == "group" else "allow_private"
+        values = list(self.settings[bucket])
+        if add:
+            if target in values:
+                return "已经在白名单里了。"
+            values.append(target)
+        else:
+            if target not in values:
+                return "白名单里没有这个号。"
+            values.remove(target)
+        self.settings[bucket] = values
+        self._save_whitelist()
+        return ("已加入白名单：" if add else "已移出白名单：") + f"{kind}:{target}"
+
+    def apply_settings(self, values: dict[str, Any]) -> dict[str, Any]:
+        """保存设置；连接相关字段变化时重建客户端和事件监听。"""
+        merged = dict(self.settings)
+        for key, value in (values or {}).items():
+            if key in merged:
+                merged[key] = value
+        updated = normalize_settings(merged)
+        try:
+            self.api.save_settings(updated)
+        except Exception as exc:
+            self._log(f"保存设置失败：{exc}")
+            return {"ok": False, "message": f"保存失败：{exc}", "settings": self.settings}
+        self._persist_local_settings(updated)
+        link_keys = (
+            "snowluma_http",
+            "access_token",
+            "http_host",
+            "http_port",
+            "event_path",
+            "event_secret",
+        )
+        changed = any(self.settings.get(key) != updated.get(key) for key in link_keys)
+        dir_changed = self.settings.get("snowluma_dir") != updated.get("snowluma_dir")
+        self.settings = updated
+        self.snowluma.configure(updated, updated["snowluma_http"])
+        if changed and self.started:
+            message = self._rebuild_link()
+        else:
+            message = "设置已保存。"
+        if not updated["auto_start_snowluma"]:
+            self.snowluma.stop()
+        else:
+            if dir_changed:
+                self.snowluma.stop()
+            self.snowluma.start_async()
+        return {"ok": True, "message": message, "settings": updated}
+
+    def _rebuild_link(self) -> str:
+        if self.server is not None:
+            self.server.stop()
+            self.server = None
+        self.client = OneBotClient(
+            self.settings["snowluma_http"], self.settings["access_token"]
+        )
+        self.server = EventServer(
+            self.settings["http_host"],
+            self.settings["http_port"],
+            self.settings["event_path"],
+            self.settings["event_secret"],
+            on_event=self._on_event_thread,
+            on_error=self._log,
+        )
+        try:
+            port = self.server.start()
+            message = f"已重新监听事件端口 {port}。"
+        except Exception as exc:
+            self.server = None
+            message = f"事件端口启动失败：{exc}"
+        self._log(message)
+        self.check_async(manual=True)
+        return message
+
+    # ---------- 设置界面数据 ----------
+
+    def snapshot(self) -> dict[str, Any]:
+        connection = self.store.runtime.get("connection_ok")
+        port = self.server.bound_port if self.server is not None else 0
+        return {
+            "started": self.started,
+            "connection_ok": connection,
+            "http": self.settings["snowluma_http"],
+            "event_port": port,
+            "event_url": (
+                f"http://{self.settings['http_host']}:"
+                f"{port or self.settings['http_port']}{self.settings['event_path']}"
+            ),
+            "owner_qq": self.settings["owner_qq"],
+            "private_count": len(self.settings["allow_private"]),
+            "group_count": len(self.settings["allow_groups"]),
+            "memory_count": len(self.store.memories(500)),
+            "slang_count": len(self.store.slang_terms()),
+            "qzone_enabled": self.settings["qzone_enabled"],
+            "auto_start_snowluma": bool(self.settings["auto_start_snowluma"]),
+            "snowluma_dir": self.settings["snowluma_dir"],
+            "vision_enabled": bool(self.settings["vision_enabled"]),
+            "voice_pack_count": len(self.settings["voice_packs"]),
+            "voice_reply_enabled": bool(self.settings["voice_reply_enabled"]),
+            "snowluma_managed": self.snowluma.status(),
+        }
+
+    def probe(self, callback: Callable[[bool, str], None]) -> None:
+        client = self.client
+        if client is None:
+            callback(False, "OneBot 客户端还没准备好。")
+            return
+
+        def work() -> None:
+            try:
+                info = client.get_login_info()
+                user_id = str(info.get("user_id", "") or "")
+                nickname = str(info.get("nickname", "") or "")
+                text = f"已连接：{nickname or 'QQ'}（{user_id}）"
+                ok = True
+            except Exception as exc:
+                text = f"连接失败：{exc}"
+                ok = False
+            self._dispatch.emit(lambda: self._finish_probe(ok, text, callback))
+
+        threading.Thread(target=work, name="qq-bridge-probe", daemon=True).start()
+
+    def _finish_probe(
+        self, ok: bool, text: str, callback: Callable[[bool, str], None]
+    ) -> None:
+        self.store.set_connection(ok)
+        self.store.flush()
+        self._log(text)
+        try:
+            callback(ok, text)
+        except Exception as exc:
+            self._log(f"连接检查回调失败：{exc}")
+
+    def send_test(
+        self, conversation: str, text: str, callback: Callable[[bool, str], None]
+    ) -> None:
+        kind, target = split_conversation(conversation)
+        if kind == "invalid" or not target:
+            callback(False, "目标格式不对，用 private:QQ号 或 group:群号。")
+            return
+        target_conversation = f"{kind}:{target}"
+        if not self.is_allowed(target_conversation):
+            callback(False, "这个对象不在白名单里，先在“白名单”页添加。")
+            return
+        cleaned, faces = parse_face_tags(str(text or ""))
+        segments = build_segments(cleaned, faces)
+        if not segments:
+            callback(False, "消息内容为空。")
+            return
+        client = self.client
+        if client is None:
+            callback(False, "OneBot 客户端还没准备好。")
+            return
+
+        def work() -> None:
+            try:
+                client.send(target_conversation, segments)
+                result = (True, f"已发送到 {target_conversation}。")
+            except Exception as exc:
+                result = (False, f"发送失败：{exc}")
+            ok, message = result
+            self._dispatch.emit(lambda: callback(ok, message))
+
+        threading.Thread(target=work, name="qq-bridge-test-send", daemon=True).start()
+
+    def qzone_action(
+        self,
+        action: str,
+        value: str = "",
+        callback: Callable[[bool, str], None] | None = None,
+    ) -> None:
+        client = self.client
+        if client is None:
+            if callback is not None:
+                callback(False, "OneBot 客户端还没准备好。")
+            return
+        if action == "publish" and not self.settings["qzone_enabled"]:
+            if callback is not None:
+                callback(False, "先在本页打开“允许发 QQ 空间”。")
+            return
+
+        def work() -> None:
+            try:
+                if action == "publish":
+                    client.publish_qzone(
+                        value,
+                        QZONE_RIGHTS[self.settings["qzone_permission"]],
+                        target_uins=self.settings["qzone_target_uins"],
+                    )
+                    result = (True, "已发到 QQ 空间。")
+                elif action == "delete":
+                    client.delete_qzone(value)
+                    result = (True, "那条说说已删除。")
+                else:
+                    result = (True, _format_qzone(client.list_qzone(10)))
+            except Exception as exc:
+                result = (False, f"QQ 空间操作失败：{exc}")
+            ok, message = result
+            if callback is not None:
+                self._dispatch.emit(lambda: callback(ok, message))
+
+        threading.Thread(target=work, name="qq-bridge-qzone-ui", daemon=True).start()
+
+    def persona_text(self) -> str:
+        return self.store.persona()
+
+    def set_persona_text(self, text: str) -> str:
+        length = self.store.set_persona(text)
+        self.store.flush()
+        return f"人格卡已保存（{length} 字）。"
+
+    def reset_persona(self) -> str:
+        text = DEFAULT_PERSONA
+        try:
+            text = self.persona_default.read_text(encoding="utf-8").strip() or text
+        except OSError:
+            pass
+        self.store.set_persona(text)
+        self.store.flush()
+        return "人格卡已恢复默认。"
+
+    def memory_items(self, limit: int = 200) -> list[dict[str, Any]]:
+        return self.store.memories(limit)
+
+    def add_memory_text(self, text: str) -> str:
+        item = self.store.add_memory(text, importance=60, source="manual")
+        self.store.prune_memory(self.settings["memory_max_items"])
+        self.store.flush()
+        return "记住了。" if item else "这条内容为空。"
+
+    def remove_memory_text(self, keyword: str) -> str:
+        removed = self.store.remove_memory(keyword)
+        self.store.flush()
+        return f"删除了 {removed} 条记忆。"
+
+    def compact_now(self, callback: Callable[[str], None]) -> None:
+        self._maybe_compact(force=True, callback=callback)
+
+    def slang_items(self) -> list[dict[str, Any]]:
+        terms = self.store.slang_terms()
+        return sorted(
+            (dict(item) for item in terms.values() if isinstance(item, dict)),
+            key=lambda item: int(item.get("count", 0)),
+            reverse=True,
+        )
+
+    def add_slang_text(self, term: str, meaning: str) -> str:
+        entry = self.store.add_slang(term, meaning, source="manual")
+        self.store.prune_slang(self.settings["slang_max_terms"])
+        self.store.flush()
+        return "收进黑话库了。" if entry else "词或含义为空，没收录。"
+
+    def remove_slang_text(self, term: str) -> str:
+        removed = self.store.remove_slang(term)
+        self.store.flush()
+        return "删掉了。" if removed else "黑话库里没有这个词。"
+
+    def allow_items(self) -> dict[str, list[str]]:
+        return {
+            "private": list(self.settings["allow_private"]),
+            "group": list(self.settings["allow_groups"]),
+        }
+
+    def allow_target_text(self, kind: str, target: str, add: bool) -> str:
+        digits = "".join(ch for ch in str(target or "") if ch.isdigit())
+        if not digits:
+            return "请填写 QQ 号或群号（纯数字）。"
+        return self._allow_target("group" if kind == "group" else "private", digits, add)
+
+    # ---------- 语音包 ----------
+
+    def voice_pack_list(self) -> list[dict[str, Any]]:
+        packs: list[dict[str, Any]] = []
+        for raw in self.settings["voice_packs"]:
+            folder = Path(raw).expanduser()
+            if not folder.is_dir():
+                continue
+            clips = voicepacks.find_clips(folder)
+            if not clips:
+                continue
+            packs.append(
+                {
+                    "path": str(folder.resolve()),
+                    "name": folder.name,
+                    "count": len(clips),
+                }
+            )
+        return packs
+
+    def _save_voice_settings(self) -> None:
+        try:
+            self.api.save_settings(
+                {
+                    "voice_packs": list(self.settings["voice_packs"]),
+                    "voice_reply_enabled": bool(self.settings["voice_reply_enabled"]),
+                    "voice_reply_probability": float(
+                        self.settings["voice_reply_probability"]
+                    ),
+                }
+            )
+        except Exception as exc:
+            self._log(f"保存语音设置失败：{exc}")
+
+    def add_voice_packs(self, paths: list[str]) -> str:
+        added = 0
+        for raw in paths:
+            folder = Path(str(raw or "").strip()).expanduser()
+            if not folder.is_dir() or not voicepacks.find_clips(folder, limit=1):
+                continue
+            value = str(folder.resolve())
+            if value in self.settings["voice_packs"]:
+                continue
+            self.settings["voice_packs"].append(value)
+            added += 1
+        if added:
+            self._save_voice_settings()
+        return f"已导入 {added} 个语音包。" if added else "没有发现新的语音包。"
+
+    def remove_voice_pack(self, folder: str) -> str:
+        value = str(Path(str(folder or "").strip()).expanduser())
+        values = list(self.settings["voice_packs"])
+        kept = [item for item in values if item != folder and item != value]
+        if len(kept) == len(values):
+            return "列表里没有这个语音包。"
+        self.settings["voice_packs"] = kept
+        self._save_voice_settings()
+        return "已移除语音包。"
+
+    def scan_voice_packs(self, callback: Callable[[list[dict[str, Any]]], None]) -> None:
+        """扫描用户目录，结果回主线程。"""
+
+        def work() -> None:
+            try:
+                packs = voicepacks.scan_packs()
+                payload = [
+                    {"path": str(item.path), "name": item.name, "count": item.count}
+                    for item in packs
+                ]
+            except Exception as exc:
+                payload = []
+                self._log(f"扫描语音包失败：{exc}")
+            self._dispatch.emit(lambda: callback(payload))
+
+        threading.Thread(target=work, name="qq-bridge-voice-scan", daemon=True).start()
+
+    def voice_clips(self, folder: str) -> list[str]:
+        return [str(item) for item in voicepacks.find_clips(folder)]
+
+    def send_voice(
+        self,
+        conversation: str,
+        clip: str,
+        callback: Callable[[bool, str], None] | None = None,
+    ) -> None:
+        kind, target = split_conversation(conversation)
+        if kind == "invalid" or not target:
+            if callback is not None:
+                callback(False, "目标格式不对，用 private:QQ号 或 group:群号。")
+            return
+        target_conversation = f"{kind}:{target}"
+        if not self.is_allowed(target_conversation):
+            if callback is not None:
+                callback(False, "这个对象不在白名单里，先在“白名单”页添加。")
+            return
+        path = Path(str(clip or "").strip()).expanduser()
+        if not voicepacks.is_audio_file(path):
+            if callback is not None:
+                callback(False, "语音文件不存在，或不是支持的音频格式。")
+            return
+        client = self.client
+        if client is None:
+            if callback is not None:
+                callback(False, "OneBot 客户端还没准备好。")
+            return
+
+        def work() -> None:
+            try:
+                client.send(
+                    target_conversation,
+                    [{"type": "record", "data": {"file": str(path.resolve())}}],
+                )
+                result = (True, f"已发送语音到 {target_conversation}。")
+            except Exception as exc:
+                result = (False, f"发送语音失败：{exc}")
+            if callback is not None:
+                ok, message = result
+                self._dispatch.emit(lambda: callback(ok, message))
+
+        threading.Thread(target=work, name="qq-bridge-voice-send", daemon=True).start()
+
+    def send_random_voice(
+        self,
+        conversation: str,
+        folder: str = "",
+        callback: Callable[[bool, str], None] | None = None,
+    ) -> None:
+        packs = [folder] if folder else [item["path"] for item in self.voice_pack_list()]
+        packs = [item for item in packs if item]
+        if not packs:
+            if callback is not None:
+                callback(False, "还没有可用的语音包，先在“语音”页导入。")
+            return
+        chosen = random.choice(packs)
+        clip = voicepacks.choose_clip(chosen)
+        if clip is None:
+            if callback is not None:
+                callback(False, "这个语音包里没有音频文件。")
+            return
+        self.send_voice(conversation, str(clip), callback)
+
+    def _pick_voice_clip(self, explicit: bool) -> str:
+        if not self.settings["voice_packs"]:
+            return ""
+        if not explicit:
+            if not self.settings["voice_reply_enabled"]:
+                return ""
+            if random.random() >= self.settings["voice_reply_probability"]:
+                return ""
+        packs = [item["path"] for item in self.voice_pack_list()]
+        if not packs:
+            return ""
+        clip = voicepacks.choose_clip(random.choice(packs))
+        return str(clip) if clip is not None else ""
+
+    def habit_rows(self, limit: int = 60) -> list[dict[str, Any]]:
+        conversations = self.store.habits.get("conversations", {})
+        if not isinstance(conversations, dict):
+            return []
+        rows: list[dict[str, Any]] = []
+        for conversation, data in conversations.items():
+            if not isinstance(data, dict):
+                continue
+            count = max(1, int(data.get("count", 0) or 1))
+            rows.append(
+                {
+                    "conversation": str(conversation),
+                    "count": int(data.get("count", 0)),
+                    "short_rate": int(data.get("short", 0)) / count,
+                    "question": int(data.get("question", 0)),
+                    "faces": int(data.get("faces", 0)),
+                    "updated_at": float(data.get("updated_at", 0) or 0),
+                }
+            )
+        rows.sort(key=lambda item: item["updated_at"], reverse=True)
+        return rows[: max(1, int(limit))]
+
+    def log_tail(self, limit: int = 40) -> str:
+        path = Path(getattr(self.api.manager, "log_path", ""))
+        try:
+            if path.is_file() and path.stat().st_size < 2 * 1024 * 1024:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                return "\n".join(lines[-max(1, int(limit)) :])
+        except OSError:
+            pass
+        return ""
+
+    # ---------- 事件入口 ----------
+
+    def _on_event_main(self, payload: dict[str, Any]) -> None:
+        if not self.started:
+            return
+        try:
+            message = parse_event(payload)
+        except Exception as exc:
+            self._log(f"消息解析失败：{exc}")
+            return
+        if message is None:
+            return
+        if message.message_id and self.store.seen(message.message_id):
+            return
+        if message.message_id:
+            self.store.mark_seen(message.message_id)
+        if not self.is_allowed(message.conversation, message.user_id):
+            return
+
+        text = clean_incoming_text(message.text, self.settings["bot_name"])
+        if self.settings["habit_enabled"]:
+            self.store.observe(message.conversation, text, message.face_count)
+        if text:
+            self.store.append_recent(
+                message.conversation, "user", text, name=message.sender_name
+            )
+        self.store.append_inbox(
+            message.conversation,
+            "user",
+            text or "[图片]",
+            name=message.sender_name,
+        )
+
+        if self.is_owner(message.user_id) and (
+            message.is_private or message.group_id in self.settings["allow_groups"]
+        ):
+            command = parse_command(text, self.settings["command_prefix"])
+            if command is not None:
+                self._handle_command(command, message)
+                return
+
+        if not is_addressed(
+            message,
+            self.settings["bot_name"],
+            self.settings["group_trigger"],
+            self.settings["reply_chance"],
+        ):
+            return
+        if not text and not message.has_image:
+            return
+        self._reply_with_ai(message, text)
+
+    # ---------- AI 回复 ----------
+
+    def _rate_ok(self) -> bool:
+        now = time.time()
+        while self._reply_times and now - self._reply_times[0] > 60:
+            self._reply_times.popleft()
+        if len(self._reply_times) >= self.settings["max_replies_per_minute"]:
+            return False
+        self._reply_times.append(now)
+        return True
+
+    def _reply_with_ai(self, message: Any, text: str) -> None:
+        conversation = message.conversation
+        if conversation in self._pending:
+            return
+        if not self._rate_ok():
+            self._log("触发每分钟回复上限，本条跳过。")
+            return
+
+        memory = (
+            analysis.memory_prompt(self.store.memories(8))
+            if self.settings["memory_enabled"]
+            else ""
+        )
+        slang = (
+            analysis.slang_prompt(self.store.slang_terms(), text)
+            if self.settings["slang_enabled"]
+            else ""
+        )
+        habit = analysis.habit_summary(self.store.habit(conversation))
+        system_prompt = analysis.build_system_prompt(
+            self.store.persona(), memory, slang, habit
+        )
+        if self.settings["voice_packs"]:
+            system_prompt += (
+                "\n\n你还可以发 QQ 语音：如果这句话适合用语音说，"
+                "在回复末尾加 [voice]，系统会从语音包里随机挑一条一起发出去。"
+                "不想发语音就不要加这个标记，也不要向对方解释这个标记。"
+            )
+        recent = self.store.recent(conversation, 9)
+        if recent and recent[-1].get("text") == (text or "[图片]"):
+            recent = recent[:-1]
+        user_prompt = analysis.build_user_prompt(
+            recent,
+            text or "[图片]",
+            sender=message.sender_name,
+        )
+
+        self._pending[conversation] = time.time()
+
+        def on_reply(reply: str | None, error: str | None) -> None:
+            self._pending.pop(conversation, None)
+            if error:
+                self._log(f"AI 回复失败：{error}")
+                return
+            cleaned = sanitize_reply(reply or "", self.settings["max_reply_chars"])
+            if not cleaned:
+                return
+            cleaned, wants_voice = parse_voice_tag(cleaned)
+            voice_clip = self._pick_voice_clip(wants_voice)
+            faces, images = self._pick_extras(conversation, cleaned)
+            cleaned, explicit = parse_face_tags(cleaned)
+            if explicit:
+                faces = explicit
+            cleaned = clean_incoming_text(cleaned, limit=1000)
+            if not cleaned and not images and not voice_clip:
+                return
+            segments = build_segments(cleaned, faces, images)
+            if segments:
+                self._send_segments(conversation, segments, cleaned or "[表情]")
+            if voice_clip:
+                self.send_voice(conversation, voice_clip)
+            self.store.append_recent(conversation, "assistant", cleaned)
+            self.store.append_inbox(
+                conversation, "assistant", cleaned, name=self.settings["bot_name"]
+            )
+
+        sources = image_sources(message) if self.settings["vision_enabled"] else []
+        if not sources:
+            self._start_chat(
+                conversation, system_prompt, user_prompt, [], "", on_reply
+            )
+            return
+
+        blocked = self._vision_blocked
+
+        def prepare() -> None:
+            prepared = vision.prepare(sources, run_ocr_when_empty=blocked)
+            if blocked:
+                prepared.uris = []
+                if prepared.blobs and not prepared.ocr_text:
+                    prepared.ocr_text = vision.ocr_images(prepared.blobs)
+            self._dispatch.emit(
+                lambda: self._start_chat(
+                    conversation,
+                    system_prompt,
+                    user_prompt,
+                    prepared.uris,
+                    prepared.ocr_text,
+                    on_reply,
+                    prepared,
+                )
+            )
+
+        threading.Thread(target=prepare, name="qq-bridge-vision", daemon=True).start()
+
+    def _start_chat(
+        self,
+        conversation: str,
+        system_prompt: str,
+        user_prompt: str,
+        uris: list[str],
+        ocr_text: str,
+        on_reply: Callable[[str | None, str | None], None],
+        prepared: vision.PreparedImages | None = None,
+    ) -> None:
+        if conversation not in self._pending:
+            return
+        prompt = user_prompt
+        if ocr_text:
+            prompt = f"{user_prompt}\n\n（图片里的文字，供参考：{ocr_text}）"
+        content: Any = prompt
+        if uris and not self._vision_blocked:
+            content = [{"type": "text", "text": prompt}]
+            content.extend(
+                {"type": "image_url", "image_url": {"url": uri}} for uri in uris
+            )
+
+        def guarded(reply: str | None, error: str | None) -> None:
+            if (
+                error
+                and uris
+                and not self._vision_blocked
+                and vision.looks_like_vision_rejection(error)
+            ):
+                self._vision_blocked = True
+                self._log("当前 AI 接口不接受图片输入，改按文字或 OCR 结果回复。")
+                self._retry_without_images(
+                    conversation, system_prompt, prompt, prepared, on_reply
+                )
+                return
+            on_reply(reply, error)
+
+        try:
+            self.api.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                guarded,
+            )
+        except Exception as exc:
+            self._pending.pop(conversation, None)
+            self._log(f"发起 AI 请求失败：{exc}")
+
+    def _retry_without_images(
+        self,
+        conversation: str,
+        system_prompt: str,
+        user_prompt: str,
+        prepared: vision.PreparedImages | None,
+        on_reply: Callable[[str | None, str | None], None],
+    ) -> None:
+        def work() -> None:
+            text = prepared.ocr_text if prepared is not None else ""
+            if not text and prepared is not None and prepared.blobs:
+                text = vision.ocr_images(prepared.blobs)
+            self._dispatch.emit(
+                lambda: self._start_chat(
+                    conversation, system_prompt, user_prompt, [], text, on_reply
+                )
+            )
+
+        threading.Thread(
+            target=work, name="qq-bridge-vision-retry", daemon=True
+        ).start()
+
+    def _pick_extras(self, conversation: str, text: str) -> tuple[list[str], list[str]]:
+        faces: list[str] = []
+        images: list[str] = []
+        if self.settings["auto_face"]:
+            face_ids = self.settings["face_ids"]
+            habit_chance = analysis.habit_face_chance(self.store.habit(conversation))
+            chance = max(self.settings["face_probability"], habit_chance * 0.5)
+            if face_ids and random.random() < chance:
+                faces.append(random.choice(face_ids))
+        stickers = self.settings["sticker_paths"]
+        if stickers and random.random() < self.settings["sticker_probability"]:
+            images.append(random.choice(stickers))
+        return faces, images
+
+    def _send_segments(
+        self, conversation: str, segments: list[dict[str, Any]], echo: str = ""
+    ) -> None:
+        client = self.client
+        if client is None:
+            return
+
+        def work() -> None:
+            try:
+                client.send(conversation, segments)
+            except Exception as exc:
+                self._dispatch.emit(
+                    lambda error=exc: self._send_failed(conversation, error)
+                )
+                return
+            if echo and self.settings["local_echo"]:
+                self._dispatch.emit(lambda: self._say_main(echo[:200], 4000))
+
+        threading.Thread(target=work, name="qq-bridge-send", daemon=True).start()
+
+    def _send_failed(self, conversation: str, exc: Exception) -> None:
+        self._log(f"发送到 {conversation} 失败：{exc}")
+        self._say_main("QQ 消息没发出去，检查一下 SnowLuma 是否在线。", 5000)
+
+    def _reply_local(self, conversation: str, text: str, max_chars: int = 1500) -> None:
+        client = self.client
+        if client is None:
+            return
+        chunks = split_text(text, max_chars)
+        if not chunks:
+            return
+
+        def work() -> None:
+            for chunk in chunks:
+                try:
+                    client.send(conversation, build_segments(chunk))
+                except Exception as exc:
+                    self._dispatch.emit(
+                        lambda error=exc: self._send_failed(conversation, error)
+                    )
+                    return
+
+        threading.Thread(target=work, name="qq-bridge-reply", daemon=True).start()
+
+    # ---------- 指令 ----------
+
+    def _handle_command(self, command: Command, message: Any) -> None:
+        name = command.name
+        conversation = message.conversation
+        prefix = self.settings["command_prefix"]
+
+        if name in ("help", "h", "?", "帮助"):
+            self._reply_local(conversation, help_text(prefix))
+            return
+        if name in ("status", "状态"):
+            self._reply_local(conversation, self._status_text())
+            return
+        if name in ("check", "连接"):
+            self._reply_local(conversation, "正在检查 SnowLuma 连接…", 200)
+            self.check_async(conversation, manual=True)
+            return
+        if name == "persona":
+            self._command_persona(command, conversation)
+            return
+        if name in ("memory", "记忆"):
+            self._command_memory(command, conversation)
+            return
+        if name in ("slang", "黑话"):
+            self._command_slang(command, conversation)
+            return
+        if name in ("allow", "白名单"):
+            self._command_allow(command, message)
+            return
+        if name == "say":
+            self._command_say(command, conversation)
+            return
+        if name in ("voice", "语音"):
+            self._command_voice(command, conversation)
+            return
+        if name in ("qzone", "空间"):
+            self._command_qzone(command, conversation)
+            return
+        if name in ("compact", "整理"):
+            self._compact_notify = conversation
+            self._reply_local(conversation, "开始整理记忆和黑话…", 200)
+            self._maybe_compact(force=True)
+            return
+        self._reply_local(conversation, "不认识的指令。\n" + help_text(prefix))
+
+    def _command_persona(self, command: Command, conversation: str) -> None:
+        action = (command.args[0].lower() if command.args else "show")
+        if action in ("show", "查看", "list"):
+            self._reply_local(conversation, "当前人格卡：\n" + self.store.persona(), 2000)
+            return
+        if action in ("reset", "重置"):
+            text = DEFAULT_PERSONA
+            try:
+                text = self.persona_default.read_text(encoding="utf-8").strip() or text
+            except OSError:
+                pass
+            self.store.set_persona(text)
+            self._reply_local(conversation, "人格卡已恢复默认。")
+            return
+        body = _tail_after_first(command.rest) if action in ("set", "设置") else command.rest.strip()
+        if not body:
+            self._reply_local(conversation, "用法：/persona set 新的角色设定")
+            return
+        try:
+            self.store.set_persona(body)
+        except ValueError as exc:
+            self._reply_local(conversation, f"没改成：{exc}")
+            return
+        self._reply_local(conversation, "人格卡已更新。")
+
+    def _command_memory(self, command: Command, conversation: str) -> None:
+        action = (command.args[0].lower() if command.args else "list")
+        if action in ("list", "列表"):
+            items = self.store.memories(20)
+            if not items:
+                self._reply_local(conversation, "还没有长期记忆。")
+                return
+            lines = [f"{index + 1}. {item.get('text', '')}" for index, item in enumerate(items)]
+            self._reply_local(conversation, "长期记忆：\n" + "\n".join(lines), 2000)
+            return
+        if action in ("add", "添加"):
+            body = _tail_after_first(command.rest)
+            if not body:
+                self._reply_local(conversation, "用法：/memory add 要记住的事")
+                return
+            item = self.store.add_memory(body, importance=60, source="manual")
+            self.store.prune_memory(self.settings["memory_max_items"])
+            self.store.flush()
+            self._reply_local(conversation, "记住了。" if item else "这条内容为空。")
+            return
+        if action in ("del", "delete", "删除"):
+            keyword = _tail_after_first(command.rest)
+            if not keyword:
+                self._reply_local(conversation, "用法：/memory del 关键词")
+                return
+            removed = self.store.remove_memory(keyword)
+            self.store.flush()
+            self._reply_local(conversation, f"删除了 {removed} 条记忆。")
+            return
+        self._reply_local(conversation, "用法：/memory list | add 内容 | del 关键词")
+
+    def _command_slang(self, command: Command, conversation: str) -> None:
+        action = (command.args[0].lower() if command.args else "list")
+        if action in ("list", "列表"):
+            terms = self.store.slang_terms()
+            if not terms:
+                self._reply_local(conversation, "黑话库还是空的。")
+                return
+            ordered = sorted(
+                terms.values(),
+                key=lambda item: int(item.get("count", 0)),
+                reverse=True,
+            )
+            lines = [
+                f"{item.get('term', '')}：{item.get('meaning', '')}"
+                for item in ordered[:25]
+                if isinstance(item, dict)
+            ]
+            self._reply_local(conversation, "黑话库：\n" + "\n".join(lines), 2000)
+            return
+        if action in ("add", "添加"):
+            body = _tail_after_first(command.rest)
+            if not body:
+                self._reply_local(conversation, "用法：/slang add 词=含义，或 /slang add 词 含义")
+                return
+            if "=" in body:
+                term, meaning = body.split("=", 1)
+            elif "：" in body:
+                term, meaning = body.split("：", 1)
+            else:
+                parts = body.split(None, 1)
+                term = parts[0]
+                meaning = parts[1] if len(parts) > 1 else ""
+            entry = self.store.add_slang(term, meaning, source="manual")
+            self.store.prune_slang(self.settings["slang_max_terms"])
+            self.store.flush()
+            self._reply_local(
+                conversation, "收进黑话库了。" if entry else "词或含义为空，没收录。"
+            )
+            return
+        if action in ("del", "delete", "删除"):
+            term = _tail_after_first(command.rest)
+            if not term:
+                self._reply_local(conversation, "用法：/slang del 词")
+                return
+            removed = self.store.remove_slang(term)
+            self.store.flush()
+            self._reply_local(conversation, "删掉了。" if removed else "黑话库里没有这个词。")
+            return
+        self._reply_local(conversation, "用法：/slang list | add 词=含义 | del 词")
+
+    def _command_allow(self, command: Command, message: Any) -> None:
+        conversation = message.conversation
+        action = (command.args[0].lower() if command.args else "list")
+        if action in ("list", "列表"):
+            private = self.settings["allow_private"]
+            groups = self.settings["allow_groups"]
+            text = "白名单："
+            text += "\n好友：" + ("、".join(private) if private else "（空）")
+            text += "\n群：" + ("、".join(groups) if groups else "（空）")
+            if self.owner:
+                text += f"\n主人：{self.owner}"
+            else:
+                text += "\n主人：未设置（在插件设置里填 owner_qq）"
+            self._reply_local(conversation, text)
+            return
+        if action not in ("add", "添加", "del", "delete", "删除"):
+            self._reply_local(conversation, "用法：/allow list | add 123456 | add group:123456 | del 123456")
+            return
+        target_text = _tail_after_first(command.rest)
+        if not target_text:
+            kind, target = split_conversation(conversation)
+        else:
+            kind, target = _parse_allow_target(target_text)
+            if kind == "invalid":
+                self._reply_local(conversation, "格式不对：用 123456 或 group:123456。")
+                return
+        if not target:
+            self._reply_local(conversation, "缺少 QQ 号或群号。")
+            return
+        result = self._allow_target(kind, target, add=action in ("add", "添加"))
+        self._reply_local(conversation, result)
+
+    def _command_say(self, command: Command, conversation: str) -> None:
+        parts = command.rest.split(None, 1)
+        if len(parts) < 2:
+            self._reply_local(conversation, "用法：/say group:123456 内容")
+            return
+        target_text, body = parts[0], parts[1].strip()
+        kind, target = _parse_allow_target(target_text)
+        if kind == "invalid" or not target:
+            self._reply_local(conversation, "目标格式不对：用 group:123456 或 private:123456。")
+            return
+        target_conversation = f"{kind}:{target}"
+        if not self.is_allowed(target_conversation):
+            self._reply_local(conversation, "这个对象不在白名单里，先 /allow add 再加。")
+            return
+        cleaned, faces = parse_face_tags(body)
+        segments = build_segments(cleaned, faces)
+        if not segments:
+            self._reply_local(conversation, "内容为空。")
+            return
+        self._send_segments(target_conversation, segments, cleaned)
+        self._reply_local(conversation, f"已发送到 {target_conversation}。")
+
+    def _command_voice(self, command: Command, conversation: str) -> None:
+        target_conversation = conversation
+        folder = ""
+        if command.args:
+            first = command.args[0]
+            if ":" in first or first.isdigit():
+                kind, target = _parse_allow_target(first)
+                if kind == "invalid" or not target:
+                    self._reply_local(
+                        conversation, "目标格式不对：用 group:123456 或 private:123456。"
+                    )
+                    return
+                target_conversation = f"{kind}:{target}"
+                if len(command.args) > 1:
+                    folder = " ".join(command.args[1:]).strip()
+            elif len(command.args) > 1:
+                folder = command.rest.strip()
+        if folder:
+            candidate = Path(folder).expanduser()
+            if not candidate.is_dir():
+                self._reply_local(conversation, f"没有找到语音包目录：{folder}")
+                return
+            folder = str(candidate)
+
+        def done(ok: bool, message: str) -> None:
+            self._reply_local(conversation, message)
+
+        self.send_random_voice(target_conversation, folder, done)
+
+    def _command_qzone(self, command: Command, conversation: str) -> None:
+        action = (command.args[0].lower() if command.args else "")
+        if action in ("on", "off", "开", "关"):
+            enabled = action in ("on", "开")
+            self.settings["qzone_enabled"] = enabled
+            try:
+                self.api.save_settings({"qzone_enabled": enabled})
+            except Exception as exc:
+                self._log(f"保存 QQ 空间开关失败：{exc}")
+            self._reply_local(conversation, "QQ 空间发送已开启。" if enabled else "QQ 空间发送已关闭。")
+            return
+        if action in ("list", "列表"):
+            self._qzone_worker(conversation, "list")
+            return
+        if action in ("del", "delete", "删除"):
+            tid = _tail_after_first(command.rest)
+            if not tid:
+                self._reply_local(conversation, "用法：/qzone del 说说id")
+                return
+            self._qzone_worker(conversation, "delete", tid)
+            return
+        if not self.settings["qzone_enabled"]:
+            self._reply_local(
+                conversation,
+                "QQ 空间发送还没开启。先在插件设置里打开 qzone_enabled，或发 /qzone on。",
+            )
+            return
+        body = command.rest.strip()
+        if not body:
+            self._reply_local(conversation, "用法：/qzone 要发的内容")
+            return
+        self._qzone_worker(conversation, "publish", body)
+
+    def _qzone_worker(self, conversation: str, action: str, value: str = "") -> None:
+        client = self.client
+        if client is None:
+            self._reply_local(conversation, "OneBot 客户端还没准备好。")
+            return
+
+        def work() -> None:
+            try:
+                if action == "publish":
+                    client.publish_qzone(
+                        value,
+                        QZONE_RIGHTS[self.settings["qzone_permission"]],
+                        target_uins=self.settings["qzone_target_uins"],
+                    )
+                    result = "已发到 QQ 空间。"
+                elif action == "delete":
+                    client.delete_qzone(value)
+                    result = "那条说说已删除。"
+                else:
+                    data = client.list_qzone(10)
+                    result = _format_qzone(data)
+            except Exception as exc:
+                result = f"QQ 空间操作失败：{exc}"
+            self._dispatch.emit(lambda: self._reply_local(conversation, result, 2000))
+
+        threading.Thread(target=work, name="qq-bridge-qzone", daemon=True).start()
+
+    def _status_text(self) -> str:
+        connection = self.store.runtime.get("connection_ok")
+        if connection is True:
+            state = "已连接"
+        elif connection is False:
+            state = "连接失败"
+        else:
+            state = "还没检查"
+        port = self.server.bound_port if self.server is not None else 0
+        lines = [
+            f"SnowLuma：{state}（{self.settings['snowluma_http']}）",
+            f"事件端口：{port or '未启动'}",
+            f"白名单：好友 {len(self.settings['allow_private'])} 个，群 {len(self.settings['allow_groups'])} 个",
+            f"记忆：{len(self.store.memories(500))} 条；黑话：{len(self.store.slang_terms())} 条",
+            f"QQ 空间：{'开启' if self.settings['qzone_enabled'] else '关闭'}",
+        ]
+        return "\n".join(lines)
+
+    # ---------- 连接检查 ----------
+
+    def check_async(self, conversation: str = "", manual: bool = False) -> None:
+        client = self.client
+        if client is None or self._checking:
+            return
+        self._checking = True
+
+        def work() -> None:
+            try:
+                info = client.get_login_info()
+                user_id = str(info.get("user_id", "") or "")
+                nickname = str(info.get("nickname", "") or "")
+                text = f"SnowLuma 已连接：{nickname or 'QQ'}（{user_id}）"
+                ok = True
+            except Exception as exc:
+                text = f"SnowLuma 连接失败：{exc}"
+                ok = False
+            self._dispatch.emit(
+                lambda: self._after_check(ok, text, conversation, manual)
+            )
+
+        threading.Thread(target=work, name="qq-bridge-check", daemon=True).start()
+
+    def _after_check(
+        self, ok: bool, text: str, conversation: str, manual: bool = False
+    ) -> None:
+        self._checking = False
+        self._last_check = time.time()
+        if not self.started:
+            return
+        self.store.set_connection(ok)
+        self.store.flush()
+        self._log(text)
+        if conversation and ok:
+            self._reply_local(conversation, text, 600)
+        elif not ok and (manual or self.settings["announce"]):
+            self._say_main(text[:200], 6000)
+
+    # ---------- 记忆整理 ----------
+
+    def _maybe_compact(self, force: bool = False, callback: Callable[[str], None] | None = None) -> None:
+        if self._compacting:
+            if callback is not None:
+                callback("已经在整理中了，稍等。")
+            return
+        if not (self.settings["memory_enabled"] or self.settings["slang_enabled"]):
+            if callback is not None:
+                callback("长期记忆和黑话库都关着，先在“高级”页打开。")
+            return
+        now = time.time()
+        if not force and now < self._compact_cooldown_until:
+            return
+        inbox = self.store.inbox()
+        minimum = 3 if force else self.settings["memory_min_batch"]
+        if len(inbox) < minimum:
+            if force and self._compact_notify:
+                self._reply_local(self._compact_notify, "聊天记录太少，先不用整理。")
+                self._compact_notify = ""
+            if callback is not None:
+                callback("聊天记录太少，先不用整理。")
+            return
+        last = float(self.store.runtime.get("last_compact_at", 0) or 0)
+        interval = self.settings["memory_interval_minutes"] * 60
+        if not force and now - last < interval:
+            return
+
+        batch = inbox[-self.settings["memory_batch_size"] :]
+        prompt = analysis.compaction_prompt(batch, self.store.slang_terms().keys())
+        self._compacting = True
+        self._compact_started_at = now
+
+        def on_done(reply: str | None, error: str | None) -> None:
+            self._compacting = False
+            notify = self._compact_notify
+            self._compact_notify = ""
+            if error:
+                self._compact_cooldown_until = time.time() + 300
+                self._log(f"记忆整理失败：{error}")
+                if notify:
+                    self._reply_local(notify, f"整理失败：{error}")
+                if callback is not None:
+                    callback(f"整理失败：{error}")
+                return
+            memories, slang = analysis.parse_compaction(reply or "")
+            for text in memories:
+                self.store.add_memory(text, importance=45, source="auto")
+            for item in slang:
+                self.store.add_slang(
+                    item.get("term", ""),
+                    item.get("meaning", ""),
+                    item.get("example", ""),
+                    source="auto",
+                )
+            self.store.prune_memory(self.settings["memory_max_items"])
+            self.store.prune_slang(self.settings["slang_max_terms"])
+            self.store.clear_inbox(keep=3)
+            self.store.mark_compacted()
+            self.store.flush()
+            self._log(f"记忆整理完成：新增 {len(memories)} 条记忆、{len(slang)} 条黑话。")
+            summary = f"整理完成：新增 {len(memories)} 条记忆、{len(slang)} 条黑话。"
+            if notify:
+                self._reply_local(notify, summary)
+            if callback is not None:
+                callback(summary)
+
+        try:
+            self.api.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "你是聊天记录整理助手，只输出 JSON，不要输出其他内容。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                on_done,
+            )
+        except Exception as exc:
+            self._compacting = False
+            self._compact_cooldown_until = time.time() + 300
+            self._log(f"发起记忆整理失败：{exc}")
+
+
+def _tail_after_first(rest: str) -> str:
+    parts = str(rest or "").strip().split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _parse_allow_target(value: str) -> tuple[str, str]:
+    text = str(value or "").strip()
+    lowered = text.lower()
+    for prefix in ("group:", "群:", "群聊:", "g:"):
+        if lowered.startswith(prefix):
+            return "group", "".join(ch for ch in text[len(prefix) :] if ch.isdigit())
+    for prefix in ("private:", "好友:", "私聊:", "p:"):
+        if lowered.startswith(prefix):
+            return "private", "".join(ch for ch in text[len(prefix) :] if ch.isdigit())
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits:
+        return "private", digits
+    return "invalid", ""
+
+
+def _format_qzone(data: Any) -> str:
+    items: Any = data
+    if isinstance(data, dict):
+        for key in ("list", "feeds", "messages", "data", "msglist"):
+            value = data.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+    if not isinstance(items, list) or not items:
+        return "最近没有读到说说。"
+    lines = ["最近的说说："]
+    for item in items[:5]:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content") or item.get("text") or item.get("summary") or ""
+        tid = item.get("tid") or item.get("id") or ""
+        content = " ".join(str(content).split())[:60]
+        lines.append(f"- {content or '（无正文）'}" + (f"  [{tid}]" if tid else ""))
+    return "\n".join(lines) if len(lines) > 1 else "最近没有读到说说。"

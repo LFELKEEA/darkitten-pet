@@ -1,0 +1,105 @@
+{
+  "id": "lfelkeea.qq_bridge",
+  "name": "QQ 桥接（SnowLuma）",
+  "version": "1.4.0",
+  "api_version": 1,
+  "entry": "main.py",
+  "description": "通过 SnowLuma 把 QQ 私聊和群聊接进桌宠：可视化设置面板、人格卡、长期记忆、黑话库、白名单、习惯化回复、表情、QQ 空间、SnowLuma 自动启停、聊天图片识别和语音包发送。",
+  "author": "LFELKEEA",
+  "highlights": [
+    {
+      "label": "配置方式",
+      "value": "可视化面板"
+    },
+    {
+      "label": "连接方式",
+      "value": "OneBot 11 HTTP"
+    },
+    {
+      "label": "人格与记忆",
+      "value": "本地保存"
+    },
+    {
+      "label": "外发范围",
+      "value": "白名单"
+    },
+    {
+      "label": "进程管理",
+      "value": "随插件自动启停"
+    },
+    {
+      "label": "图片消息",
+      "value": "视觉 + OCR 兜底"
+    },
+    {
+      "label": "语音消息",
+      "value": "语音包导入 / 本机扫描"
+    }
+  ],
+  "permissions": [
+    "pet.say",
+    "ai.chat",
+    "timer",
+    "settings"
+  ],
+  "requires": [
+    {
+      "name": "SnowLuma",
+      "version": ">=2.2.1",
+      "url": "https://github.com/SnowLuma/SnowLuma/releases",
+      "note": "本地运行并扫码登录 QQ；插件通过 OneBot 11 HTTP 连接。"
+    },
+    {
+      "name": "桌宠 LFELKEEA",
+      "version": ">=1.1.1",
+      "url": "https://github.com/LFELKEEA/darkitten-launcher/releases",
+      "note": "1.1.1 起支持插件自带设置面板；旧版本没有“设置”按钮。"
+    }
+  ],
+  "settings": {
+    "snowluma_http": "http://127.0.0.1:3000",
+    "http_port": 8766,
+    "owner_qq": "",
+    "allow_private": [],
+    "allow_groups": [],
+    "qzone_enabled": false,
+    "group_trigger": "at",
+    "memory_enabled": true,
+    "slang_enabled": true,
+    "habit_enabled": true,
+    "auto_face": true,
+    "local_echo": false,
+    "announce": false,
+    "access_token": "",
+    "http_host": "127.0.0.1",
+    "event_path": "/onebot",
+    "event_secret": "",
+    "bot_name": "小猫",
+    "command_prefix": "/",
+    "reply_chance": 0.15,
+    "max_replies_per_minute": 6,
+    "max_reply_chars": 300,
+    "face_ids": [
+      "14",
+      "13",
+      "178",
+      "179"
+    ],
+    "sticker_paths": [],
+    "face_probability": 0.03,
+    "sticker_probability": 0.03,
+    "memory_interval_minutes": 30,
+    "memory_min_batch": 8,
+    "memory_batch_size": 40,
+    "memory_max_items": 80,
+    "slang_max_terms": 200,
+    "qzone_permission": "friends",
+    "qzone_target_uins": [],
+    "auto_start_snowluma": true,
+    "snowluma_dir": "",
+    "vision_enabled": true,
+    "voice_packs": [],
+    "voice_reply_enabled": false,
+    "voice_reply_probability": 0.08
+  }
+}
