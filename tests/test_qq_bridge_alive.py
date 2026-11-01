@@ -234,6 +234,14 @@ class ServiceAliveTests(unittest.TestCase):
         self.assertEqual(settings["alive_recall"], 10)
         self.assertTrue(settings["alive_report"])
 
+    def test_alive_settings_survive_local_backup(self) -> None:
+        api, service = self.make_service({"alive_enabled": False, "alive_recall": 2})
+        service.apply_settings({"alive_report": False})
+        local = service._load_local_settings()
+        self.assertFalse(local["alive_enabled"])
+        self.assertEqual(local["alive_recall"], 2)
+        self.assertFalse(local["alive_report"])
+
     def test_system_prompt_includes_alive_block(self) -> None:
         api, service = self.make_service()
         message = self.message(text_body="我想喝冰美式")
