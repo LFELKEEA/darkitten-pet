@@ -565,7 +565,10 @@ class QQBridgeDialog(QDialog):
     def _build_whitelist(self) -> QWidget:
         page, layout = self._page()
         layout.addWidget(
-            _hint("只有白名单里的私聊和群会被响应，也才会收到主动消息。主人 QQ 自动放行。")
+            _hint(
+                "只有白名单里的私聊和群会被响应，也才会收到主动消息。主人 QQ 自动放行。\n"
+                "备注只用于自己辨认，例如“室友小明”，不影响白名单匹配。"
+            )
         )
         self.owner_label = QLabel("")
         self.owner_label.setObjectName("hint")
@@ -576,8 +579,13 @@ class QQBridgeDialog(QDialog):
         private_layout.setSpacing(8)
         self.private_list = QListWidget()
         self.private_list.setMinimumHeight(130)
+        self.private_list.itemSelectionChanged.connect(
+            lambda: self._load_allow_note("private")
+        )
         self.private_input = QLineEdit()
         self.private_input.setPlaceholderText("QQ 号，纯数字")
+        self.private_note = QLineEdit()
+        self.private_note.setPlaceholderText("备注（可选），例如：室友小明")
         private_actions = QHBoxLayout()
         add_private = QPushButton("添加")
         add_private.setObjectName("primary")
@@ -587,8 +595,14 @@ class QQBridgeDialog(QDialog):
         private_actions.addWidget(self.private_input, 1)
         private_actions.addWidget(add_private)
         private_actions.addWidget(del_private)
+        private_note_row = QHBoxLayout()
+        save_private_note = QPushButton("保存备注")
+        save_private_note.clicked.connect(lambda: self._save_allow_note("private"))
+        private_note_row.addWidget(self.private_note, 1)
+        private_note_row.addWidget(save_private_note)
         private_layout.addWidget(self.private_list)
         private_layout.addLayout(private_actions)
+        private_layout.addLayout(private_note_row)
         layout.addWidget(private_box)
 
         group_box = QGroupBox("群聊")
@@ -596,8 +610,13 @@ class QQBridgeDialog(QDialog):
         group_layout.setSpacing(8)
         self.group_list = QListWidget()
         self.group_list.setMinimumHeight(130)
+        self.group_list.itemSelectionChanged.connect(
+            lambda: self._load_allow_note("group")
+        )
         self.group_input = QLineEdit()
         self.group_input.setPlaceholderText("群号，纯数字")
+        self.group_note = QLineEdit()
+        self.group_note.setPlaceholderText("备注（可选），例如：公司摸鱼群")
         group_actions = QHBoxLayout()
         add_group = QPushButton("添加")
         add_group.setObjectName("primary")
@@ -607,8 +626,14 @@ class QQBridgeDialog(QDialog):
         group_actions.addWidget(self.group_input, 1)
         group_actions.addWidget(add_group)
         group_actions.addWidget(del_group)
+        group_note_row = QHBoxLayout()
+        save_group_note = QPushButton("保存备注")
+        save_group_note.clicked.connect(lambda: self._save_allow_note("group"))
+        group_note_row.addWidget(self.group_note, 1)
+        group_note_row.addWidget(save_group_note)
         group_layout.addWidget(self.group_list)
         group_layout.addLayout(group_actions)
+        group_layout.addLayout(group_note_row)
         layout.addWidget(group_box)
         return page
 
@@ -1217,12 +1242,23 @@ class QQBridgeDialog(QDialog):
 
     def _refresh_whitelist(self) -> None:
         items = self.service.allow_items()
-        self.private_list.clear()
-        for value in items["private"]:
-            self.private_list.addItem(value)
-        self.group_list.clear()
-        for value in items["group"]:
-            self.group_list.addItem(value)
+        notes = self.service.allow_notes()
+        for widget, kind in (
+            (self.private_list, "private"),
+            (self.group_list, "group"),
+        ):
+            widget.blockSignals(True)
+            widget.clear()
+            for value in items[kind]:
+                note = notes.get(f"{kind}:{value}", "")
+                item = QListWidgetItem(f"{value}  ·  {note}" if note else value)
+                item.setData(Qt.ItemDataRole.UserRole, value)
+                if note:
+                    item.setToolTip(note)
+                widget.addItem(item)
+            widget.blockSignals(False)
+        self.private_note.clear()
+        self.group_note.clear()
 
     def _refresh_memory(self) -> None:
         self.memory_list.clear()
@@ -1344,25 +1380,60 @@ class QQBridgeDialog(QDialog):
 
         self.service.takeover_snowluma(done)
 
+    def _allow_target_value(self, kind: str) -> str:
+        widget = self.private_list if kind == "private" else self.group_list
+        current = widget.currentItem()
+        if current is None:
+            return ""
+        value = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        return value or current.text().split("  ·  ")[0].strip()
+
+    def _load_allow_note(self, kind: str) -> None:
+        target = self._allow_target_value(kind)
+        note = self.private_note if kind == "private" else self.group_note
+        note.setText(self.service.allow_note(kind, target) if target else "")
+
+    def _select_allow_target(self, kind: str, target: str) -> None:
+        widget = self.private_list if kind == "private" else self.group_list
+        for row in range(widget.count()):
+            item = widget.item(row)
+            if item is not None and str(item.data(Qt.ItemDataRole.UserRole)) == target:
+                widget.setCurrentRow(row)
+                return
+
+    def _save_allow_note(self, kind: str) -> None:
+        target = self._allow_target_value(kind)
+        if not target:
+            self._notify("先选中要加备注的好友或群。", False)
+            return
+        note = self.private_note if kind == "private" else self.group_note
+        text = self.service.set_allow_note(kind, target, note.text())
+        self._refresh_whitelist()
+        self._select_allow_target(kind, target)
+        self._notify(text, text.startswith("已"))
+
     def _allow_change(self, kind: str, add: bool) -> None:
         if add:
             source = self.private_input if kind == "private" else self.group_input
+            note_input = self.private_note if kind == "private" else self.group_note
             target = source.text().strip()
             if not target:
                 self._notify("先填 QQ 号或群号。", False)
                 return
-            text = self.service.allow_target_text(kind, target, True)
-            if not text.startswith("已加入") and not text.startswith("已经"):
+            text = self.service.allow_target_text(
+                kind, target, True, note_input.text().strip()
+            )
+            if not text.startswith("已"):
                 self._notify(text, False)
                 return
             source.clear()
+            note_input.clear()
         else:
-            widget = self.private_list if kind == "private" else self.group_list
-            current = widget.currentItem()
-            if current is None:
+            target = self._allow_target_value(kind)
+            if not target:
                 self._notify("先选中要删除的条目。", False)
                 return
-            text = self.service.allow_target_text(kind, current.text(), False)
+            text = self.service.allow_target_text(kind, target, False)
         self._refresh_whitelist()
         self._refresh_status()
         self._notify(text, text.startswith("已"))

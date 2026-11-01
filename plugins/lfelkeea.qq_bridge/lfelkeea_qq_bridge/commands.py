@@ -49,7 +49,7 @@ def help_text(prefix: str = "/") -> str:
         f"{mark}persona 查看人格卡；{mark}persona set 文字 修改",
         f"{mark}memory list | add 内容 | del 关键词",
         f"{mark}slang list | add 词=含义 | del 词",
-        f"{mark}allow list | add 123456 | add group:123456 | del 123456",
+        f"{mark}allow list | add 123456 [备注] | add group:123456 [备注] | del 123456",
         f"{mark}say private:123456 内容 / {mark}say group:123456 内容",
         f"{mark}voice 发一条随机语音；{mark}voice group:123456 语音包目录",
         f"{mark}qzone 内容 发一条说说（需先在设置里开启）",

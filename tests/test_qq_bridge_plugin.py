@@ -483,6 +483,50 @@ class ServiceTests(unittest.TestCase):
         service._allow_target("private", "22222", add=False)
         self.assertFalse(service.is_allowed("private:22222"))
 
+    def test_whitelist_notes(self) -> None:
+        api, service = self.make_service()
+        result = service.allow_target_text("private", "22222", True, "  室友   小明 ")
+        self.assertIn("室友 小明", result)
+        self.assertEqual(service.allow_notes()["private:22222"], "室友 小明")
+        self.assertEqual(api.saved[-1]["allow_notes"]["private:22222"], "室友 小明")
+
+        result = service.set_allow_note("private", "22222", "隔壁宿舍")
+        self.assertIn("已保存", result)
+        self.assertEqual(service.allow_note("private", "22222"), "隔壁宿舍")
+        self.assertIn("没有这个号", service.set_allow_note("private", "66666", "x"))
+
+        service.allow_target_text("private", "22222", False)
+        self.assertNotIn("private:22222", service.allow_notes())
+
+    def test_normalize_whitelist_notes(self) -> None:
+        settings = normalize_settings(
+            {
+                "allow_private": ["123"],
+                "allow_groups": ["456"],
+                "allow_notes": {
+                    "private:123": " 小明 ",
+                    "群:456": "摸鱼群",
+                    "private:999": "已经不在白名单",
+                    "bad": "x",
+                },
+            }
+        )
+        self.assertEqual(
+            settings["allow_notes"],
+            {"private:123": "小明", "group:456": "摸鱼群"},
+        )
+
+    def test_allow_command_with_note(self) -> None:
+        api, service = self.make_service()
+        service._on_event_main(private_event("/allow add 33333 同事", message_id=7))
+        self.assertTrue(service.client.event.wait(2))
+        self.assertEqual(service.allow_note("private", "33333"), "同事")
+        self.assertIn("同事", service.client.sent[-1][1][0]["data"]["text"])
+
+        service._on_event_main(private_event("/allow list", message_id=8))
+        self.assertTrue(service.client.event.wait(2))
+        self.assertIn("33333（同事）", service.client.sent[-1][1][0]["data"]["text"])
+
     def test_allow_target_parsing(self) -> None:
         self.assertEqual(_parse_allow_target("group:123"), ("group", "123"))
         self.assertEqual(_parse_allow_target("群:456"), ("group", "456"))

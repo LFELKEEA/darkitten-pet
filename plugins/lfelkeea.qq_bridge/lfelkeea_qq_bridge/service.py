@@ -84,6 +84,26 @@ def _as_ids(value: Any, digits_only: bool = True) -> list[str]:
     return result
 
 
+def _clean_note(value: Any, limit: int = 40) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _as_notes(value: Any) -> dict[str, str]:
+    """白名单备注：键统一成 private:123 / group:456，空备注直接丢掉。"""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for raw_key, raw_note in value.items():
+        kind, target = _parse_allow_target(str(raw_key or ""))
+        note = _clean_note(raw_note)
+        if kind == "invalid" or not target or not note:
+            continue
+        result[f"{kind}:{target}"] = note
+        if len(result) >= 200:
+            break
+    return result
+
+
 def _as_path_list(value: Any, limit: int = 50) -> list[str]:
     if isinstance(value, str):
         raw = value.splitlines()
@@ -110,6 +130,16 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     trigger = str(data.get("group_trigger", "at") or "at").strip().lower()
     if trigger not in ("at", "all"):
         trigger = "at"
+    private_ids = _as_ids(data.get("allow_private"))
+    group_ids = _as_ids(data.get("allow_groups"))
+    allowed_keys = {f"private:{item}" for item in private_ids} | {
+        f"group:{item}" for item in group_ids
+    }
+    notes = {
+        key: note
+        for key, note in _as_notes(data.get("allow_notes")).items()
+        if key in allowed_keys
+    }
     return {
         "snowluma_http": str(data.get("snowluma_http", "http://127.0.0.1:3000") or "").strip()
         or "http://127.0.0.1:3000",
@@ -119,8 +149,9 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         "event_path": str(data.get("event_path", "/onebot") or "/onebot").strip(),
         "event_secret": str(data.get("event_secret", "") or "").strip(),
         "owner_qq": "".join(ch for ch in str(data.get("owner_qq", "") or "") if ch.isdigit()),
-        "allow_private": _as_ids(data.get("allow_private")),
-        "allow_groups": _as_ids(data.get("allow_groups")),
+        "allow_private": private_ids,
+        "allow_groups": group_ids,
+        "allow_notes": notes,
         "qzone_enabled": _as_bool(data.get("qzone_enabled"), False),
         "qzone_permission": permission,
         "qzone_target_uins": _as_ids(data.get("qzone_target_uins")),
@@ -376,25 +407,48 @@ class QQBridgeService(QObject):
                 {
                     "allow_private": list(self.settings["allow_private"]),
                     "allow_groups": list(self.settings["allow_groups"]),
+                    "allow_notes": dict(self.settings["allow_notes"]),
                 }
             )
         except Exception as exc:
             self._log(f"保存白名单失败：{exc}")
 
-    def _allow_target(self, kind: str, target: str, add: bool) -> str:
+    def _allow_target(
+        self, kind: str, target: str, add: bool, note: str | None = None
+    ) -> str:
         bucket = "allow_groups" if kind == "group" else "allow_private"
         values = list(self.settings[bucket])
+        notes = dict(self.settings["allow_notes"])
+        key = f"{kind}:{target}"
+        cleaned = _clean_note(note) if note is not None else ""
         if add:
             if target in values:
-                return "已经在白名单里了。"
+                if not cleaned:
+                    return "已经在白名单里了。"
+                if notes.get(key) == cleaned:
+                    return "备注没有变化。"
+                notes[key] = cleaned
+                self.settings["allow_notes"] = notes
+                self._save_whitelist()
+                return f"已更新备注：{key}（{cleaned}）"
             values.append(target)
-        else:
-            if target not in values:
-                return "白名单里没有这个号。"
-            values.remove(target)
+            if cleaned:
+                notes[key] = cleaned
+            else:
+                notes.pop(key, None)
+            self.settings[bucket] = values
+            self.settings["allow_notes"] = notes
+            self._save_whitelist()
+            suffix = f"（{cleaned}）" if cleaned else ""
+            return f"已加入白名单：{key}{suffix}"
+        if target not in values:
+            return "白名单里没有这个号。"
+        values.remove(target)
+        notes.pop(key, None)
         self.settings[bucket] = values
+        self.settings["allow_notes"] = notes
         self._save_whitelist()
-        return ("已加入白名单：" if add else "已移出白名单：") + f"{kind}:{target}"
+        return f"已移出白名单：{key}"
 
     def apply_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         """保存设置；连接相关字段变化时重建客户端和事件监听。"""
@@ -647,11 +701,46 @@ class QQBridgeService(QObject):
             "group": list(self.settings["allow_groups"]),
         }
 
-    def allow_target_text(self, kind: str, target: str, add: bool) -> str:
+    def allow_notes(self) -> dict[str, str]:
+        return dict(self.settings["allow_notes"])
+
+    def allow_note(self, kind: str, target: str) -> str:
+        key = f"{'group' if kind == 'group' else 'private'}:{str(target or '').strip()}"
+        return str(self.settings["allow_notes"].get(key, ""))
+
+    def set_allow_note(self, kind: str, target: str, note: str) -> str:
+        bucket = "allow_groups" if kind == "group" else "allow_private"
+        value = "".join(ch for ch in str(target or "") if ch.isdigit())
+        if not value:
+            return "请先选中白名单里的好友或群。"
+        if value not in self.settings[bucket]:
+            return "白名单里没有这个号。"
+        key = f"{'group' if kind == 'group' else 'private'}:{value}"
+        notes = dict(self.settings["allow_notes"])
+        cleaned = _clean_note(note)
+        if cleaned:
+            if notes.get(key) == cleaned:
+                return "备注没有变化。"
+            notes[key] = cleaned
+            message = f"备注已保存：{key}（{cleaned}）"
+        else:
+            if key not in notes:
+                return "这个号还没有备注。"
+            notes.pop(key, None)
+            message = f"备注已清空：{key}"
+        self.settings["allow_notes"] = notes
+        self._save_whitelist()
+        return message
+
+    def allow_target_text(
+        self, kind: str, target: str, add: bool, note: str | None = None
+    ) -> str:
         digits = "".join(ch for ch in str(target or "") if ch.isdigit())
         if not digits:
             return "请填写 QQ 号或群号（纯数字）。"
-        return self._allow_target("group" if kind == "group" else "private", digits, add)
+        return self._allow_target(
+            "group" if kind == "group" else "private", digits, add, note
+        )
 
     # ---------- 语音包 ----------
 
@@ -1293,9 +1382,18 @@ class QQBridgeService(QObject):
         if action in ("list", "列表"):
             private = self.settings["allow_private"]
             groups = self.settings["allow_groups"]
+            notes = self.settings["allow_notes"]
+
+            def tagged(kind: str, values: list[str]) -> str:
+                items = []
+                for value in values:
+                    note = notes.get(f"{kind}:{value}")
+                    items.append(f"{value}（{note}）" if note else value)
+                return "、".join(items)
+
             text = "白名单："
-            text += "\n好友：" + ("、".join(private) if private else "（空）")
-            text += "\n群：" + ("、".join(groups) if groups else "（空）")
+            text += "\n好友：" + (tagged("private", private) if private else "（空）")
+            text += "\n群：" + (tagged("group", groups) if groups else "（空）")
             if self.owner:
                 text += f"\n主人：{self.owner}"
             else:
@@ -1303,20 +1401,29 @@ class QQBridgeService(QObject):
             self._reply_local(conversation, text)
             return
         if action not in ("add", "添加", "del", "delete", "删除"):
-            self._reply_local(conversation, "用法：/allow list | add 123456 | add group:123456 | del 123456")
+            self._reply_local(
+                conversation,
+                "用法：/allow list | add 123456 [备注] | add group:123456 [备注] | del 123456",
+            )
             return
         target_text = _tail_after_first(command.rest)
+        note = ""
         if not target_text:
             kind, target = split_conversation(conversation)
         else:
-            kind, target = _parse_allow_target(target_text)
+            parts = target_text.split(None, 1)
+            note = parts[1].strip() if len(parts) > 1 else ""
+            kind, target = _parse_allow_target(parts[0])
             if kind == "invalid":
                 self._reply_local(conversation, "格式不对：用 123456 或 group:123456。")
                 return
         if not target:
             self._reply_local(conversation, "缺少 QQ 号或群号。")
             return
-        result = self._allow_target(kind, target, add=action in ("add", "添加"))
+        adding = action in ("add", "添加")
+        result = self._allow_target(
+            kind, target, add=adding, note=note if adding else None
+        )
         self._reply_local(conversation, result)
 
     def _command_say(self, command: Command, conversation: str) -> None:
