@@ -229,6 +229,21 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(store.remove(item["id"]))
         self.assertEqual(store.all(), [])
 
+    def test_remove_many_deletes_selected_and_saves_once(self):
+        api = FakeAPI(storage={})
+        store = inspiration_store.InspirationStore(api)
+        first = store.add("第一条", "第一条灵感")
+        second = store.add("第二条", "第二条灵感")
+        third = store.add("第三条", "第三条灵感")
+        saved = api.saved
+
+        self.assertEqual(store.remove_many([first["id"], third["id"], "missing"]), 2)
+        self.assertEqual([item["id"] for item in store.all()], [second["id"]])
+        self.assertEqual(api.saved, saved + 1)
+        self.assertEqual(store.remove_many([]), 0)
+        self.assertEqual(store.remove_many(None), 0)
+        self.assertEqual(api.saved, saved + 1)
+
 
 class PathTests(unittest.TestCase):
     def test_data_dir_is_plugin_parent_parent(self):
@@ -272,6 +287,49 @@ class UISmokeTests(unittest.TestCase):
         dialog.close()
         self.app.processEvents()
         plugin_main.teardown()
+
+    def test_one_click_deletes_multiple_selected_without_confirmation(self):
+        from PySide6.QtWidgets import QAbstractItemView
+
+        from lfelkeea_qq_inspiration import service as plugin_main
+
+        items = [
+            {
+                "id": f"id{index}",
+                "title": f"灵感{index}",
+                "idea": f"点子{index}",
+                "source": "AI 生成",
+                "tags": [],
+                "created": "2026-11-02 10:00:00",
+            }
+            for index in range(4)
+        ]
+        api = FakeAPI(storage={"inspirations": items})
+        plugin_main.setup(api)
+        dialog = plugin_main.open_settings(api)
+        try:
+            self.assertEqual(
+                dialog.list_widget.selectionMode(), QAbstractItemView.ExtendedSelection
+            )
+            self.assertEqual(dialog.delete_button.text(), "一键删除（1）")
+
+            dialog.list_widget.clearSelection()
+            dialog.list_widget.item(0).setSelected(True)
+            dialog.list_widget.item(2).setSelected(True)
+            self.assertEqual(dialog.delete_button.text(), "一键删除（2）")
+
+            dialog.delete_button.click()
+            self.app.processEvents()
+
+            self.assertEqual(dialog.list_widget.count(), 2)
+            self.assertEqual(
+                [item["id"] for item in api.storage["inspirations"]], ["id1", "id3"]
+            )
+            self.assertIn("已删除 2 条", dialog.status_label.text())
+        finally:
+            dialog.close()
+            self.app.processEvents()
+            plugin_main.teardown()
 
 
 if __name__ == "__main__":

@@ -47,12 +47,18 @@ class InspirationStore:
         return item
 
     def remove(self, item_id: str) -> bool:
+        return self.remove_many([item_id]) > 0
+
+    def remove_many(self, item_ids) -> int:
+        targets = {str(item_id) for item_id in (item_ids or []) if item_id}
+        if not targets:
+            return 0
         before = len(self.items)
-        self.items = [item for item in self.items if item.get("id") != item_id]
-        if len(self.items) != before:
+        self.items = [item for item in self.items if item.get("id") not in targets]
+        removed = before - len(self.items)
+        if removed:
             self.save()
-            return True
-        return False
+        return removed
 
     def has_idea(self, idea: str) -> bool:
         key = _normalize(idea)

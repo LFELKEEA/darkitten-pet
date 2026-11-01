@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -149,6 +151,7 @@ def _refresh_list(window) -> None:
         _show_detail(window, current.data(Qt.UserRole))
     else:
         window.detail.setPlainText("")
+    _update_delete_button(window)
 
     counts = _store.source_counts()
     parts = [f"共 {len(_store.all())} 条"]
@@ -544,16 +547,47 @@ def _copy_to_workshop(window) -> None:
         pass
 
 
-def _delete(window) -> None:
-    current = window.list_widget.currentItem()
-    if not current:
+def _selected_ids(window) -> list[str]:
+    ids = []
+    for item in window.list_widget.selectedItems():
+        item_id = item.data(Qt.UserRole)
+        if item_id:
+            ids.append(str(item_id))
+    return ids
+
+
+def _update_delete_button(window) -> None:
+    button = getattr(window, "delete_button", None)
+    if button is None:
         return
-    item_id = current.data(Qt.UserRole)
-    if QMessageBox.question(window, "删除", "确定删除这条灵感？") != QMessageBox.Yes:
+    count = len(_selected_ids(window))
+    button.setText(f"一键删除（{count}）" if count else "一键删除")
+    button.setEnabled(count > 0)
+
+
+def _delete_selected(window) -> None:
+    ids = _selected_ids(window)
+    if not ids:
+        window.status_label.setText("先在左边选中要删除的灵感，可按住 Ctrl 或 Shift 多选")
         return
-    _store.remove(item_id)
+    removed = _store.remove_many(ids)
     _refresh_list(window)
-    window.status_label.setText("已删除")
+    window.status_label.setText(f"已删除 {removed} 条灵感" if removed else "没有删除任何灵感")
+
+
+def _show_list_menu(window, pos) -> None:
+    item = window.list_widget.itemAt(pos)
+    if item is None:
+        return
+    if not item.isSelected():
+        window.list_widget.clearSelection()
+        window.list_widget.setCurrentItem(item)
+        item.setSelected(True)
+    count = len(_selected_ids(window))
+    menu = QMenu(window)
+    action = menu.addAction(f"删除选中（{count} 条）" if count > 1 else "删除这条")
+    action.triggered.connect(lambda: _delete_selected(window))
+    menu.exec(window.list_widget.viewport().mapToGlobal(pos))
 
 
 def _on_dialog_closed(dialog) -> None:
@@ -612,9 +646,15 @@ def open_settings(api, parent=None):
 
     splitter = QSplitter(Qt.Horizontal)
     dialog.list_widget = QListWidget()
+    dialog.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+    dialog.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+    dialog.list_widget.customContextMenuRequested.connect(
+        lambda pos: _show_list_menu(dialog, pos)
+    )
     dialog.list_widget.currentItemChanged.connect(
         lambda current, _previous: _show_detail(dialog, current.data(Qt.UserRole)) if current else None
     )
+    dialog.list_widget.itemSelectionChanged.connect(lambda: _update_delete_button(dialog))
     splitter.addWidget(dialog.list_widget)
 
     right = QWidget()
@@ -626,18 +666,22 @@ def open_settings(api, parent=None):
     copy_btn = QPushButton("复制到工坊")
     copy_btn.clicked.connect(lambda: _copy_to_workshop(dialog))
     bottom.addWidget(copy_btn)
-    delete_btn = QPushButton("删除")
-    delete_btn.clicked.connect(lambda: _delete(dialog))
-    bottom.addWidget(delete_btn)
+    dialog.delete_button = QPushButton("一键删除")
+    dialog.delete_button.setToolTip("删除当前选中的灵感；按住 Ctrl 或 Shift 可以多选，点一次全部删除")
+    dialog.delete_button.clicked.connect(lambda: _delete_selected(dialog))
+    bottom.addWidget(dialog.delete_button)
     bottom.addStretch(1)
     right_layout.addLayout(bottom)
     splitter.addWidget(right)
     splitter.setSizes([280, 640])
     root.addWidget(splitter, 1)
 
-    dialog.status_label = QLabel("就绪")
+    dialog.status_label = QLabel("就绪 · 按住 Ctrl 或 Shift 可多选，Delete 键也能一键删除")
     dialog.status_label.setWordWrap(True)
     root.addWidget(dialog.status_label)
+
+    delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), dialog)
+    delete_shortcut.activated.connect(lambda: _delete_selected(dialog))
 
     dialog.finished.connect(lambda _result: _on_dialog_closed(dialog))
     _refresh_list(dialog)
