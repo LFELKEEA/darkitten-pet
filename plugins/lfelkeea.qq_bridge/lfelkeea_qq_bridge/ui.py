@@ -694,6 +694,32 @@ class QQBridgeDialog(QDialog):
 
     def _build_memory(self) -> QWidget:
         page, layout = self._page()
+        alive_box = QGroupBox("活人感内核")
+        alive_form = QFormLayout(alive_box)
+        alive_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        alive_form.setHorizontalSpacing(12)
+        alive_form.setVerticalSpacing(8)
+        self.alive_enabled = QCheckBox("接入活人感内核")
+        self.alive_enabled.setToolTip(
+            "读取「活人感内核」导出的状态、自我认识和长期记忆，让回复更像同一个人。\n"
+            "内核没安装或没启用时自动跳过，不影响原来的回复。"
+        )
+        self.alive_recall = QSpinBox()
+        self.alive_recall.setRange(0, 10)
+        self.alive_recall.setSuffix(" 条")
+        self.alive_report = QCheckBox("把聊天写回内核")
+        self.alive_report.setToolTip(
+            "把主人和盯人对象的聊天、用到的记忆、更正写回内核。\n"
+            "只在「活人感内核」已安装并启用时生效。"
+        )
+        self.alive_status = QLabel("")
+        self.alive_status.setObjectName("hint")
+        self.alive_status.setWordWrap(True)
+        alive_form.addRow("", self.alive_enabled)
+        alive_form.addRow("每次最多召回", self.alive_recall)
+        alive_form.addRow("", self.alive_report)
+        alive_form.addRow("", self.alive_status)
+        layout.addWidget(alive_box)
         layout.addWidget(
             _hint("长期记忆会随聊天自动积累。可以点“立即整理”手动总结，也可以补充或删除内容。")
         )
@@ -1356,6 +1382,9 @@ class QQBridgeDialog(QDialog):
         self.memory_batch.setValue(int(settings["memory_batch_size"]))
         self.memory_max.setValue(int(settings["memory_max_items"]))
         self.slang_max.setValue(int(settings["slang_max_terms"]))
+        self.alive_enabled.setChecked(bool(settings.get("alive_enabled", True)))
+        self.alive_recall.setValue(int(settings.get("alive_recall", 5)))
+        self.alive_report.setChecked(bool(settings.get("alive_report", True)))
 
         self.qzone_enabled.setChecked(bool(settings["qzone_enabled"]))
         perm_index = self.qzone_perm.findData(settings["qzone_permission"])
@@ -1448,6 +1477,9 @@ class QQBridgeDialog(QDialog):
             "memory_batch_size": self.memory_batch.value(),
             "memory_max_items": self.memory_max.value(),
             "slang_max_terms": self.slang_max.value(),
+            "alive_enabled": self.alive_enabled.isChecked(),
+            "alive_recall": self.alive_recall.value(),
+            "alive_report": self.alive_report.isChecked(),
             "watch_users": [
                 str(self.watch_list.item(index).data(Qt.ItemDataRole.UserRole))
                 for index in range(self.watch_list.count())
@@ -1555,6 +1587,7 @@ class QQBridgeDialog(QDialog):
                 f"收藏表情 {snapshot.get('custom_face_count', 0)} 个，"
                 f"QQ 空间{'开启' if snapshot['qzone_enabled'] else '关闭'}"
             )
+        self._refresh_alive(snapshot.get("alive"))
         last = float(snapshot.get("qzone_last_check", 0) or 0)
         stamp = time.strftime("%m-%d %H:%M", time.localtime(last)) if last else "还没检查"
         if hasattr(self, "qzone_auto_status"):
@@ -1591,6 +1624,27 @@ class QQBridgeDialog(QDialog):
             item = QListWidgetItem(value)
             item.setData(Qt.ItemDataRole.UserRole, value)
             self.watch_list.addItem(item)
+
+    def _refresh_alive(self, alive: dict[str, Any] | None) -> None:
+        if not hasattr(self, "alive_status"):
+            return
+        info = alive if isinstance(alive, dict) else {}
+        if not info.get("enabled"):
+            self.alive_status.setText("未接入：回复只使用本地人格卡和记忆。")
+            return
+        if not info.get("available"):
+            self.alive_status.setText(
+                "未检测到可用的内核导出：请安装并启用「活人感内核（姐妹人格与记忆）」，"
+                "或等它在桌宠里运行一分钟后再刷新。"
+            )
+            return
+        age = float(info.get("age_seconds") or 0)
+        self.alive_status.setText(
+            f"已接入：名字 {info.get('name') or '未命名'}，"
+            f"状态 {info.get('state') or '未知'}，"
+            f"长期记忆 {info.get('memories', 0)} 条、情节 {info.get('episodes', 0)} 条，"
+            f"导出 {max(0, int(age))} 秒前。"
+        )
 
     def _refresh_memory(self) -> None:
         self.memory_list.clear()

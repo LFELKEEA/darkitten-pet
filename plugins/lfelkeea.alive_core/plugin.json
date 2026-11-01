@@ -1,0 +1,70 @@
+{
+  "id": "lfelkeea.alive_core",
+  "name": "活人感内核（姐妹人格与记忆）",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.py",
+  "description": "把身份、记忆、状态和节律串起来：长期记住主人的偏好和约定，按遗忘曲线变淡、被用过的才加固，更正保留历史；有自己的昼夜节律和主动额度，没有真实信号就允许沉默；把状态和可召回的记忆导出给 QQ 桥接，让私聊和群聊也能接上连续的生活。",
+  "author": "LFELKEEA",
+  "highlights": [
+    {
+      "label": "身份层",
+      "value": "core + 可成长段"
+    },
+    {
+      "label": "记忆",
+      "value": "情节 / 印象 / 偏好"
+    },
+    {
+      "label": "遗忘",
+      "value": "曲线衰减 + 复述加固"
+    },
+    {
+      "label": "更正",
+      "value": "旧版保留可回滚"
+    },
+    {
+      "label": "状态",
+      "value": "节律慢变，只管语气"
+    },
+    {
+      "label": "主动",
+      "value": "有信号才醒，有每日额度"
+    },
+    {
+      "label": "边界",
+      "value": "不碰权限与外发"
+    },
+    {
+      "label": "协作",
+      "value": "向 QQ 桥接导出上下文"
+    }
+  ],
+  "permissions": [
+    "pet.say",
+    "pet.action",
+    "ai.chat",
+    "timer",
+    "events",
+    "settings"
+  ],
+  "settings": {
+    "enabled": true,
+    "name": "喵呜",
+    "quiet_start": "23:30",
+    "quiet_end": "07:30",
+    "quiet_screen": false,
+    "screen_note": true,
+    "pet_reactions": true,
+    "proactive_enabled": true,
+    "proactive_per_day": 3,
+    "proactive_min_minutes": 60,
+    "consolidate_enabled": true,
+    "consolidate_ai": true,
+    "consolidate_minutes": 30,
+    "consolidate_batch": 30,
+    "share_with_qq": true,
+    "recall_limit": 6,
+    "recall_chars": 420
+  }
+}

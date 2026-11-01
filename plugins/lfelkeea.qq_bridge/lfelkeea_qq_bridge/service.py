@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
 from collections import deque
@@ -14,6 +15,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, Signal
 
 from . import analysis, tts as tts_engine, vision
+from .alive import AliveLink
 from .commands import Command, help_text, parse_command
 from .onebot import EventServer, OneBotClient, OneBotError, split_conversation
 from .snowluma import SnowLumaManager
@@ -229,6 +231,9 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         "custom_face_ids": _as_ids(
             data.get("custom_face_ids"), digits_only=False
         )[:200],
+        "alive_enabled": _as_bool(data.get("alive_enabled"), True),
+        "alive_recall": _as_int(data.get("alive_recall"), 5, 0, 10),
+        "alive_report": _as_bool(data.get("alive_report"), True),
     }
 
 
@@ -244,6 +249,8 @@ class QQBridgeService(QObject):
         self.state_root = Path(api.manager.state_dir) / PLUGIN_ID
         self.settings = self._initial_settings()
         self.store = JsonStore(self.state_root, self.persona_default)
+        self.alive = AliveLink(api, self._log)
+        self.alive.configure(self.settings)
         self.snowluma = SnowLumaManager(
             self.state_root, self._log, on_ready=self._after_snowluma_ready
         )
@@ -326,6 +333,7 @@ class QQBridgeService(QObject):
         if self.started:
             return
         self.settings = normalize_settings(self.api.settings)
+        self.alive.configure(self.settings)
         self.client = OneBotClient(
             self.settings["snowluma_http"], self.settings["access_token"]
         )
@@ -570,6 +578,7 @@ class QQBridgeService(QObject):
         )
         was_qzone_auto = bool(self.settings.get("qzone_auto_reply"))
         self.settings = updated
+        self.alive.configure(updated)
         if updated["qzone_auto_reply"] and not was_qzone_auto:
             # 新开启时把当前已有评论当作基线，不补回复旧评论。
             self.store.reset_qzone_baseline()
@@ -663,6 +672,7 @@ class QQBridgeService(QObject):
             "custom_face_count": len(self._custom_faces)
             or len(self.settings["custom_face_ids"]),
             "snowluma_managed": self.snowluma.status(),
+            "alive": self.alive.status(),
         }
 
     def probe(self, callback: Callable[[bool, str], None]) -> None:
@@ -1162,6 +1172,7 @@ class QQBridgeService(QObject):
             text or "[图片]",
             name=message.sender_name,
         )
+        self._report_incoming(message, text)
 
         if self.is_owner(message.user_id) and (
             message.is_private or message.group_id in self.settings["allow_groups"]
@@ -1190,6 +1201,68 @@ class QQBridgeService(QObject):
         if message.is_private:
             return True
         return message.group_id in self.settings["allow_groups"]
+
+    # ---------- 活人感内核 ----------
+
+    def _viewer(self, message: Any) -> str:
+        """召回时的视角：主人看全部，其他人只看自己的会话。"""
+        if self.is_owner(message.user_id):
+            return "owner"
+        if message.is_private:
+            return f"private:{message.user_id}"
+        return f"group:{message.group_id}"
+
+    def _visibility(self, message: Any) -> str:
+        if self.is_owner(message.user_id):
+            return "private"
+        if message.is_private:
+            return f"private:{message.user_id}"
+        return f"group:{message.group_id}"
+
+    def _report_incoming(self, message: Any, text: str) -> None:
+        if not self.alive.available():
+            return
+        if not (self.is_owner(message.user_id) or self.is_watched(message.user_id)):
+            return
+        owner = self.is_owner(message.user_id)
+        self.alive.report_episode(
+            text or "[图片]",
+            actor_id="owner" if owner else "other",
+            visibility=self._visibility(message),
+            conversation=message.conversation,
+            sender=message.sender_name,
+            at=float(message.time or 0) or time.time(),
+            kind="group" if message.is_group else "chat",
+            salience=0.5 if owner else 0.4,
+        )
+
+    def _report_reply(
+        self,
+        message: Any,
+        reply: str,
+        recalled: list[dict[str, Any]],
+    ) -> None:
+        if not self.alive.available():
+            return
+        if recalled:
+            self.alive.report_recall([str(item.get("id") or "") for item in recalled])
+        if not reply:
+            return
+        self.alive.report_episode(
+            reply,
+            actor_id="self",
+            visibility=self._visibility(message),
+            conversation=message.conversation,
+            sender=self.settings["bot_name"],
+            at=time.time(),
+            kind="chat",
+            salience=0.35,
+        )
+        self.alive.report({"type": "affect", "event": "bot_spoke"})
+        if _looks_unsure(reply) and _looks_question(message.text):
+            self.alive.report_curiosity(
+                message.text, visibility=self._visibility(message)
+            )
 
     # ---------- AI 回复 ----------
 
@@ -1224,6 +1297,14 @@ class QQBridgeService(QObject):
         system_prompt = analysis.build_system_prompt(
             self.store.persona(), memory, slang, habit
         )
+        alive_block = ""
+        alive_recalled: list[dict[str, Any]] = []
+        if self.settings["alive_enabled"]:
+            alive_block, alive_recalled = self.alive.prompt_block(
+                text, viewer=self._viewer(message)
+            )
+        if alive_block:
+            system_prompt += "\n\n" + alive_block
         if self._tts_ready():
             system_prompt += (
                 "\n\n你还可以发 QQ 语音：如果这句话适合用语音说，"
@@ -1245,6 +1326,7 @@ class QQBridgeService(QObject):
             self._pending.pop(conversation, None)
             if error:
                 self._log(f"AI 回复失败：{error}")
+                self.alive.report({"type": "affect", "event": "ai_error"})
                 return
             cleaned = sanitize_reply(reply or "", self.settings["max_reply_chars"])
             if not cleaned:
@@ -1271,6 +1353,7 @@ class QQBridgeService(QObject):
             self.store.append_inbox(
                 conversation, "assistant", cleaned, name=self.settings["bot_name"]
             )
+            self._report_reply(message, cleaned, alive_recalled)
 
         sources = image_sources(message) if self.settings["vision_enabled"] else []
         if not sources:
@@ -1577,9 +1660,21 @@ class QQBridgeService(QObject):
         if action in ("list", "列表"):
             items = self.store.memories(20)
             if not items:
-                self._reply_local(conversation, "还没有长期记忆。")
+                alive = self.alive.status()
+                if alive["enabled"] and alive["available"] and alive["memories"]:
+                    self._reply_local(
+                        conversation,
+                        f"本地记忆还是空的；活人感内核里有 {alive['memories']} 条长期记忆。",
+                    )
+                else:
+                    self._reply_local(conversation, "还没有长期记忆。")
                 return
             lines = [f"{index + 1}. {item.get('text', '')}" for index, item in enumerate(items)]
+            alive = self.alive.status()
+            if alive["enabled"] and alive["available"]:
+                lines.append(
+                    f"（活人感内核另有 {alive['memories']} 条长期记忆，在桌宠的插件设置里查看）"
+                )
             self._reply_local(conversation, "长期记忆：\n" + "\n".join(lines), 2000)
             return
         if action in ("add", "添加"):
@@ -1590,6 +1685,8 @@ class QQBridgeService(QObject):
             item = self.store.add_memory(body, importance=60, source="manual")
             self.store.prune_memory(self.settings["memory_max_items"])
             self.store.flush()
+            if item:
+                self.alive.report_remember(body, visibility="private")
             self._reply_local(conversation, "记住了。" if item else "这条内容为空。")
             return
         if action in ("del", "delete", "删除"):
@@ -1599,6 +1696,7 @@ class QQBridgeService(QObject):
                 return
             removed = self.store.remove_memory(keyword)
             self.store.flush()
+            self.alive.report_forget(keyword)
             self._reply_local(conversation, f"删除了 {removed} 条记忆。")
             return
         self._reply_local(conversation, "用法：/memory list | add 内容 | del 关键词")
@@ -2037,6 +2135,15 @@ class QQBridgeService(QObject):
             f"QQ 空间：{'开启' if self.settings['qzone_enabled'] else '关闭'}；"
             f"自动回复{'开启' if self.settings['qzone_auto_reply'] else '关闭'}",
         ]
+        alive = self.alive.status()
+        if alive["enabled"]:
+            if alive["available"]:
+                lines.append(
+                    f"活人感内核：已接入（{alive['memories']} 条记忆，"
+                    f"状态 {alive['state'] or '未知'}，召回 {alive['recall_limit']} 条）"
+                )
+            else:
+                lines.append("活人感内核：未检测到可用导出，按普通人格卡回复。")
         return "\n".join(lines)
 
     # ---------- 连接检查 ----------
@@ -2209,6 +2316,20 @@ class QQBridgeService(QObject):
                 fail(f"发起请求失败：{exc}")
 
         request()
+
+
+_UNSURE_RE = re.compile(
+    r"记不清|不记得|不知道|不清楚|没印象|不太确定|说不好|没听你说过|没提过"
+)
+_QUESTION_RE = re.compile(r"[?？]|吗|呢|什么|怎么|为什么|哪|谁|多少|几")
+
+
+def _looks_unsure(reply: str) -> bool:
+    return bool(_UNSURE_RE.search(str(reply or "")))
+
+
+def _looks_question(text: str) -> bool:
+    return bool(_QUESTION_RE.search(str(text or "")))
 
 
 def _tail_after_first(rest: str) -> str:

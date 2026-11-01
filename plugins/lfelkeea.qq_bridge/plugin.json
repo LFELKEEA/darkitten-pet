@@ -1,10 +1,10 @@
 {
   "id": "lfelkeea.qq_bridge",
   "name": "QQ 桥接（SnowLuma）",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "api_version": 1,
   "entry": "main.py",
-  "description": "通过 SnowLuma 把 QQ 私聊和群聊接进桌宠：可视化设置面板、人格卡、长期记忆、黑话库、可加备注的白名单、盯人即时回复、习惯化回复、收藏表情、QQ 空间与评论自动回复、SnowLuma 自动启停、聊天图片识别，以及 Windows 本地语音 / GPT-SoVITS 自定义音色的 TTS 语音回复。1.6.0 起 GPT-SoVITS 也能自动探测安装目录、后台无窗口启动，并在设置面板里切换参考音色。",
+  "description": "通过 SnowLuma 把 QQ 私聊和群聊接进桌宠：可视化设置面板、人格卡、长期记忆、黑话库、可加备注的白名单、盯人即时回复、习惯化回复、收藏表情、QQ 空间与评论自动回复、SnowLuma 自动启停、聊天图片识别，以及 Windows 本地语音 / GPT-SoVITS 自定义音色的 TTS 语音回复。1.6.0 起 GPT-SoVITS 也能自动探测安装目录、后台无窗口启动，并在设置面板里切换参考音色。1.7.0 起可以接入「活人感内核」：回复会带上她当前的状态、最近的自我认识和按话题召回的记忆，聊天也会写回内核，成为下一次重逢的素材；没安装内核时完全按原来的逻辑工作。",
   "author": "LFELKEEA",
   "highlights": [
     {
@@ -18,6 +18,10 @@
     {
       "label": "人格与记忆",
       "value": "本地保存"
+    },
+    {
+      "label": "活人感内核",
+      "value": "状态 + 记忆联动（可选）"
     },
     {
       "label": "外发范围",
@@ -132,6 +136,9 @@
     "tts_max_chars": 120,
     "custom_face_enabled": false,
     "custom_face_probability": 0.05,
-    "custom_face_ids": []
+    "custom_face_ids": [],
+    "alive_enabled": true,
+    "alive_recall": 5,
+    "alive_report": true
   }
 }
