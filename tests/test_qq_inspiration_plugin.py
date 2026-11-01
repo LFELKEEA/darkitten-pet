@@ -230,6 +230,14 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(store.all(), [])
 
 
+class PathTests(unittest.TestCase):
+    def test_data_dir_is_plugin_parent_parent(self):
+        from lfelkeea_qq_inspiration.service import _data_dir
+
+        # 源码目录是 desktop_pet/plugins/<id>/<package>/service.py
+        self.assertEqual(Path(_data_dir()).resolve(), ROOT.resolve())
+
+
 class UISmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -259,6 +267,7 @@ class UISmokeTests(unittest.TestCase):
         self.assertEqual(dialog.list_widget.count(), 1)
         self.assertIn("[AI]", dialog.list_widget.item(0).text())
         self.assertIn("共 1 条", dialog.count_label.text())
+        self.assertIn("提醒喝水", dialog.detail.toPlainText())
         self.assertGreaterEqual(len(dialog.action_buttons), 6)
         dialog.close()
         self.app.processEvents()

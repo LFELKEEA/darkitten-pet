@@ -50,9 +50,11 @@ _busy = False
 
 
 def _data_dir() -> str:
-    """插件目录是 data/plugins/<id>，上两级就是 data。"""
+    """插件目录是 data/plugins/<id>，从包内文件往上四级就是 data。"""
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.dirname(os.path.dirname(here))
+    plugin_dir = os.path.dirname(here)
+    plugins_dir = os.path.dirname(plugin_dir)
+    return os.path.dirname(plugins_dir)
 
 
 def _settings() -> dict:
@@ -141,6 +143,12 @@ def _refresh_list(window) -> None:
     elif window.list_widget.count():
         window.list_widget.setCurrentRow(0)
     window.list_widget.blockSignals(False)
+
+    current = window.list_widget.currentItem()
+    if current is not None:
+        _show_detail(window, current.data(Qt.UserRole))
+    else:
+        window.detail.setPlainText("")
 
     counts = _store.source_counts()
     parts = [f"共 {len(_store.all())} 条"]
@@ -253,7 +261,11 @@ def _run_batches(
             if error:
                 _busy = False
                 _set_busy(window, False)
-                window.status_label.setText(f"AI 出错：{error}")
+                _refresh_list(window)
+                window.status_label.setText(
+                    f"AI 出错：{error}"
+                    + (f"（已保留新增 {state['added']} 条）" if state["added"] else "")
+                )
                 return
             added, skipped = _add_ideas(parse_ideas(reply or ""), source)
             state["added"] += added
@@ -275,6 +287,7 @@ def _run_batches(
         except Exception as exc:
             _busy = False
             _set_busy(window, False)
+            _refresh_list(window)
             window.status_label.setText(f"没法调用 AI：{exc}")
 
     run_next()

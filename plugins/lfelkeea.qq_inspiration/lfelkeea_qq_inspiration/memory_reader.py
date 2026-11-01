@@ -158,19 +158,21 @@ def _qq_files(data_dir: str) -> list[str]:
     base = os.path.join(data_dir, "plugins")
     candidates = [
         os.path.join(base, ".state", "lfelkeea.qq_bridge", "memory.json"),
-        os.path.join(base, ".state", "lfelkeea.qq_bridge.json"),
         os.path.join(base, "lfelkeea.qq_bridge", "memory.json"),
         os.path.join(data_dir, "qq_bridge", "memory.json"),
     ]
     files = [path for path in candidates if os.path.isfile(path)]
     if files:
         return files
-    # 兼容旧安装：只在 QQ 桥接目录里找，不扫整个数据目录。
+    # 兼容旧安装：只在 QQ 桥接目录里找 memory 类文件，不扫整个数据目录。
     for root in (
         os.path.join(base, ".state", "lfelkeea.qq_bridge"),
         os.path.join(base, "lfelkeea.qq_bridge"),
     ):
-        files.extend(_json_files(root))
+        for path in _json_files(root):
+            name = os.path.basename(path).lower()
+            if "memory" in name or "episode" in name:
+                files.append(path)
     return list(dict.fromkeys(files))
 
 
