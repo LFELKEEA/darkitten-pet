@@ -173,6 +173,8 @@ class AppVersionTests(unittest.TestCase):
 
 class ApplyTests(unittest.TestCase):
     def test_apply_flags_do_not_detach(self) -> None:
+        if platform.system() != "Windows":
+            self.skipTest("创建标志只对 Windows 有意义")
         flags = updater.apply_flags()
         self.assertEqual(flags & subprocess.CREATE_NO_WINDOW, subprocess.CREATE_NO_WINDOW)
         self.assertFalse(flags & 0x00000008)  # DETACHED_PROCESS
