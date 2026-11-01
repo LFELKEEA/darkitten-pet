@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QApplication
 
 from config import Config
 from conversation import Conversation
@@ -26,7 +26,7 @@ from screen_watcher import (
 )
 from ai_client import AIError, request_chat, supports_vision
 
-APP = QGuiApplication.instance() or QGuiApplication([])
+APP = QApplication.instance() or QApplication([])
 
 
 class FakePet:
