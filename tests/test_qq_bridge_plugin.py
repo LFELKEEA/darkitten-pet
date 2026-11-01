@@ -23,6 +23,7 @@ from lfelkeea_qq_bridge.service import (  # noqa: E402
     QQBridgeService,
     _format_qzone,
     _parse_allow_target,
+    _parse_custom_faces,
     normalize_settings,
 )
 
@@ -64,6 +65,13 @@ class FakeClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, list[dict]]] = []
         self.qzone: list[dict] = []
+        self.qzone_posts: list[dict] = [{"tid": "t1", "content": "今天的猫", "comment_num": 0}]
+        self.qzone_details: dict[str, list[dict]] = {}
+        self.qzone_comments: list[dict] = []
+        self.custom_faces: list[dict] = [
+            {"emoji_id": "face-a", "desc": "猫猫", "url": "http://x/a.png"}
+        ]
+        self.custom_face_sent: list[dict] = []
         self.event = threading.Event()
 
     def send(self, conversation: str, segments: list[dict]) -> None:
@@ -84,12 +92,38 @@ class FakeClient:
         )
         self.event.set()
 
-    def list_qzone(self, num: int = 20) -> list[dict]:
+    def list_qzone(self, num: int = 20, target_uin: str = "") -> list[dict]:
         self.event.set()
-        return [{"tid": "t1", "content": "今天的猫"}]
+        return list(self.qzone_posts)
+
+    def qzone_detail(
+        self, tid: str, target_uin: str = "", pos: int = 0, num: int = 50
+    ) -> dict:
+        self.event.set()
+        return {"comments": list(self.qzone_details.get(tid, []))}
+
+    def comment_qzone(
+        self, tid: str, content: str, target_uin: str = "", images=None
+    ) -> None:
+        self.qzone_comments.append(
+            {"tid": tid, "content": content, "target_uin": target_uin}
+        )
+        self.event.set()
 
     def delete_qzone(self, tid: str) -> None:
         self.qzone.append({"delete": tid})
+        self.event.set()
+
+    def fetch_custom_face_detail(self, count: int = 50) -> list[dict]:
+        self.event.set()
+        return list(self.custom_faces)
+
+    def send_custom_face(
+        self, emoji_id: str, group_id: str = "", user_id: str = ""
+    ) -> None:
+        self.custom_face_sent.append(
+            {"emoji_id": emoji_id, "group_id": group_id, "user_id": user_id}
+        )
         self.event.set()
 
 
@@ -390,6 +424,35 @@ class OneBotServerTests(unittest.TestCase):
         self.assertEqual(body["images"], ["a.png"])
         self.assertEqual(body["target_uins"], ["123"])
 
+    def test_qzone_detail_comment_and_custom_face(self) -> None:
+        client = onebot.OneBotClient(self.base)
+        client.qzone_detail("t1", "99999", 10, 20)
+        body = self.seen[-1]["body"]
+        self.assertEqual(self.seen[-1]["path"], "/get_qzone_msg_detail")
+        self.assertEqual(body, {"tid": "t1", "target_uin": "99999", "pos": 10, "num": 20})
+
+        client.comment_qzone("t1", "好看", "99999", ["b.png"])
+        body = self.seen[-1]["body"]
+        self.assertEqual(self.seen[-1]["path"], "/comment_qzone")
+        self.assertEqual(body["content"], "好看")
+        self.assertEqual(body["images"], ["b.png"])
+
+        client.fetch_custom_face_detail(30)
+        self.assertEqual(self.seen[-1]["path"], "/fetch_custom_face_detail")
+        self.assertEqual(self.seen[-1]["body"], {"count": 30})
+
+        client.send_custom_face("face-a", user_id="10001")
+        body = self.seen[-1]["body"]
+        self.assertEqual(self.seen[-1]["path"], "/send_custom_face")
+        self.assertEqual(body, {"emoji_id": "face-a", "user_id": "10001"})
+
+        client.send_custom_face("face-a", group_id="123456")
+        self.assertEqual(
+            self.seen[-1]["body"], {"emoji_id": "face-a", "group_id": "123456"}
+        )
+        with self.assertRaises(onebot.OneBotError):
+            client.send_custom_face("")
+
     def test_error_raises(self) -> None:
         client = onebot.OneBotClient(self.base)
         with self.assertRaises(onebot.OneBotError):
@@ -482,6 +545,12 @@ class ServiceTests(unittest.TestCase):
                 "qzone_permission": "乱写",
                 "group_trigger": "all",
                 "memory_enabled": "off",
+                "watch_users": "22222, 33333，22222",
+                "qzone_auto_reply": "on",
+                "qzone_reply_interval": "0",
+                "qzone_reply_max": "99",
+                "custom_face_ids": ["face-a", " face-b ", "face-a"],
+                "custom_face_probability": "9",
             }
         )
         self.assertEqual(settings["http_port"], 65535)
@@ -491,6 +560,12 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(settings["qzone_permission"], "friends")
         self.assertEqual(settings["group_trigger"], "all")
         self.assertFalse(settings["memory_enabled"])
+        self.assertEqual(settings["watch_users"], ["22222", "33333"])
+        self.assertTrue(settings["qzone_auto_reply"])
+        self.assertEqual(settings["qzone_reply_interval"], 1)
+        self.assertEqual(settings["qzone_reply_max"], 10)
+        self.assertEqual(settings["custom_face_ids"], ["face-a", "face-b"])
+        self.assertEqual(settings["custom_face_probability"], 1.0)
 
     def test_whitelist(self) -> None:
         api, service = self.make_service()
@@ -577,6 +652,146 @@ class ServiceTests(unittest.TestCase):
         service._on_event_main(payload)
         service._on_event_main(payload)
         self.assertEqual(len(api.chat_calls), 1)
+
+    def test_watch_user_private_and_whitelisted_group(self) -> None:
+        api, service = self.make_service(
+            {"watch_users": ["55555"], "reply_chance": 0.0}
+        )
+        # 盯人私聊：不在白名单也能直接回复，不需要 @ 或叫名字。
+        service._on_event_main(private_event("在吗", user_id=55555, message_id=101))
+        self.assertTrue(service.client.event.wait(2))
+        self.assertEqual(service.client.sent[-1][0], "private:55555")
+        self.assertEqual(len(api.chat_calls), 1)
+
+        # 盯人在白名单群里：不用 @，也不受接话概率限制。
+        service.client.event.clear()
+        payload = group_event("随便说说", message_id=102)
+        payload["user_id"] = 55555
+        payload["message"] = [{"type": "text", "data": {"text": "随便说说"}}]
+        service._on_event_main(payload)
+        self.assertTrue(service.client.event.wait(2))
+        self.assertEqual(service.client.sent[-1][0], "group:123456")
+        self.assertEqual(len(api.chat_calls), 2)
+
+        # 盯人在非白名单群里：不响应。
+        service.client.event.clear()
+        outsider = group_event("随便说说", message_id=103)
+        outsider["group_id"] = 999999
+        outsider["user_id"] = 55555
+        outsider["message"] = [{"type": "text", "data": {"text": "随便说说"}}]
+        service._on_event_main(outsider)
+        self.assertFalse(service.client.event.wait(0.2))
+        self.assertEqual(len(api.chat_calls), 2)
+
+    def test_watch_user_management(self) -> None:
+        api, service = self.make_service()
+        self.assertIn("已开始", service.watch_add(" 55 555 "))
+        self.assertIn("55555", service.watch_items())
+        self.assertEqual(api.saved[-1]["watch_users"], ["55555"])
+        self.assertIn("已经在", service.watch_add("55555"))
+        self.assertIn("已取消", service.watch_remove("55555"))
+        self.assertEqual(service.watch_items(), [])
+
+    def test_qzone_auto_reply_baseline_and_new_comment(self) -> None:
+        api, service = self.make_service(
+            {
+                "qzone_auto_reply": True,
+                "qzone_reply_interval": 1,
+                "qzone_reply_max": 3,
+            }
+        )
+        client = service.client
+        client.qzone_posts = [
+            {"tid": "t1", "content": "今天的猫", "comment_num": 2}
+        ]
+        client.qzone_details["t1"] = [
+            {"comment_id": "self", "uin": "99999", "name": "小猫", "content": "我自己的评论"},
+            {"comment_id": "c1", "uin": "10001", "name": "小明", "content": "好可爱"},
+        ]
+
+        all_ids, candidates = service._collect_qzone_candidates(client)
+        self.assertEqual(all_ids, ["self", "c1"])
+        self.assertEqual([item["comment_id"] for item in candidates], ["c1"])
+
+        # 第一次扫描只建立基线，不回复旧评论。
+        service._finish_qzone_scan(all_ids, candidates, "")
+        self.assertTrue(service.store.qzone_baseline_done())
+        self.assertFalse(client.qzone_comments)
+        self.assertTrue(service.store.qzone_replied("c1"))
+
+        # 新评论才回复，并带上 AI 生成的内容。
+        client.qzone_posts[0]["comment_num"] = 3
+        client.qzone_details["t1"].append(
+            {"comment_id": "c2", "uin": "10002", "name": "小红", "content": "猫猫呢"}
+        )
+        all_ids, candidates = service._collect_qzone_candidates(client)
+        self.assertEqual([item["comment_id"] for item in candidates], ["c2"])
+        api.reply = "它刚睡醒。"
+        client.event.clear()
+        service._finish_qzone_scan(all_ids, candidates, "")
+        deadline = time.time() + 2
+        while time.time() < deadline and not client.qzone_comments:
+            time.sleep(0.02)
+        self.assertEqual(client.qzone_comments[-1]["tid"], "t1")
+        self.assertEqual(client.qzone_comments[-1]["content"], "它刚睡醒。")
+        self.assertIn("小红", api.chat_calls[-1][1]["content"])
+        self.assertIn("猫猫呢", api.chat_calls[-1][1]["content"])
+
+        service._after_qzone_post(candidates[0], True, "")
+        self.assertTrue(service.store.qzone_replied("c2"))
+
+    def test_qzone_auto_reply_disabled_does_nothing(self) -> None:
+        api, service = self.make_service({"qzone_auto_reply": False})
+        service._maybe_qzone_auto_reply()
+        self.assertFalse(service._qzone_checking)
+
+    def test_custom_face_pick_and_send(self) -> None:
+        api, service = self.make_service(
+            {
+                "custom_face_enabled": True,
+                "custom_face_probability": 1.0,
+                "custom_face_ids": ["face-a"],
+            }
+        )
+        self.assertEqual(service._pick_custom_face(), "face-a")
+        service._on_event_main(private_event("你好", message_id=201))
+        deadline = time.time() + 2
+        while time.time() < deadline and not service.client.custom_face_sent:
+            time.sleep(0.02)
+        self.assertEqual(
+            service.client.custom_face_sent[-1],
+            {"emoji_id": "face-a", "group_id": "", "user_id": "10001"},
+        )
+
+        service._on_event_main(group_event("在吗", message_id=202))
+        deadline = time.time() + 2
+        while time.time() < deadline and len(service.client.custom_face_sent) < 2:
+            time.sleep(0.02)
+        self.assertEqual(
+            service.client.custom_face_sent[-1],
+            {"emoji_id": "face-a", "group_id": "123456", "user_id": ""},
+        )
+
+        service.settings["custom_face_probability"] = 0.0
+        self.assertEqual(service._pick_custom_face(), "")
+        service.settings["custom_face_probability"] = 1.0
+        service.settings["custom_face_ids"] = []
+        service._custom_faces = [{"emoji_id": "face-b", "desc": "", "url": ""}]
+        self.assertEqual(service._pick_custom_face(), "face-b")
+
+    def test_parse_custom_faces(self) -> None:
+        faces = _parse_custom_faces(
+            [
+                {"emoji_id": "a", "desc": "猫猫"},
+                {"emojiId": "b"},
+                {"emoji_id": "a", "desc": "重复"},
+                {"id": "c", "url": "http://x"},
+                "d",
+                "",
+            ]
+        )
+        self.assertEqual([item["emoji_id"] for item in faces], ["a", "b", "c", "d"])
+        self.assertEqual(faces[0]["desc"], "猫猫")
 
     def test_owner_command(self) -> None:
         api, service = self.make_service()

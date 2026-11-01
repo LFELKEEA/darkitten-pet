@@ -637,6 +637,32 @@ class QQBridgeDialog(QDialog):
         group_layout.addLayout(group_actions)
         group_layout.addLayout(group_note_row)
         layout.addWidget(group_box)
+
+        watch_box = QGroupBox("盯人")
+        watch_layout = QVBoxLayout(watch_box)
+        watch_layout.setSpacing(8)
+        watch_layout.addWidget(
+            _hint(
+                "盯人名单里的 QQ 私聊时不用 @ 或叫名字，也不受接话概率限制，会直接回复；"
+                "在群里只有白名单群会响应。盯人名单本身也可以直接私聊。"
+            )
+        )
+        self.watch_list = QListWidget()
+        self.watch_list.setMinimumHeight(100)
+        self.watch_input = QLineEdit()
+        self.watch_input.setPlaceholderText("要盯的 QQ 号，纯数字")
+        watch_actions = QHBoxLayout()
+        add_watch = QPushButton("开始盯")
+        add_watch.setObjectName("primary")
+        add_watch.clicked.connect(self._watch_add)
+        del_watch = QPushButton("取消盯")
+        del_watch.clicked.connect(self._watch_remove)
+        watch_actions.addWidget(self.watch_input, 1)
+        watch_actions.addWidget(add_watch)
+        watch_actions.addWidget(del_watch)
+        watch_layout.addWidget(self.watch_list)
+        watch_layout.addLayout(watch_actions)
+        layout.addWidget(watch_box)
         return page
 
     # ---------- 人格 ----------
@@ -804,6 +830,33 @@ class QQBridgeDialog(QDialog):
         publish_layout.addLayout(publish_row)
         layout.addWidget(publish_box)
 
+        auto_box = QGroupBox("自动回复评论")
+        auto_layout = QVBoxLayout(auto_box)
+        auto_layout.setSpacing(8)
+        self.qzone_auto_reply = QCheckBox("自动回复我最近说说下的新评论")
+        self.qzone_reply_interval = QSpinBox()
+        self.qzone_reply_interval.setRange(1, 1440)
+        self.qzone_reply_interval.setSuffix(" 分钟")
+        self.qzone_reply_max = QSpinBox()
+        self.qzone_reply_max.setRange(1, 10)
+        self.qzone_reply_max.setSuffix(" 条 / 轮")
+        auto_form = QFormLayout()
+        auto_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        auto_form.setHorizontalSpacing(12)
+        auto_form.addRow("检查间隔", self.qzone_reply_interval)
+        auto_form.addRow("每轮最多", self.qzone_reply_max)
+        auto_layout.addWidget(self.qzone_auto_reply)
+        auto_layout.addLayout(auto_form)
+        self.qzone_auto_status = _hint("")
+        auto_layout.addWidget(self.qzone_auto_status)
+        auto_layout.addWidget(
+            _hint(
+                "只读取自己最近 5 条说说，遇到没回复过的新评论时用 AI 写一句回复。"
+                "第一次开启只记录已有评论，不会补回复旧评论；关闭后立即停止。"
+            )
+        )
+        layout.addWidget(auto_box)
+
         manage_box = QGroupBox("最近说说")
         manage_layout = QVBoxLayout(manage_box)
         self.qzone_result = QPlainTextEdit()
@@ -866,6 +919,27 @@ class QQBridgeDialog(QDialog):
         self.sticker_paths_edit.setFixedHeight(80)
         self.sticker_paths_edit.setPlaceholderText("每行一个本地图片路径")
 
+        self.custom_face_enabled = QCheckBox("AI 回复时按概率附带一个收藏表情")
+        self.custom_face_probability = QDoubleSpinBox()
+        self.custom_face_probability.setRange(0.0, 1.0)
+        self.custom_face_probability.setSingleStep(0.01)
+        self.custom_face_probability.setDecimals(2)
+        self.custom_face_list = QListWidget()
+        self.custom_face_list.setFixedHeight(120)
+        self.custom_face_status = _hint("还没有读取收藏表情。")
+        custom_face_box = QWidget()
+        custom_face_layout = QVBoxLayout(custom_face_box)
+        custom_face_layout.setContentsMargins(0, 0, 0, 0)
+        custom_face_layout.setSpacing(6)
+        custom_face_layout.addWidget(self.custom_face_list)
+        custom_face_row = QHBoxLayout()
+        refresh_custom_faces_btn = QPushButton("读取收藏表情")
+        refresh_custom_faces_btn.setObjectName("ghost")
+        refresh_custom_faces_btn.clicked.connect(self._refresh_custom_faces)
+        custom_face_row.addWidget(self.custom_face_status, 1)
+        custom_face_row.addWidget(refresh_custom_faces_btn)
+        custom_face_layout.addLayout(custom_face_row)
+
         self.auto_face = QCheckBox("自动附带 QQ 表情")
         self.local_echo = QCheckBox("把发出的消息在桌宠气泡里复述")
         self.announce = QCheckBox("连接失败时让桌宠提醒")
@@ -897,6 +971,9 @@ class QQBridgeDialog(QDialog):
         form.addRow("表情附带概率", self.face_chance)
         form.addRow("表情包概率", self.sticker_chance)
         form.addRow("表情包路径", self.sticker_paths_edit)
+        form.addRow("", self.custom_face_enabled)
+        form.addRow("收藏表情概率", self.custom_face_probability)
+        form.addRow("可用收藏表情", custom_face_box)
         form.addRow("", self.local_echo)
         form.addRow("", self.announce)
         form.addRow("", self.vision_enabled)
@@ -1075,6 +1152,54 @@ class QQBridgeDialog(QDialog):
 
     # ---------- 数据填充 ----------
 
+    def _fill_custom_faces(
+        self, ids: list[str], faces: list[dict[str, str]] | None = None
+    ) -> None:
+        known = {
+            str(item.get("emoji_id", "")): item
+            for item in (faces or [])
+            if item.get("emoji_id")
+        }
+        ordered = list(known)
+        for emoji_id in ids:
+            if emoji_id and emoji_id not in known:
+                ordered.append(emoji_id)
+                known[emoji_id] = {"emoji_id": emoji_id, "desc": ""}
+        self.custom_face_list.clear()
+        for emoji_id in ordered:
+            desc = str(known.get(emoji_id, {}).get("desc", "")).strip()
+            item = QListWidgetItem(f"{desc}  ·  {emoji_id}" if desc else emoji_id)
+            item.setData(Qt.ItemDataRole.UserRole, emoji_id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            checked = not ids or emoji_id in ids
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            self.custom_face_list.addItem(item)
+
+    def _refresh_custom_faces(self) -> None:
+        current = [
+            str(self.custom_face_list.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.custom_face_list.count())
+            if self.custom_face_list.item(index) is not None
+            and self.custom_face_list.item(index).checkState()
+            == Qt.CheckState.Checked
+        ]
+        if not current:
+            current = list(self.service.settings["custom_face_ids"])
+        self.custom_face_status.setText("正在读取…")
+
+        def done(faces: list[dict[str, str]]) -> None:
+            self._fill_custom_faces(current, faces)
+            if faces:
+                self.custom_face_status.setText(f"共 {len(faces)} 个收藏表情。")
+            else:
+                self.custom_face_status.setText(
+                    "没有读到收藏表情，确认 SnowLuma 已登录且版本支持该动作。"
+                )
+
+        self.service.refresh_custom_faces_async(done)
+
     def _load_settings(self) -> None:
         settings = self.service.settings
         self.http_edit.setText(settings["snowluma_http"])
@@ -1099,6 +1224,13 @@ class QQBridgeDialog(QDialog):
         self.face_chance.setValue(float(settings["face_probability"]))
         self.sticker_chance.setValue(float(settings["sticker_probability"]))
         self.sticker_paths_edit.setPlainText("\n".join(settings["sticker_paths"]))
+        self.custom_face_enabled.setChecked(bool(settings["custom_face_enabled"]))
+        self.custom_face_probability.setValue(
+            float(settings["custom_face_probability"])
+        )
+        self._fill_custom_faces(
+            list(settings["custom_face_ids"]), self.service.custom_face_items()
+        )
         self.local_echo.setChecked(bool(settings["local_echo"]))
         self.announce.setChecked(bool(settings["announce"]))
         self.vision_enabled.setChecked(bool(settings["vision_enabled"]))
@@ -1115,6 +1247,9 @@ class QQBridgeDialog(QDialog):
         perm_index = self.qzone_perm.findData(settings["qzone_permission"])
         self.qzone_perm.setCurrentIndex(max(0, perm_index))
         self.qzone_targets.setText(",".join(settings["qzone_target_uins"]))
+        self.qzone_auto_reply.setChecked(bool(settings["qzone_auto_reply"]))
+        self.qzone_reply_interval.setValue(int(settings["qzone_reply_interval"]))
+        self.qzone_reply_max.setValue(int(settings["qzone_reply_max"]))
 
         self.voice_reply_enabled.setChecked(bool(settings["voice_reply_enabled"]))
         self.voice_reply_probability.setValue(float(settings["voice_reply_probability"]))
@@ -1129,6 +1264,15 @@ class QQBridgeDialog(QDialog):
             "".join(ch for ch in part if ch.isdigit())
             for part in re.split(r"[,，\s]+", self.face_ids_edit.text())
         ]
+        custom_face_ids = [
+            str(self.custom_face_list.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.custom_face_list.count())
+            if self.custom_face_list.item(index) is not None
+            and self.custom_face_list.item(index).checkState()
+            == Qt.CheckState.Checked
+        ]
+        if self.custom_face_list.count() == 0:
+            custom_face_ids = list(self.service.settings["custom_face_ids"])
         return {
             "snowluma_http": self.http_edit.text().strip(),
             "access_token": self.token_edit.text().strip(),
@@ -1154,6 +1298,9 @@ class QQBridgeDialog(QDialog):
                 for line in self.sticker_paths_edit.toPlainText().splitlines()
                 if line.strip()
             ],
+            "custom_face_enabled": self.custom_face_enabled.isChecked(),
+            "custom_face_probability": self.custom_face_probability.value(),
+            "custom_face_ids": custom_face_ids,
             "local_echo": self.local_echo.isChecked(),
             "announce": self.announce.isChecked(),
             "vision_enabled": self.vision_enabled.isChecked(),
@@ -1165,6 +1312,11 @@ class QQBridgeDialog(QDialog):
             "memory_batch_size": self.memory_batch.value(),
             "memory_max_items": self.memory_max.value(),
             "slang_max_terms": self.slang_max.value(),
+            "watch_users": [
+                str(self.watch_list.item(index).data(Qt.ItemDataRole.UserRole))
+                for index in range(self.watch_list.count())
+                if self.watch_list.item(index) is not None
+            ],
             "qzone_enabled": self.qzone_enabled.isChecked(),
             "qzone_permission": self.qzone_perm.currentData(),
             "qzone_target_uins": [
@@ -1172,6 +1324,9 @@ class QQBridgeDialog(QDialog):
                 for part in re.split(r"[,，\s]+", self.qzone_targets.text())
                 if "".join(ch for ch in part if ch.isdigit())
             ],
+            "qzone_auto_reply": self.qzone_auto_reply.isChecked(),
+            "qzone_reply_interval": self.qzone_reply_interval.value(),
+            "qzone_reply_max": self.qzone_reply_max.value(),
             "voice_packs": [
                 str(self.voice_pack_list.item(index).data(Qt.ItemDataRole.UserRole))
                 for index in range(self.voice_pack_list.count())
@@ -1234,12 +1389,20 @@ class QQBridgeDialog(QDialog):
             self.diag_http.setText(snapshot["http"])
             self.diag_event.setText(snapshot["event_url"])
             self.diag_audience.setText(
-                f"好友 {snapshot['private_count']} 个，群 {snapshot['group_count']} 个"
+                f"好友 {snapshot['private_count']} 个，群 {snapshot['group_count']} 个，"
+                f"盯人 {snapshot.get('watch_count', 0)} 个"
             )
             self.diag_data.setText(
                 f"记忆 {snapshot['memory_count']} 条，黑话 {snapshot['slang_count']} 条，"
                 f"语音包 {snapshot['voice_pack_count']} 个，"
+                f"收藏表情 {snapshot.get('custom_face_count', 0)} 个，"
                 f"QQ 空间{'开启' if snapshot['qzone_enabled'] else '关闭'}"
+            )
+        last = float(snapshot.get("qzone_last_check", 0) or 0)
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(last)) if last else "还没检查"
+        if hasattr(self, "qzone_auto_status"):
+            self.qzone_auto_status.setText(
+                f"已回复 {snapshot.get('qzone_replied_count', 0)} 条评论；上次检查：{stamp}"
             )
 
     def _refresh_whitelist(self) -> None:
@@ -1261,6 +1424,16 @@ class QQBridgeDialog(QDialog):
             widget.blockSignals(False)
         self.private_note.clear()
         self.group_note.clear()
+        self._refresh_watch()
+
+    def _refresh_watch(self) -> None:
+        if not hasattr(self, "watch_list"):
+            return
+        self.watch_list.clear()
+        for value in self.service.watch_items():
+            item = QListWidgetItem(value)
+            item.setData(Qt.ItemDataRole.UserRole, value)
+            self.watch_list.addItem(item)
 
     def _refresh_memory(self) -> None:
         self.memory_list.clear()
@@ -1439,6 +1612,29 @@ class QQBridgeDialog(QDialog):
         self._refresh_whitelist()
         self._refresh_status()
         self._notify(text, text.startswith("已"))
+
+    def _watch_add(self) -> None:
+        target = self.watch_input.text().strip()
+        if not target:
+            self._notify("先填要盯的 QQ 号。", False)
+            return
+        message = self.service.watch_add(target)
+        if message.startswith("已"):
+            self.watch_input.clear()
+        self._refresh_watch()
+        self._refresh_status()
+        self._notify(message, message.startswith("已"))
+
+    def _watch_remove(self) -> None:
+        current = self.watch_list.currentItem()
+        if current is None:
+            self._notify("先选中要取消的 QQ 号。", False)
+            return
+        value = str(current.data(Qt.ItemDataRole.UserRole) or current.text())
+        message = self.service.watch_remove(value)
+        self._refresh_watch()
+        self._refresh_status()
+        self._notify(message, message.startswith("已"))
 
     def _save_persona(self) -> None:
         try:

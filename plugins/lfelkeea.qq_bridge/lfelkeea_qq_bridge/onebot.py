@@ -161,8 +161,60 @@ class OneBotClient:
     def delete_qzone(self, tid: str) -> Any:
         return self.call("delete_qzone_msg", {"tid": str(tid or "").strip()})
 
+    def qzone_detail(
+        self, tid: str, target_uin: str = "", pos: int = 0, num: int = 50
+    ) -> Any:
+        params: dict[str, Any] = {
+            "tid": str(tid or "").strip(),
+            "pos": max(0, int(pos)),
+            "num": max(1, min(50, int(num))),
+        }
+        if str(target_uin or "").strip():
+            params["target_uin"] = str(target_uin).strip()
+        return self.call("get_qzone_msg_detail", params)
+
+    def comment_qzone(
+        self,
+        tid: str,
+        content: str,
+        target_uin: str = "",
+        images: list[str] | None = None,
+    ) -> Any:
+        params: dict[str, Any] = {
+            "tid": str(tid or "").strip(),
+            "content": str(content or "")[:2000],
+        }
+        if str(target_uin or "").strip():
+            params["target_uin"] = str(target_uin).strip()
+        files = [str(item) for item in _as_list(images) if str(item).strip()]
+        if files:
+            params["images"] = files
+        return self.call("comment_qzone", params)
+
     def qzone_feeds(self, count: int = 10) -> Any:
         return self.call("get_qzone_feeds", {"count": max(1, min(30, int(count)))})
+
+    # ---------- 收藏表情 ----------
+
+    def fetch_custom_face_detail(self, count: int = 50) -> Any:
+        return self.call(
+            "fetch_custom_face_detail", {"count": max(1, min(200, int(count)))}
+        )
+
+    def send_custom_face(
+        self, emoji_id: str, group_id: str = "", user_id: str = ""
+    ) -> Any:
+        emoji = str(emoji_id or "").strip()
+        if not emoji:
+            raise OneBotError("收藏表情 id 为空。")
+        params: dict[str, Any] = {"emoji_id": emoji}
+        if str(group_id or "").strip():
+            params["group_id"] = str(group_id).strip()
+        elif str(user_id or "").strip():
+            params["user_id"] = str(user_id).strip()
+        else:
+            raise OneBotError("收藏表情缺少发送对象。")
+        return self.call("send_custom_face", params)
 
 
 def _error_text(payload: dict[str, Any], action: str) -> str:

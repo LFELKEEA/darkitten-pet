@@ -152,9 +152,15 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         "allow_private": private_ids,
         "allow_groups": group_ids,
         "allow_notes": notes,
+        "watch_users": _as_ids(data.get("watch_users")),
         "qzone_enabled": _as_bool(data.get("qzone_enabled"), False),
         "qzone_permission": permission,
         "qzone_target_uins": _as_ids(data.get("qzone_target_uins")),
+        "qzone_auto_reply": _as_bool(data.get("qzone_auto_reply"), False),
+        "qzone_reply_interval": _as_int(
+            data.get("qzone_reply_interval"), 10, 1, 1440
+        ),
+        "qzone_reply_max": _as_int(data.get("qzone_reply_max"), 3, 1, 10),
         "group_trigger": trigger,
         "memory_enabled": _as_bool(data.get("memory_enabled"), True),
         "slang_enabled": _as_bool(data.get("slang_enabled"), True),
@@ -190,6 +196,13 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         "voice_reply_probability": _as_float(
             data.get("voice_reply_probability"), 0.08, 0.0, 1.0
         ),
+        "custom_face_enabled": _as_bool(data.get("custom_face_enabled"), False),
+        "custom_face_probability": _as_float(
+            data.get("custom_face_probability"), 0.05, 0.0, 1.0
+        ),
+        "custom_face_ids": _as_ids(
+            data.get("custom_face_ids"), digits_only=False
+        )[:200],
     }
 
 
@@ -221,6 +234,11 @@ class QQBridgeService(QObject):
         self._vision_blocked = False
         self._checking = False
         self._last_check = 0.0
+        self._custom_faces: list[dict[str, str]] = []
+        self._custom_faces_loading = False
+        self._qzone_checking = False
+        self._qzone_queue: list[dict[str, Any]] = []
+        self._qzone_left = 0
 
         self.event_received.connect(self._on_event_main)
         self.local_say.connect(self._say_main)
@@ -312,6 +330,8 @@ class QQBridgeService(QObject):
         self.snowluma.configure(self.settings, self.settings["snowluma_http"])
         self.snowluma.start_async()
         self.check_async()
+        if self.settings["custom_face_enabled"]:
+            self.refresh_custom_faces_async()
 
     def stop(self) -> None:
         self.snowluma.stop()
@@ -320,6 +340,8 @@ class QQBridgeService(QObject):
             self.server = None
         self.store.flush()
         self._pending.clear()
+        self._qzone_queue.clear()
+        self._qzone_checking = False
         self.started = False
         self._log("QQ 桥接已停止")
 
@@ -343,6 +365,7 @@ class QQBridgeService(QObject):
         if not self._checking and now - self._last_check >= 300:
             self.check_async()
         self._maybe_compact()
+        self._maybe_qzone_auto_reply()
 
     # ---------- 线程投递 ----------
 
@@ -393,10 +416,17 @@ class QQBridgeService(QObject):
     def is_owner(self, user_id: str) -> bool:
         return bool(self.owner) and str(user_id) == self.owner
 
+    def is_watched(self, user_id: str) -> bool:
+        value = str(user_id or "").strip()
+        return bool(value) and value in self.settings["watch_users"]
+
     def is_allowed(self, conversation: str, user_id: str = "") -> bool:
         kind, target = split_conversation(conversation)
         if kind == "group":
             return target in self.settings["allow_groups"]
+        # 盯人名单里的账号可以直接私聊，不需要先加白名单。
+        if self.is_watched(target) or self.is_watched(user_id):
+            return True
         if self.is_owner(target) or self.is_owner(user_id):
             return True
         return target in self.settings["allow_private"]
@@ -412,6 +442,33 @@ class QQBridgeService(QObject):
             )
         except Exception as exc:
             self._log(f"保存白名单失败：{exc}")
+
+    def _save_watch(self) -> None:
+        try:
+            self.api.save_settings({"watch_users": list(self.settings["watch_users"])})
+        except Exception as exc:
+            self._log(f"保存盯人名单失败：{exc}")
+
+    def watch_items(self) -> list[str]:
+        return list(self.settings["watch_users"])
+
+    def watch_add(self, target: str) -> str:
+        value = "".join(ch for ch in str(target or "") if ch.isdigit())
+        if not value:
+            return "请填写要盯的 QQ 号（纯数字）。"
+        if value in self.settings["watch_users"]:
+            return "这个 QQ 号已经在盯人名单里了。"
+        self.settings["watch_users"].append(value)
+        self._save_watch()
+        return f"已开始盯 {value}。"
+
+    def watch_remove(self, target: str) -> str:
+        value = "".join(ch for ch in str(target or "") if ch.isdigit())
+        if not value or value not in self.settings["watch_users"]:
+            return "盯人名单里没有这个号。"
+        self.settings["watch_users"].remove(value)
+        self._save_watch()
+        return f"已取消盯 {value}。"
 
     def _allow_target(
         self, kind: str, target: str, add: bool, note: str | None = None
@@ -473,7 +530,15 @@ class QQBridgeService(QObject):
         )
         changed = any(self.settings.get(key) != updated.get(key) for key in link_keys)
         dir_changed = self.settings.get("snowluma_dir") != updated.get("snowluma_dir")
+        was_qzone_auto = bool(self.settings.get("qzone_auto_reply"))
         self.settings = updated
+        if updated["qzone_auto_reply"] and not was_qzone_auto:
+            # 新开启时把当前已有评论当作基线，不补回复旧评论。
+            self.store.reset_qzone_baseline()
+            self.store.mark_qzone_check(0)
+            self.store.flush()
+        if updated["custom_face_enabled"] and not self._custom_faces:
+            self.refresh_custom_faces_async()
         self.snowluma.configure(updated, updated["snowluma_http"])
         if changed and self.started:
             message = self._rebuild_link()
@@ -531,12 +596,21 @@ class QQBridgeService(QObject):
             "group_count": len(self.settings["allow_groups"]),
             "memory_count": len(self.store.memories(500)),
             "slang_count": len(self.store.slang_terms()),
+            "watch_count": len(self.settings["watch_users"]),
             "qzone_enabled": self.settings["qzone_enabled"],
+            "qzone_auto_reply": bool(self.settings["qzone_auto_reply"]),
+            "qzone_replied_count": self.store.qzone_replied_count(),
+            "qzone_last_check": float(
+                self.store.runtime.get("qzone_last_check", 0) or 0
+            ),
             "auto_start_snowluma": bool(self.settings["auto_start_snowluma"]),
             "snowluma_dir": self.settings["snowluma_dir"],
             "vision_enabled": bool(self.settings["vision_enabled"]),
             "voice_pack_count": len(self.settings["voice_packs"]),
             "voice_reply_enabled": bool(self.settings["voice_reply_enabled"]),
+            "custom_face_enabled": bool(self.settings["custom_face_enabled"]),
+            "custom_face_count": len(self._custom_faces)
+            or len(self.settings["custom_face_ids"]),
             "snowluma_managed": self.snowluma.status(),
         }
 
@@ -979,7 +1053,8 @@ class QQBridgeService(QObject):
                 self._handle_command(command, message)
                 return
 
-        if not is_addressed(
+        watch = self._is_watch_hit(message)
+        if not watch and not is_addressed(
             message,
             self.settings["bot_name"],
             self.settings["group_trigger"],
@@ -988,7 +1063,15 @@ class QQBridgeService(QObject):
             return
         if not text and not message.has_image:
             return
-        self._reply_with_ai(message, text)
+        self._reply_with_ai(message, text, watch=watch)
+
+    def _is_watch_hit(self, message: Any) -> bool:
+        """盯人名单命中：私聊直接回；群里只认白名单群。"""
+        if not self.is_watched(message.user_id):
+            return False
+        if message.is_private:
+            return True
+        return message.group_id in self.settings["allow_groups"]
 
     # ---------- AI 回复 ----------
 
@@ -1001,11 +1084,11 @@ class QQBridgeService(QObject):
         self._reply_times.append(now)
         return True
 
-    def _reply_with_ai(self, message: Any, text: str) -> None:
+    def _reply_with_ai(self, message: Any, text: str, watch: bool = False) -> None:
         conversation = message.conversation
         if conversation in self._pending:
             return
-        if not self._rate_ok():
+        if not watch and not self._rate_ok():
             self._log("触发每分钟回复上限，本条跳过。")
             return
 
@@ -1062,6 +1145,9 @@ class QQBridgeService(QObject):
                 self._send_segments(conversation, segments, cleaned or "[表情]")
             if voice_clip:
                 self.send_voice(conversation, voice_clip)
+            custom_face = self._pick_custom_face()
+            if custom_face:
+                self._send_custom_face(conversation, custom_face)
             self.store.append_recent(conversation, "assistant", cleaned)
             self.store.append_inbox(
                 conversation, "assistant", cleaned, name=self.settings["bot_name"]
@@ -1180,6 +1266,78 @@ class QQBridgeService(QObject):
         if stickers and random.random() < self.settings["sticker_probability"]:
             images.append(random.choice(stickers))
         return faces, images
+
+    # ---------- 收藏表情 ----------
+
+    def custom_face_items(self) -> list[dict[str, str]]:
+        return [dict(item) for item in self._custom_faces]
+
+    def refresh_custom_faces_async(
+        self, callback: Callable[[list[dict[str, str]]], None] | None = None
+    ) -> None:
+        client = self.client
+        if client is None or self._custom_faces_loading:
+            if callback is not None:
+                callback(self.custom_face_items())
+            return
+        self._custom_faces_loading = True
+
+        def work() -> None:
+            try:
+                faces = _parse_custom_faces(client.fetch_custom_face_detail(50))
+            except Exception as exc:
+                faces = []
+                self._log(f"读取收藏表情失败：{exc}")
+
+            def done() -> None:
+                self._custom_faces_loading = False
+                self._custom_faces = faces
+                if callback is not None:
+                    try:
+                        callback(self.custom_face_items())
+                    except Exception as exc:
+                        self._log(f"收藏表情回调出错：{exc}")
+
+            self._dispatch.emit(done)
+
+        threading.Thread(
+            target=work, name="qq-bridge-custom-face", daemon=True
+        ).start()
+
+    def _pick_custom_face(self) -> str:
+        if not self.settings["custom_face_enabled"]:
+            return ""
+        ids = [item for item in self.settings["custom_face_ids"] if item]
+        if not ids:
+            ids = [
+                str(item.get("emoji_id", ""))
+                for item in self._custom_faces
+                if item.get("emoji_id")
+            ]
+        if not ids:
+            return ""
+        if random.random() >= self.settings["custom_face_probability"]:
+            return ""
+        return random.choice(ids)
+
+    def _send_custom_face(self, conversation: str, emoji_id: str) -> None:
+        client = self.client
+        if client is None:
+            return
+        kind, target = split_conversation(conversation)
+
+        def work() -> None:
+            try:
+                if kind == "group":
+                    client.send_custom_face(emoji_id, group_id=target)
+                else:
+                    client.send_custom_face(emoji_id, user_id=target)
+            except Exception as exc:
+                self._log(f"发送收藏表情失败：{exc}")
+
+        threading.Thread(
+            target=work, name="qq-bridge-custom-face-send", daemon=True
+        ).start()
 
     def _send_segments(
         self, conversation: str, segments: list[dict[str, Any]], echo: str = ""
@@ -1537,6 +1695,213 @@ class QQBridgeService(QObject):
 
         threading.Thread(target=work, name="qq-bridge-qzone", daemon=True).start()
 
+    # ---------- QQ 空间自动回复 ----------
+
+    def _maybe_qzone_auto_reply(self) -> None:
+        if not self.settings["qzone_auto_reply"] or not self.started:
+            return
+        client = self.client
+        if client is None or self._qzone_checking:
+            return
+        now = time.time()
+        interval = self.settings["qzone_reply_interval"] * 60
+        last = float(self.store.runtime.get("qzone_last_check", 0) or 0)
+        if last and now - last < interval:
+            return
+        self._qzone_checking = True
+        self.store.mark_qzone_check(now)
+        self.store.flush()
+
+        def work() -> None:
+            try:
+                all_ids, candidates = self._collect_qzone_candidates(client)
+                error = ""
+            except Exception as exc:
+                all_ids, candidates, error = [], [], str(exc)
+            self._dispatch.emit(
+                lambda: self._finish_qzone_scan(all_ids, candidates, error)
+            )
+
+        threading.Thread(
+            target=work, name="qq-bridge-qzone-auto", daemon=True
+        ).start()
+
+    def _collect_qzone_candidates(
+        self, client: OneBotClient
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        login = client.get_login_info() or {}
+        self_id = str(login.get("user_id", "") or "").strip()
+        items = _qzone_items(client.list_qzone(5))[:5]
+        all_ids: list[str] = []
+        candidates: list[dict[str, Any]] = []
+        for post in items:
+            tid = _first_text(post, ("tid", "id"), 80)
+            if not tid:
+                continue
+            try:
+                count = int(post.get("comment_num", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count <= 0:
+                continue
+            try:
+                detail = client.qzone_detail(tid, num=50)
+            except Exception as exc:
+                self._log(f"读取空间评论失败（{tid}）：{exc}")
+                continue
+            post_text = _first_text(post, ("content", "text", "summary"), 300)
+            for comment in _qzone_comments(detail):
+                cid = _comment_id(comment)
+                if cid:
+                    all_ids.append(cid)
+                uin = _comment_uin(comment)
+                content = _comment_text(comment)
+                if not cid or not content:
+                    continue
+                if self_id and uin == self_id:
+                    continue
+                if self.store.qzone_replied(cid):
+                    continue
+                candidates.append(
+                    {
+                        "tid": tid,
+                        "target_uin": self_id,
+                        "comment_id": cid,
+                        "uin": uin,
+                        "name": _comment_name(comment) or uin or "有人",
+                        "content": content,
+                        "post": post_text,
+                    }
+                )
+        return all_ids, candidates
+
+    def _finish_qzone_scan(
+        self,
+        all_ids: list[str],
+        candidates: list[dict[str, Any]],
+        error: str,
+    ) -> None:
+        self._qzone_checking = False
+        if not self.started:
+            return
+        if error:
+            self._log(f"QQ 空间自动回复检查失败：{error}")
+            return
+        if not self.store.qzone_baseline_done():
+            for cid in all_ids:
+                self.store.mark_qzone_replied(cid)
+            self.store.mark_qzone_baseline(True)
+            self.store.flush()
+            if candidates:
+                self._log(
+                    f"QQ 空间自动回复已就绪，跳过 {len(candidates)} 条旧评论。"
+                )
+            return
+        pending = [
+            item
+            for item in candidates
+            if not self.store.qzone_replied(item.get("comment_id", ""))
+        ]
+        if not pending:
+            return
+        self._qzone_queue = pending
+        self._qzone_left = max(1, int(self.settings["qzone_reply_max"]))
+        self._next_qzone_reply()
+
+    def _next_qzone_reply(self) -> None:
+        if not self.started or self._qzone_left <= 0 or not self._qzone_queue:
+            self._qzone_queue.clear()
+            return
+        item = self._qzone_queue.pop(0)
+        if self.store.qzone_replied(item.get("comment_id", "")):
+            self._next_qzone_reply()
+            return
+        memory = (
+            analysis.memory_prompt(self.store.memories(6))
+            if self.settings["memory_enabled"]
+            else ""
+        )
+        slang = (
+            analysis.slang_prompt(self.store.slang_terms(), item["content"])
+            if self.settings["slang_enabled"]
+            else ""
+        )
+        system_prompt = analysis.build_system_prompt(
+            self.store.persona(), memory, slang, ""
+        )
+        system_prompt += (
+            "\n\n现在你在 QQ 空间回复别人的评论。只写一句自然的中文回复，"
+            "不要 Markdown、不要解释、不要输出 [silent]，不超过 60 个字。"
+        )
+        user_prompt = (
+            f"我说说：{item.get('post') or '（无正文）'}\n"
+            f"{item.get('name') or item.get('uin') or '有人'} 评论：{item.get('content')}\n"
+            "请回复这条评论。"
+        )
+
+        def on_reply(reply: str | None, error: str | None) -> None:
+            if error:
+                self._log(f"QQ 空间自动回复生成失败：{error}")
+                self._qzone_left -= 1
+                self._next_qzone_reply()
+                return
+            cleaned = sanitize_reply(reply or "", 120)
+            if not cleaned:
+                self._qzone_left -= 1
+                self._next_qzone_reply()
+                return
+
+            def post() -> None:
+                client = self.client
+                if client is None:
+                    self._dispatch.emit(
+                        lambda: self._after_qzone_post(
+                            item, False, "OneBot 客户端还没准备好。"
+                        )
+                    )
+                    return
+                try:
+                    client.comment_qzone(
+                        item["tid"], cleaned, target_uin=item.get("target_uin", "")
+                    )
+                    ok, message = True, ""
+                except Exception as exc:
+                    ok, message = False, str(exc)
+                self._dispatch.emit(
+                    lambda: self._after_qzone_post(item, ok, message)
+                )
+
+            threading.Thread(
+                target=post, name="qq-bridge-qzone-comment", daemon=True
+            ).start()
+
+        try:
+            self.api.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                on_reply,
+            )
+        except Exception as exc:
+            self._log(f"发起空间自动回复失败：{exc}")
+            self._qzone_left -= 1
+            self._next_qzone_reply()
+
+    def _after_qzone_post(
+        self, item: dict[str, Any], ok: bool, message: str
+    ) -> None:
+        self._qzone_left -= 1
+        if ok:
+            self.store.mark_qzone_replied(str(item.get("comment_id", "")))
+            self.store.flush()
+            self._log(
+                f"已自动回复 {item.get('name') or item.get('uin') or '有人'} 的空间评论。"
+            )
+        else:
+            self._log(f"QQ 空间评论发送失败：{message}")
+        self._next_qzone_reply()
+
     def _status_text(self) -> str:
         connection = self.store.runtime.get("connection_ok")
         if connection is True:
@@ -1549,9 +1914,11 @@ class QQBridgeService(QObject):
         lines = [
             f"SnowLuma：{state}（{self.settings['snowluma_http']}）",
             f"事件端口：{port or '未启动'}",
-            f"白名单：好友 {len(self.settings['allow_private'])} 个，群 {len(self.settings['allow_groups'])} 个",
+            f"白名单：好友 {len(self.settings['allow_private'])} 个，群 {len(self.settings['allow_groups'])} 个；"
+            f"盯人 {len(self.settings['watch_users'])} 个",
             f"记忆：{len(self.store.memories(500))} 条；黑话：{len(self.store.slang_terms())} 条",
-            f"QQ 空间：{'开启' if self.settings['qzone_enabled'] else '关闭'}",
+            f"QQ 空间：{'开启' if self.settings['qzone_enabled'] else '关闭'}；"
+            f"自动回复{'开启' if self.settings['qzone_auto_reply'] else '关闭'}",
         ]
         return "\n".join(lines)
 
@@ -1766,3 +2133,87 @@ def _format_qzone(data: Any) -> str:
         content = " ".join(str(content).split())[:60]
         lines.append(f"- {content or '（无正文）'}" + (f"  [{tid}]" if tid else ""))
     return "\n".join(lines) if len(lines) > 1 else "最近没有读到说说。"
+
+
+def _qzone_items(data: Any) -> list[dict[str, Any]]:
+    items: Any = data
+    if isinstance(data, dict):
+        for key in ("list", "feeds", "messages", "data", "msglist"):
+            value = data.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _qzone_comments(data: Any) -> list[dict[str, Any]]:
+    comments: Any = data
+    if isinstance(data, dict):
+        comments = data.get("comments")
+    if not isinstance(comments, list):
+        return []
+    return [item for item in comments if isinstance(item, dict)]
+
+
+def _first_text(item: dict[str, Any], keys: tuple[str, ...], limit: int = 400) -> str:
+    for key in keys:
+        value = item.get(key)
+        if value is None:
+            continue
+        text = " ".join(str(value).split()).strip()
+        if text:
+            return text[:limit]
+    return ""
+
+
+def _comment_id(item: dict[str, Any]) -> str:
+    return _first_text(item, ("comment_id", "id", "cid", "tid"), 80)
+
+
+def _comment_uin(item: dict[str, Any]) -> str:
+    return _first_text(item, ("uin", "user_id", "qq"), 40)
+
+
+def _comment_name(item: dict[str, Any]) -> str:
+    return _first_text(item, ("name", "nickname", "nick", "card"), 40)
+
+
+def _comment_text(item: dict[str, Any]) -> str:
+    return _first_text(item, ("content", "text", "message"), 400)
+
+
+def _parse_custom_faces(data: Any) -> list[dict[str, str]]:
+    items: Any = data
+    if isinstance(data, dict):
+        for key in ("list", "data", "faces", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+    if not isinstance(items, list):
+        return []
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if isinstance(item, dict):
+            emoji_id = str(
+                item.get("emoji_id") or item.get("emojiId") or item.get("id") or ""
+            ).strip()
+            if not emoji_id or emoji_id in seen:
+                continue
+            seen.add(emoji_id)
+            result.append(
+                {
+                    "emoji_id": emoji_id,
+                    "desc": str(item.get("desc") or "").strip()[:60],
+                    "url": str(item.get("url") or "").strip(),
+                }
+            )
+        elif isinstance(item, str) and item.strip() and item.strip() not in seen:
+            seen.add(item.strip())
+            result.append({"emoji_id": item.strip(), "desc": "", "url": ""})
+        if len(result) >= 200:
+            break
+    return result

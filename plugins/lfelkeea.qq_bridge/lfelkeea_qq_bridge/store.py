@@ -64,7 +64,16 @@ class JsonStore:
         self.habits = self._read_json(self.habits_path, {"conversations": {}})
         self.runtime = self._read_json(
             self.runtime_path,
-            {"inbox": [], "recent": {}, "seen": [], "last_compact_at": 0, "connection_ok": None},
+            {
+                "inbox": [],
+                "recent": {},
+                "seen": [],
+                "last_compact_at": 0,
+                "connection_ok": None,
+                "qzone_replied": [],
+                "qzone_baseline_done": False,
+                "qzone_last_check": 0.0,
+            },
         )
 
         if not isinstance(self.memory.get("items"), list):
@@ -79,6 +88,16 @@ class JsonStore:
             self.runtime["recent"] = {}
         if not isinstance(self.runtime.get("seen"), list):
             self.runtime["seen"] = []
+        if not isinstance(self.runtime.get("qzone_replied"), list):
+            self.runtime["qzone_replied"] = []
+        if not isinstance(self.runtime.get("qzone_baseline_done"), bool):
+            self.runtime["qzone_baseline_done"] = False
+        try:
+            self.runtime["qzone_last_check"] = float(
+                self.runtime.get("qzone_last_check", 0) or 0
+            )
+        except (TypeError, ValueError):
+            self.runtime["qzone_last_check"] = 0.0
 
         self._dirty: set[str] = set()
         self._ensure_persona(default_persona_path)
@@ -455,4 +474,42 @@ class JsonStore:
 
     def mark_compacted(self, timestamp: float | None = None) -> None:
         self.runtime["last_compact_at"] = _now() if timestamp is None else float(timestamp)
+        self._dirty.add("runtime")
+
+    # ---------- QQ 空间自动回复 ----------
+
+    def mark_qzone_replied(self, comment_id: str, limit: int = 1000) -> None:
+        value = str(comment_id or "").strip()
+        if not value:
+            return
+        replied = self.runtime["qzone_replied"]
+        if value in replied:
+            return
+        replied.append(value)
+        if len(replied) > max(1, int(limit)):
+            del replied[: len(replied) - max(1, int(limit))]
+        self._dirty.add("runtime")
+
+    def qzone_replied(self, comment_id: str) -> bool:
+        value = str(comment_id or "").strip()
+        return bool(value) and value in self.runtime["qzone_replied"]
+
+    def qzone_replied_count(self) -> int:
+        return len(self.runtime["qzone_replied"])
+
+    def qzone_baseline_done(self) -> bool:
+        return bool(self.runtime.get("qzone_baseline_done"))
+
+    def mark_qzone_baseline(self, done: bool = True) -> None:
+        self.runtime["qzone_baseline_done"] = bool(done)
+        self._dirty.add("runtime")
+
+    def reset_qzone_baseline(self) -> None:
+        self.runtime["qzone_baseline_done"] = False
+        self._dirty.add("runtime")
+
+    def mark_qzone_check(self, timestamp: float | None = None) -> None:
+        self.runtime["qzone_last_check"] = (
+            _now() if timestamp is None else float(timestamp)
+        )
         self._dirty.add("runtime")
