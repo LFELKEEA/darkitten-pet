@@ -2,9 +2,9 @@
 
 住在 Windows 桌面上的白发红瞳猫耳少女。支持 AI 聊天、长按语音对话、主动搭话、定时观察屏幕，以及本地插件扩展。
 
-当前源码版本：`1.3.1`。
+当前源码版本：`1.3.2`。
 
-- 下载安装包：[pet-v1.3.1](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.3.1)
+- 下载安装包：[pet-v1.3.2](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.3.2)
 - 插件库：[lfelkeea.github.io/darkitten-launcher/plugins.html](https://lfelkeea.github.io/darkitten-launcher/plugins.html)
 - 插件源码：[`plugins/`](plugins)（示例插件、专注守护、QQ 桥接）
 
@@ -22,7 +22,7 @@
   - 隐私闸门：敏感窗口、全屏应用、聊天中、语音中、刚和桌宠互动过时自动跳过。
 - **插件系统**：`data/plugins/` 下的本地 Python 插件，带权限声明、事件、定时器、AI、截屏、设置和存储 API。
 - 插件管理界面：启用/停用/重载、权限展示、错误隔离、日志。
-- **自动更新**：从站点清单检查桌宠新版本，下载后校验 SHA-256，退出时由隐藏脚本替换程序文件并自动重启，`data/` 完整保留。
+- **自动更新**：从站点清单检查桌宠新版本，下载后校验 SHA-256，退出时由隐藏脚本替换程序文件并自动重启，`data/` 完整保留。右键桌宠、托盘菜单、设置页都能手动检查更新。
 - **插件更新**：读取插件库 `plugins.json`，支持单个或全部更新；同样校验 SHA-256，更新前自动备份旧插件。
 
 ## 目录

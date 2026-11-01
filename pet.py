@@ -49,6 +49,7 @@ class PetWindow(QWidget):
     voice_cancelled = Signal()
     observe_screen_requested = Signal()
     plugins_requested = Signal()
+    update_requested = Signal()
     screen_watch_toggled = Signal(bool)
     petted = Signal()
     poked = Signal()
@@ -692,6 +693,7 @@ class PetWindow(QWidget):
         screen_action.setCheckable(True)
         screen_action.setChecked(screen_enabled)
         plugins_action = menu.addAction("插件管理")
+        update_action = menu.addAction("检查更新…")
         sleep_action = menu.addAction("叫醒 LFELKEEA" if self._sleeping else "让 LFELKEEA 休息")
         settings_action = menu.addAction("AI 与桌宠设置")
         menu.addSeparator()
@@ -714,6 +716,8 @@ class PetWindow(QWidget):
             self.observe_screen_requested.emit()
         elif chosen is plugins_action:
             self.plugins_requested.emit()
+        elif chosen is update_action:
+            self.update_requested.emit()
         elif chosen is screen_action:
             self.screen_watch_toggled.emit(screen_action.isChecked())
         elif chosen is voice_help_action:

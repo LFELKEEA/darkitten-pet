@@ -56,6 +56,7 @@ class PetApp(QObject):
         self.pet.voice_cancelled.connect(self.voice.cancel_listening)
         self.pet.observe_screen_requested.connect(self.observe_screen)
         self.pet.plugins_requested.connect(self.open_plugins)
+        self.pet.update_requested.connect(lambda: self.check_updates(manual=True))
         self.pet.screen_watch_toggled.connect(self.set_screen_watch)
         self.pet.petted.connect(lambda: self.plugins.emit("pet.pat"))
         self.pet.poked.connect(lambda: self.plugins.emit("pet.poke"))
