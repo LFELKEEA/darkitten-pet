@@ -7,12 +7,13 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugins" / "lfelkeea.qq_bridge"
 sys.path.insert(0, str(PLUGIN))
 
-from lfelkeea_qq_bridge import text, voicepacks  # noqa: E402
+from lfelkeea_qq_bridge import text, tts  # noqa: E402
 from lfelkeea_qq_bridge.service import (  # noqa: E402
     QQBridgeService,
     normalize_settings,
@@ -62,67 +63,86 @@ class FakeClient:
         self.event.set()
 
 
-def make_audio(folder: Path, name: str = "clip.wav") -> Path:
+def make_audio(folder: Path, name: str = "sample.wav") -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / name
     path.write_bytes(b"RIFF....WAVEfmt ")
     return path
 
 
-class VoiceUtilityTests(unittest.TestCase):
+class TTSUtilityTests(unittest.TestCase):
     def test_normalize_defaults(self) -> None:
         settings = normalize_settings({})
-        self.assertEqual(settings["voice_packs"], [])
-        self.assertFalse(settings["voice_reply_enabled"])
-        self.assertAlmostEqual(settings["voice_reply_probability"], 0.08)
+        self.assertEqual(settings["tts_engine"], "windows")
+        self.assertEqual(settings["tts_windows_voice"], "")
+        self.assertEqual(settings["tts_gpt_sovits_url"], "http://127.0.0.1:9880")
+        self.assertEqual(settings["tts_ref_audio"], "")
+        self.assertEqual(settings["tts_prompt_lang"], "zh")
+        self.assertEqual(settings["tts_text_lang"], "zh")
+        self.assertAlmostEqual(settings["tts_speed"], 1.0)
+        self.assertFalse(settings["tts_reply_enabled"])
+        self.assertAlmostEqual(settings["tts_reply_probability"], 0.08)
+        self.assertEqual(settings["tts_max_chars"], 120)
+
+    def test_normalize_clamps_and_sanitizes(self) -> None:
         settings = normalize_settings(
             {
-                "voice_packs": [" C:/a ", "C:/a", "", "D:/b"],
-                "voice_reply_enabled": "on",
-                "voice_reply_probability": "9",
+                "tts_engine": "GPT_SOVITS",
+                "tts_gpt_sovits_url": " http://127.0.0.1:9880 ",
+                "tts_ref_audio": '"C:/voice/ref.wav"',
+                "tts_rate": 99,
+                "tts_volume": -5,
+                "tts_speed": 9,
+                "tts_reply_enabled": "on",
+                "tts_reply_probability": "2",
+                "tts_max_chars": 5000,
+                "tts_prompt_lang": "jp",
+                "tts_text_lang": "ja",
             }
         )
-        self.assertEqual(settings["voice_packs"], ["C:/a", "D:/b"])
-        self.assertTrue(settings["voice_reply_enabled"])
-        self.assertEqual(settings["voice_reply_probability"], 1.0)
+        self.assertEqual(settings["tts_engine"], "gpt_sovits")
+        self.assertEqual(settings["tts_gpt_sovits_url"], "http://127.0.0.1:9880")
+        self.assertEqual(settings["tts_ref_audio"], "C:/voice/ref.wav")
+        self.assertEqual(settings["tts_rate"], 10)
+        self.assertEqual(settings["tts_volume"], 0)
+        self.assertEqual(settings["tts_speed"], 2.0)
+        self.assertTrue(settings["tts_reply_enabled"])
+        self.assertEqual(settings["tts_reply_probability"], 1.0)
+        self.assertEqual(settings["tts_max_chars"], 500)
+        self.assertEqual(settings["tts_prompt_lang"], "zh")
+        self.assertEqual(settings["tts_text_lang"], "ja")
+
+    def test_invalid_engine_falls_back(self) -> None:
+        self.assertEqual(normalize_settings({"tts_engine": "edge"})["tts_engine"], "windows")
 
     def test_parse_voice_tag(self) -> None:
-        cleaned, wanted = text.parse_voice_tag("好呀[voice]")
-        self.assertTrue(wanted)
-        self.assertEqual(cleaned, "好呀")
-        cleaned, wanted = text.parse_voice_tag("好呀【语音】")
-        self.assertTrue(wanted)
-        self.assertEqual(cleaned, "好呀")
-        cleaned, wanted = text.parse_voice_tag("好呀[语音]")
-        self.assertTrue(wanted)
-        self.assertEqual(cleaned, "好呀")
+        for value in ("好呀[voice]", "好呀【语音】", "好呀[语音]"):
+            cleaned, wanted = text.parse_voice_tag(value)
+            self.assertTrue(wanted)
+            self.assertEqual(cleaned, "好呀")
 
     def test_build_segments_record(self) -> None:
         segments = text.build_segments("你好", records=["C:/a.wav"])
         self.assertEqual(segments[-1], {"type": "record", "data": {"file": "C:/a.wav"}})
 
-    def test_find_clips_and_scan(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            pack = root / "我的语音包"
-            make_audio(pack)
-            make_audio(pack, "second.mp3")
-            (pack / "readme.txt").write_text("x", encoding="utf-8")
-            clips = voicepacks.find_clips(pack)
-            self.assertEqual(len(clips), 2)
-            packs = voicepacks.scan_packs([root], max_depth=2)
-            self.assertTrue(any(item.path == pack.resolve() for item in packs))
-            self.assertIn(voicepacks.choose_clip(pack).suffix, {".mp3", ".wav"})
+    def test_clean_text(self) -> None:
+        self.assertEqual(tts.clean_text("[face:1] 你好 https://x.com 啊"), "你好 啊")
+        self.assertEqual(tts.clean_text("abcdef", 3), "abc")
+        self.assertEqual(tts.clean_text("   "), "")
 
-    def test_scan_ignores_empty_folder(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "语音包").mkdir()
-            (root / "语音包" / "a.txt").write_text("x", encoding="utf-8")
-            self.assertEqual(voicepacks.scan_packs([root], max_depth=2), [])
+    def test_gpt_sovits_endpoint(self) -> None:
+        self.assertEqual(
+            tts.gpt_sovits_endpoint("127.0.0.1:9880"), "http://127.0.0.1:9880/tts"
+        )
+        self.assertEqual(
+            tts.gpt_sovits_endpoint("http://127.0.0.1:9880/tts"),
+            "http://127.0.0.1:9880/tts",
+        )
+        with self.assertRaises(tts.TTSError):
+            tts.gpt_sovits_endpoint("   ")
 
 
-class VoiceServiceTests(unittest.TestCase):
+class TTSServiceTests(unittest.TestCase):
     def make_service(self, settings: dict | None = None):
         state = Path(tempfile.mkdtemp())
         api = FakeAPI(
@@ -142,41 +162,123 @@ class VoiceServiceTests(unittest.TestCase):
         service.started = True
         return api, service
 
-    def test_send_voice_record(self) -> None:
+    def test_tts_ready(self) -> None:
         api, service = self.make_service()
-        with tempfile.TemporaryDirectory() as tmp:
-            clip = make_audio(Path(tmp))
-            result: list[tuple[bool, str]] = []
-            service.send_voice("private:10001", str(clip), lambda ok, msg: result.append((ok, msg)))
+        self.assertTrue(service._tts_ready())
+        api, service = self.make_service({"tts_engine": "gpt_sovits"})
+        self.assertFalse(service._tts_ready())
+        api, service = self.make_service(
+            {"tts_engine": "gpt_sovits", "tts_ref_audio": "C:/voice/ref.wav"}
+        )
+        self.assertTrue(service._tts_ready())
+
+    def test_should_tts(self) -> None:
+        api, service = self.make_service()
+        self.assertTrue(service._should_tts(True))
+        self.assertFalse(service._should_tts(False))
+        api, service = self.make_service(
+            {"tts_reply_enabled": True, "tts_reply_probability": 0.0}
+        )
+        self.assertFalse(service._should_tts(False))
+        api, service = self.make_service(
+            {"tts_reply_enabled": True, "tts_reply_probability": 1.0}
+        )
+        self.assertTrue(service._should_tts(False))
+        api, service = self.make_service(
+            {
+                "tts_engine": "gpt_sovits",
+                "tts_reply_enabled": True,
+                "tts_reply_probability": 1.0,
+            }
+        )
+        self.assertFalse(service._should_tts(True))
+
+    def test_synthesize_uses_windows_engine(self) -> None:
+        api, service = self.make_service({"tts_max_chars": 20})
+        calls: list[tuple[str, dict]] = []
+
+        def fake_windows(value, out, **kwargs):
+            calls.append((value, kwargs))
+            Path(out).write_bytes(b"RIFF" + b"0" * 2000)
+            return Path(out)
+
+        with mock.patch.object(tts, "synthesize_windows", fake_windows):
+            path = service._synthesize_tts("[face:1] 你好呀")
+        self.assertTrue(path.is_file())
+        self.assertEqual(calls[0][0], "你好呀")
+        self.assertEqual(calls[0][1]["voice"], "")
+        self.assertEqual(calls[0][1]["rate"], 0)
+        self.assertEqual(calls[0][1]["volume"], 100)
+
+    def test_synthesize_uses_gpt_sovits(self) -> None:
+        api, service = self.make_service(
+            {
+                "tts_engine": "gpt_sovits",
+                "tts_gpt_sovits_url": "http://127.0.0.1:9880",
+                "tts_ref_audio": "C:/voice/ref.wav",
+                "tts_prompt_text": "参考文字",
+                "tts_prompt_lang": "zh",
+                "tts_text_lang": "ja",
+                "tts_speed": 1.2,
+            }
+        )
+        calls: list[tuple[str, dict]] = []
+
+        def fake_gpt(value, out, **kwargs):
+            calls.append((value, kwargs))
+            Path(out).write_bytes(b"RIFF" + b"0" * 2000)
+            return Path(out)
+
+        with mock.patch.object(tts, "synthesize_gpt_sovits", fake_gpt):
+            path = service._synthesize_tts("こんにちは")
+        self.assertTrue(path.is_file())
+        self.assertEqual(calls[0][0], "こんにちは")
+        self.assertEqual(calls[0][1]["base_url"], "http://127.0.0.1:9880")
+        self.assertEqual(calls[0][1]["ref_audio"], "C:/voice/ref.wav")
+        self.assertEqual(calls[0][1]["prompt_text"], "参考文字")
+        self.assertEqual(calls[0][1]["text_lang"], "ja")
+        self.assertEqual(calls[0][1]["speed"], 1.2)
+
+    def test_tts_voices_swallows_error(self) -> None:
+        api, service = self.make_service()
+        with mock.patch.object(tts, "windows_voices", side_effect=RuntimeError("坏了")):
+            self.assertEqual(service.tts_voices(), [])
+        self.assertTrue(any("读取 Windows 语音失败" in item for item in api.logs))
+
+    def test_send_tts_record(self) -> None:
+        api, service = self.make_service()
+        clip = make_audio(Path(tempfile.mkdtemp()))
+        result: list[tuple[bool, str]] = []
+        with mock.patch.object(service, "_synthesize_tts", lambda value: clip):
+            service.send_tts(
+                "private:10001", "读这句话", lambda ok, msg: result.append((ok, msg))
+            )
             self.assertTrue(service.client.event.wait(2))
         conversation, segments = service.client.sent[-1]
         self.assertEqual(conversation, "private:10001")
-        self.assertEqual(segments, [{"type": "record", "data": {"file": str(clip.resolve())}}])
+        self.assertEqual(segments, [{"type": "record", "data": {"file": str(clip)}}])
 
-    def test_send_voice_rejects_stranger(self) -> None:
+    def test_send_tts_rejects_stranger(self) -> None:
         api, service = self.make_service()
-        with tempfile.TemporaryDirectory() as tmp:
-            clip = make_audio(Path(tmp))
-            result: list[tuple[bool, str]] = []
-            service.send_voice("private:22222", str(clip), lambda ok, msg: result.append((ok, msg)))
-        self.assertEqual(result and result[0][0], False)
+        result: list[tuple[bool, str]] = []
+        service.send_tts("private:22222", "你好", lambda ok, msg: result.append((ok, msg)))
+        self.assertFalse(result[0][0])
         self.assertIn("白名单", result[0][1])
         self.assertEqual(service.client.sent, [])
 
-    def test_pick_voice_clip_explicit_and_disabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            clip = make_audio(Path(tmp) / "pack")
-            api, service = self.make_service({"voice_packs": [str(clip.parent)]})
-            self.assertEqual(service._pick_voice_clip(False), "")
-            self.assertTrue(service._pick_voice_clip(True))
+    def test_send_tts_rejects_empty_text(self) -> None:
+        api, service = self.make_service()
+        result: list[tuple[bool, str]] = []
+        service.send_tts("private:10001", "[face:1]", lambda ok, msg: result.append((ok, msg)))
+        self.assertFalse(result[0][0])
+        self.assertIn("为空", result[0][1])
+        self.assertEqual(service.client.sent, [])
 
     def test_reply_with_voice_tag(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            clip = make_audio(Path(tmp) / "pack")
-            api, service = self.make_service(
-                {"voice_packs": [str(clip.parent)], "voice_reply_enabled": False}
-            )
-            api.reply = "给你听个声音[voice]"
+        api, service = self.make_service()
+        clip = make_audio(Path(tempfile.mkdtemp()))
+        api.reply = "给你听个声音[voice]"
+        with mock.patch.object(service, "_synthesize_tts", lambda value: clip):
             service._on_event_main(
                 {
                     "post_type": "message",
@@ -201,7 +303,7 @@ class VoiceServiceTests(unittest.TestCase):
             if segment.get("type") == "record"
         ]
         self.assertEqual(len(records), 1)
-        self.assertTrue(records[0]["data"]["file"].endswith(".wav"))
+        self.assertEqual(records[0]["data"]["file"], str(clip))
         texts = [
             segment["data"]["text"]
             for _, segments in service.client.sent
@@ -211,10 +313,33 @@ class VoiceServiceTests(unittest.TestCase):
         self.assertIn("给你听个声音", texts)
         self.assertNotIn("[voice]", "".join(texts))
 
+    def test_reply_without_tag_stays_silent(self) -> None:
+        api, service = self.make_service()
+        api.reply = "今天天气不错。"
+        with mock.patch.object(service, "_synthesize_tts", lambda value: make_audio(Path(tempfile.mkdtemp()))):
+            service._on_event_main(
+                {
+                    "post_type": "message",
+                    "message_type": "private",
+                    "user_id": 10001,
+                    "self_id": 99999,
+                    "message_id": 10,
+                    "message": [{"type": "text", "data": {"text": "在吗"}}],
+                }
+            )
+            time.sleep(0.2)
+        records = [
+            segment
+            for _, segments in service.client.sent
+            for segment in segments
+            if segment.get("type") == "record"
+        ]
+        self.assertEqual(records, [])
+
     def test_voice_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            clip = make_audio(Path(tmp) / "pack")
-            api, service = self.make_service({"voice_packs": [str(clip.parent)]})
+        api, service = self.make_service()
+        clip = make_audio(Path(tempfile.mkdtemp()))
+        with mock.patch.object(service, "_synthesize_tts", lambda value: clip):
             service._on_event_main(
                 {
                     "post_type": "message",
@@ -222,7 +347,7 @@ class VoiceServiceTests(unittest.TestCase):
                     "user_id": 10001,
                     "self_id": 99999,
                     "message_id": 11,
-                    "message": [{"type": "text", "data": {"text": "/voice"}}],
+                    "message": [{"type": "text", "data": {"text": "/voice 读这句话"}}],
                 }
             )
             self.assertTrue(service.client.event.wait(2))
@@ -232,7 +357,7 @@ class VoiceServiceTests(unittest.TestCase):
             for segment in segments
             if segment.get("type") == "record"
         ]
-        self.assertEqual(len(records), 1)
+        self.assertEqual(records, [{"type": "record", "data": {"file": str(clip)}}])
 
 
 if __name__ == "__main__":

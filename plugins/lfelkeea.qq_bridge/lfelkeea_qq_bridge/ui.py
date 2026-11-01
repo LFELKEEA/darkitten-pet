@@ -995,63 +995,109 @@ class QQBridgeDialog(QDialog):
     def _build_voice(self) -> QWidget:
         page, layout = self._page()
 
-        pack_box = QGroupBox("语音包")
-        pack_layout = QVBoxLayout(pack_box)
-        pack_layout.setSpacing(8)
-        pack_hint = _hint(
-            "语音包就是装着 mp3 / wav / amr / silk 等音频的文件夹。"
-            "SnowLuma 会自动转成 QQ 语音格式；发送前请确认语音包来源合法。"
+        engine_box = QGroupBox("TTS 引擎")
+        engine_form = QFormLayout(engine_box)
+        self.tts_engine = QComboBox()
+        self.tts_engine.addItem("Windows 本地语音（开箱即用）", "windows")
+        self.tts_engine.addItem("GPT-SoVITS 本地 API（自定义音色）", "gpt_sovits")
+        engine_form.addRow("合成方式", self.tts_engine)
+        engine_form.addRow(
+            _hint(
+                "TTS 会把模型回复的文字读成 WAV，再由 SnowLuma 转成 QQ 语音。"
+                "Windows 引擎不需要额外安装；自定义音色需要本机运行 GPT-SoVITS。"
+            )
         )
-        pack_layout.addWidget(pack_hint)
-        self.voice_pack_list = QListWidget()
-        self.voice_pack_list.setFixedHeight(135)
-        self.voice_pack_list.currentItemChanged.connect(
-            lambda *_: self._refresh_voice_clips()
+        layout.addWidget(engine_box)
+
+        windows_box = QGroupBox("Windows 本地语音")
+        self.tts_windows_box = windows_box
+        windows_form = QFormLayout(windows_box)
+        voice_row = QHBoxLayout()
+        self.tts_voice_combo = QComboBox()
+        self.tts_voice_combo.setEditable(True)
+        self.tts_voice_combo.setMinimumWidth(240)
+        refresh_voices = QPushButton("刷新音色")
+        refresh_voices.setObjectName("ghost")
+        refresh_voices.clicked.connect(self._refresh_tts_voices)
+        voice_row.addWidget(self.tts_voice_combo, 1)
+        voice_row.addWidget(refresh_voices)
+        windows_form.addRow("音色", voice_row)
+        self.tts_rate = QSpinBox()
+        self.tts_rate.setRange(-10, 10)
+        self.tts_rate.setValue(0)
+        windows_form.addRow("语速", self.tts_rate)
+        self.tts_volume = QSpinBox()
+        self.tts_volume.setRange(0, 100)
+        self.tts_volume.setValue(100)
+        windows_form.addRow("音量", self.tts_volume)
+        windows_form.addRow(
+            _hint(
+                "使用 Windows 已安装的 SAPI 语音；中文系统通常自带 Microsoft Huihui。"
+                "音色留空时由系统选默认语音。"
+            )
         )
-        pack_layout.addWidget(self.voice_pack_list)
-        pack_btns = QHBoxLayout()
-        import_btn = QPushButton("导入文件夹")
-        import_btn.clicked.connect(self._import_voice_pack)
-        scan_btn = QPushButton("扫描电脑")
-        scan_btn.clicked.connect(self._scan_voice_packs)
-        remove_btn = QPushButton("移除")
-        remove_btn.clicked.connect(self._remove_voice_pack)
-        open_btn = QPushButton("打开目录")
-        open_btn.setObjectName("ghost")
-        open_btn.clicked.connect(self._open_selected_voice_pack)
-        pack_btns.addWidget(import_btn)
-        pack_btns.addWidget(scan_btn)
-        pack_btns.addWidget(remove_btn)
-        pack_btns.addStretch(1)
-        pack_btns.addWidget(open_btn)
-        pack_layout.addLayout(pack_btns)
-        self.voice_pack_status = _hint("还没有导入语音包。")
-        pack_layout.addWidget(self.voice_pack_status)
-        layout.addWidget(pack_box)
+        layout.addWidget(windows_box)
 
-        clip_box = QGroupBox("语音片段")
-        clip_layout = QVBoxLayout(clip_box)
-        clip_layout.setSpacing(8)
-        self.voice_clip_list = QListWidget()
-        self.voice_clip_list.setMinimumHeight(150)
-        clip_layout.addWidget(self.voice_clip_list, 1)
-        clip_btns = QHBoxLayout()
-        preview_btn = QPushButton("试听")
-        preview_btn.clicked.connect(self._preview_voice_clip)
-        send_clip_btn = QPushButton("发送选中")
-        send_clip_btn.setObjectName("primary")
-        send_clip_btn.clicked.connect(self._send_voice_clip)
-        random_btn = QPushButton("随机发一条")
-        random_btn.clicked.connect(self._send_random_voice)
-        clip_btns.addWidget(preview_btn)
-        clip_btns.addWidget(send_clip_btn)
-        clip_btns.addStretch(1)
-        clip_btns.addWidget(random_btn)
-        clip_layout.addLayout(clip_btns)
-        layout.addWidget(clip_box, 1)
+        self.tts_gpt_box = QGroupBox("GPT-SoVITS 本地 API")
+        gpt_form = QFormLayout(self.tts_gpt_box)
+        self.tts_gpt_url = QLineEdit()
+        self.tts_gpt_url.setPlaceholderText("http://127.0.0.1:9880")
+        gpt_form.addRow("API 地址", self.tts_gpt_url)
+        ref_row = QHBoxLayout()
+        self.tts_ref_audio = QLineEdit()
+        self.tts_ref_audio.setPlaceholderText("参考音频的本地路径，例如数据集里的某个 wav")
+        browse_ref = QPushButton("选择")
+        browse_ref.setObjectName("ghost")
+        browse_ref.clicked.connect(self._browse_tts_ref)
+        ref_row.addWidget(self.tts_ref_audio, 1)
+        ref_row.addWidget(browse_ref)
+        gpt_form.addRow("参考音频", ref_row)
+        self.tts_prompt_text = QLineEdit()
+        self.tts_prompt_text.setPlaceholderText("参考音频里说的内容，要和音频一致")
+        gpt_form.addRow("参考文字", self.tts_prompt_text)
+        self.tts_prompt_lang = QComboBox()
+        self.tts_text_lang = QComboBox()
+        for label, value in (
+            ("中文", "zh"),
+            ("英文", "en"),
+            ("日文", "ja"),
+            ("韩文", "ko"),
+            ("粤语", "yue"),
+            ("自动", "auto"),
+        ):
+            self.tts_prompt_lang.addItem(label, value)
+            self.tts_text_lang.addItem(label, value)
+        gpt_form.addRow("参考语言", self.tts_prompt_lang)
+        gpt_form.addRow("合成语言", self.tts_text_lang)
+        self.tts_speed = QDoubleSpinBox()
+        self.tts_speed.setRange(0.5, 2.0)
+        self.tts_speed.setSingleStep(0.05)
+        self.tts_speed.setDecimals(2)
+        self.tts_speed.setValue(1.0)
+        gpt_form.addRow("语速倍率", self.tts_speed)
+        dataset_link = QLabel(
+            '音色参考：<a href="https://modelscope.cn/datasets/YinZilu/da-fei-yu-girl-voice-zh">'
+            "大飞鱼少女音数据集</a>（CC BY-NC 4.0，仅参考音频，不含在线接口）"
+        )
+        dataset_link.setOpenExternalLinks(True)
+        dataset_link.setWordWrap(True)
+        gpt_form.addRow("数据集", dataset_link)
+        gpt_form.addRow(
+            _hint(
+                "需要在本机运行 GPT-SoVITS 的 api_v2.py（默认 9880 端口），"
+                "参考音频和参考文字要对应。数据集只提供音色素材，请仅用于个人非商业用途，"
+                "不要冒充他人或用于诈骗。"
+            )
+        )
+        layout.addWidget(self.tts_gpt_box)
 
-        send_box = QGroupBox("发送对象")
-        send_layout = QHBoxLayout(send_box)
+        use_box = QGroupBox("试听与发送")
+        use_layout = QVBoxLayout(use_box)
+        self.tts_text = QPlainTextEdit()
+        self.tts_text.setFixedHeight(72)
+        self.tts_text.setPlaceholderText("输入要合成的文字，例如：今天也要早点睡呀。")
+        use_layout.addWidget(self.tts_text)
+        target_row = QHBoxLayout()
         self.voice_target = QComboBox()
         self.voice_target.setEditable(True)
         self.voice_target.setMinimumWidth(280)
@@ -1062,31 +1108,55 @@ class QQBridgeDialog(QDialog):
         target_btn = QPushButton("刷新对象")
         target_btn.setObjectName("ghost")
         target_btn.clicked.connect(self._refresh_voice_targets)
-        send_layout.addWidget(QLabel("发给"))
-        send_layout.addWidget(self.voice_target, 1)
-        send_layout.addWidget(target_btn)
-        layout.addWidget(send_box)
+        target_row.addWidget(QLabel("发给"))
+        target_row.addWidget(self.voice_target, 1)
+        target_row.addWidget(target_btn)
+        use_layout.addLayout(target_row)
+        use_btns = QHBoxLayout()
+        preview_btn = QPushButton("试听")
+        preview_btn.clicked.connect(self._preview_tts)
+        send_btn = QPushButton("发送语音")
+        send_btn.setObjectName("primary")
+        send_btn.clicked.connect(self._send_tts_text)
+        use_btns.addWidget(preview_btn)
+        use_btns.addWidget(send_btn)
+        use_btns.addStretch(1)
+        use_layout.addLayout(use_btns)
+        self.tts_status = _hint("先在上面选好引擎，再输入文字试听或发送。")
+        use_layout.addWidget(self.tts_status)
+        layout.addWidget(use_box)
 
         auto_box = QGroupBox("自动语音")
         auto_layout = QVBoxLayout(auto_box)
-        self.voice_reply_enabled = QCheckBox("AI 回复时按概率附带一条语音")
-        self.voice_reply_probability = QDoubleSpinBox()
-        self.voice_reply_probability.setRange(0.0, 1.0)
-        self.voice_reply_probability.setSingleStep(0.01)
-        self.voice_reply_probability.setDecimals(2)
-        self.voice_reply_probability.setPrefix("概率 ")
+        self.tts_reply_enabled = QCheckBox("AI 回复时按概率附带一条 TTS 语音")
+        self.tts_reply_probability = QDoubleSpinBox()
+        self.tts_reply_probability.setRange(0.0, 1.0)
+        self.tts_reply_probability.setSingleStep(0.01)
+        self.tts_reply_probability.setDecimals(2)
+        self.tts_reply_probability.setPrefix("概率 ")
         prob_row = QHBoxLayout()
-        prob_row.addWidget(self.voice_reply_probability)
+        prob_row.addWidget(self.tts_reply_probability)
         prob_row.addStretch(1)
-        auto_layout.addWidget(self.voice_reply_enabled)
+        auto_layout.addWidget(self.tts_reply_enabled)
         auto_layout.addLayout(prob_row)
+        max_row = QHBoxLayout()
+        self.tts_max_chars = QSpinBox()
+        self.tts_max_chars.setRange(20, 500)
+        self.tts_max_chars.setValue(120)
+        self.tts_max_chars.setSuffix(" 字")
+        max_row.addWidget(QLabel("单条最多合成"))
+        max_row.addWidget(self.tts_max_chars)
+        max_row.addStretch(1)
+        auto_layout.addLayout(max_row)
         auto_layout.addWidget(
             _hint(
-                "AI 在回复末尾写 [voice] 时会发语音；关闭自动语音后，仍可以用下面的按钮手动发。"
+                "模型在回复末尾写 [voice] 时必定尝试发语音；关闭自动语音后，"
+                "仍可以用上面的「发送语音」手动发。"
             )
         )
         layout.addWidget(auto_box)
         layout.addStretch(1)
+        self.tts_engine.currentIndexChanged.connect(self._update_tts_engine_visibility)
         return page
 
     # ---------- 诊断 ----------
@@ -1251,9 +1321,24 @@ class QQBridgeDialog(QDialog):
         self.qzone_reply_interval.setValue(int(settings["qzone_reply_interval"]))
         self.qzone_reply_max.setValue(int(settings["qzone_reply_max"]))
 
-        self.voice_reply_enabled.setChecked(bool(settings["voice_reply_enabled"]))
-        self.voice_reply_probability.setValue(float(settings["voice_reply_probability"]))
-        self._refresh_voice_packs()
+        engine_index = self.tts_engine.findData(settings["tts_engine"])
+        self.tts_engine.setCurrentIndex(max(0, engine_index))
+        self._fill_tts_voice(str(settings["tts_windows_voice"]))
+        self.tts_rate.setValue(int(settings["tts_rate"]))
+        self.tts_volume.setValue(int(settings["tts_volume"]))
+        self.tts_gpt_url.setText(str(settings["tts_gpt_sovits_url"]))
+        self.tts_ref_audio.setText(str(settings["tts_ref_audio"]))
+        self.tts_prompt_text.setText(str(settings["tts_prompt_text"]))
+        prompt_index = self.tts_prompt_lang.findData(settings["tts_prompt_lang"])
+        self.tts_prompt_lang.setCurrentIndex(max(0, prompt_index))
+        text_index = self.tts_text_lang.findData(settings["tts_text_lang"])
+        self.tts_text_lang.setCurrentIndex(max(0, text_index))
+        self.tts_speed.setValue(float(settings["tts_speed"]))
+        self.tts_reply_enabled.setChecked(bool(settings["tts_reply_enabled"]))
+        self.tts_reply_probability.setValue(float(settings["tts_reply_probability"]))
+        self.tts_max_chars.setValue(int(settings["tts_max_chars"]))
+        self._update_tts_engine_visibility()
+        self._refresh_tts_voices()
         self._refresh_voice_targets()
 
         self.persona_edit.setPlainText(self.service.persona_text())
@@ -1327,13 +1412,19 @@ class QQBridgeDialog(QDialog):
             "qzone_auto_reply": self.qzone_auto_reply.isChecked(),
             "qzone_reply_interval": self.qzone_reply_interval.value(),
             "qzone_reply_max": self.qzone_reply_max.value(),
-            "voice_packs": [
-                str(self.voice_pack_list.item(index).data(Qt.ItemDataRole.UserRole))
-                for index in range(self.voice_pack_list.count())
-                if self.voice_pack_list.item(index) is not None
-            ],
-            "voice_reply_enabled": self.voice_reply_enabled.isChecked(),
-            "voice_reply_probability": self.voice_reply_probability.value(),
+            "tts_engine": self.tts_engine.currentData() or "windows",
+            "tts_windows_voice": self.tts_voice_combo.currentText().strip(),
+            "tts_rate": self.tts_rate.value(),
+            "tts_volume": self.tts_volume.value(),
+            "tts_gpt_sovits_url": self.tts_gpt_url.text().strip(),
+            "tts_ref_audio": self.tts_ref_audio.text().strip(),
+            "tts_prompt_text": self.tts_prompt_text.text().strip(),
+            "tts_prompt_lang": self.tts_prompt_lang.currentData() or "zh",
+            "tts_text_lang": self.tts_text_lang.currentData() or "zh",
+            "tts_speed": self.tts_speed.value(),
+            "tts_reply_enabled": self.tts_reply_enabled.isChecked(),
+            "tts_reply_probability": self.tts_reply_probability.value(),
+            "tts_max_chars": self.tts_max_chars.value(),
         }
 
     def _refresh_all(self) -> None:
@@ -1342,7 +1433,6 @@ class QQBridgeDialog(QDialog):
         self._refresh_memory()
         self._refresh_slang()
         self._refresh_habits()
-        self._refresh_voice_packs()
         self._refresh_voice_targets()
         self._refresh_diagnostics()
 
@@ -1394,7 +1484,8 @@ class QQBridgeDialog(QDialog):
             )
             self.diag_data.setText(
                 f"记忆 {snapshot['memory_count']} 条，黑话 {snapshot['slang_count']} 条，"
-                f"语音包 {snapshot['voice_pack_count']} 个，"
+                f"TTS {snapshot.get('tts_engine', 'windows')}"
+                f"{'（已配置）' if snapshot.get('tts_configured') else '（未配置）'}，"
                 f"收藏表情 {snapshot.get('custom_face_count', 0)} 个，"
                 f"QQ 空间{'开启' if snapshot['qzone_enabled'] else '关闭'}"
             )
@@ -1778,55 +1869,52 @@ class QQBridgeDialog(QDialog):
 
         self.service.send_test(target, text, done)
 
-    # ---------- 语音操作 ----------
+    # ---------- TTS 语音操作 ----------
 
-    def _selected_voice_pack_path(self) -> str:
-        item = self.voice_pack_list.currentItem()
-        if item is None:
-            return ""
-        return str(item.data(Qt.ItemDataRole.UserRole) or "")
-
-    def _refresh_voice_packs(self) -> None:
-        current = self._selected_voice_pack_path()
-        packs = self.service.voice_pack_list()
-        self.voice_pack_list.blockSignals(True)
-        self.voice_pack_list.clear()
-        restore = -1
-        for index, pack in enumerate(packs):
-            item = QListWidgetItem(f"{pack['name']}（{pack['count']} 条）")
-            item.setData(Qt.ItemDataRole.UserRole, pack["path"])
-            item.setToolTip(pack["path"])
-            self.voice_pack_list.addItem(item)
-            if pack["path"] == current:
-                restore = index
-        self.voice_pack_list.blockSignals(False)
-        if packs:
-            self.voice_pack_list.setCurrentRow(restore if restore >= 0 else 0)
-            self.voice_pack_status.setText(f"已导入 {len(packs)} 个语音包。")
+    def _fill_tts_voice(self, voice: str) -> None:
+        text = str(voice or "").strip()
+        if not text:
+            return
+        index = self.tts_voice_combo.findText(text)
+        if index >= 0:
+            self.tts_voice_combo.setCurrentIndex(index)
         else:
-            self.voice_pack_status.setText("还没有导入语音包。可以点“导入文件夹”或“扫描电脑”。")
-        self._refresh_voice_clips()
+            self.tts_voice_combo.setEditText(text)
 
-    def _refresh_voice_clips(self) -> None:
-        self.voice_clip_list.clear()
-        folder = self._selected_voice_pack_path()
-        if not folder:
+    def _refresh_tts_voices(self, force: bool = False) -> None:
+        if getattr(self, "_tts_voices_loaded", False) and not force:
             return
-        try:
-            clips = self.service.voice_clips(folder)
-        except Exception as exc:
-            self._notify(f"读取语音包失败：{exc}", False)
-            return
-        for clip in clips[:600]:
-            path = Path(clip)
-            item = QListWidgetItem(path.stem if path.stem else path.name)
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
-            item.setToolTip(str(path))
-            self.voice_clip_list.addItem(item)
-        if len(clips) > 600:
-            self.voice_pack_status.setText(
-                f"这个语音包有 {len(clips)} 条，列表只显示前 600 条；随机发送会覆盖全部。"
+        current = self.tts_voice_combo.currentText().strip()
+        voices = self.service.tts_voices()
+        self.tts_voice_combo.blockSignals(True)
+        self.tts_voice_combo.clear()
+        self.tts_voice_combo.addItems(voices)
+        self.tts_voice_combo.blockSignals(False)
+        self._fill_tts_voice(current)
+        self._tts_voices_loaded = True
+        if voices:
+            self.tts_status.setText(f"检测到 {len(voices)} 个 Windows 语音。")
+        else:
+            self.tts_status.setText(
+                "没有读到 Windows 语音，可以手填语音名，或改用 GPT-SoVITS。"
             )
+
+    def _update_tts_engine_visibility(self) -> None:
+        engine = self.tts_engine.currentData() or "windows"
+        self.tts_windows_box.setVisible(engine == "windows")
+        self.tts_gpt_box.setVisible(engine == "gpt_sovits")
+
+    def _browse_tts_ref(self) -> None:
+        current = self.tts_ref_audio.text().strip()
+        start = str(Path(current).parent) if current else str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择参考音频",
+            start,
+            "音频文件 (*.wav *.mp3 *.flac *.ogg *.m4a);;所有文件 (*)",
+        )
+        if path:
+            self.tts_ref_audio.setText(path)
 
     def _refresh_voice_targets(self) -> None:
         current = self.voice_target.currentText().strip()
@@ -1853,88 +1941,40 @@ class QQBridgeDialog(QDialog):
             return str(data)
         return text
 
-    def _import_voice_pack(self) -> None:
-        folder = QFileDialog.getExistingDirectory(
-            self, "选择语音包文件夹", str(Path.home())
-        )
-        if not folder:
+    def _preview_tts(self) -> None:
+        text = self.tts_text.toPlainText().strip()
+        if not text:
+            self._notify("先输入要合成的文字。", False)
             return
-        message = self.service.add_voice_packs([folder])
-        self._refresh_voice_packs()
-        self._notify(message, message.startswith("已导入"))
+        self.tts_status.setText("正在合成试听音频…")
 
-    def _scan_voice_packs(self) -> None:
-        self._notify("正在扫描下载、桌面、文档、音乐等目录…")
-        self.voice_pack_status.setText("扫描中，请稍等…")
-
-        def done(packs: list[dict[str, Any]]) -> None:
-            if not packs:
-                self.voice_pack_status.setText(
-                    "没找到语音包。可以用“导入文件夹”手动选择。"
-                )
+        def done(path: str, error: str) -> None:
+            if error:
+                self.tts_status.setText(f"合成失败：{error}")
+                self._notify(f"合成失败：{error}", False)
                 return
-            message = self.service.add_voice_packs(
-                [str(item.get("path", "")) for item in packs]
-            )
-            self._refresh_voice_packs()
-            self._notify(message, message.startswith("已导入"))
+            self.tts_status.setText(f"试听文件：{path}")
+            self._notify("试听音频已生成，正在打开。")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-        self.service.scan_voice_packs(done)
+        self.service.preview_tts(text, done)
 
-    def _remove_voice_pack(self) -> None:
-        folder = self._selected_voice_pack_path()
-        if not folder:
-            self._notify("先选中要移除的语音包。", False)
-            return
-        message = self.service.remove_voice_pack(folder)
-        self._refresh_voice_packs()
-        self._notify(message, message.startswith("已移除"))
-
-    def _open_selected_voice_pack(self) -> None:
-        folder = self._selected_voice_pack_path()
-        if folder and Path(folder).is_dir():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-        else:
-            self._notify("先选中一个语音包。", False)
-
-    def _selected_voice_clip(self) -> str:
-        item = self.voice_clip_list.currentItem()
-        if item is None:
-            return ""
-        return str(item.data(Qt.ItemDataRole.UserRole) or "")
-
-    def _preview_voice_clip(self) -> None:
-        clip = self._selected_voice_clip()
-        if not clip or not Path(clip).is_file():
-            self._notify("先选中一条语音。", False)
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(clip))
-
-    def _send_voice_clip(self) -> None:
+    def _send_tts_text(self) -> None:
         target = self._voice_target_value()
-        clip = self._selected_voice_clip()
+        text = self.tts_text.toPlainText().strip()
         if not target:
             self._notify("先选择或填写发送对象。", False)
             return
-        if not clip:
-            self._notify("先选中一条语音。", False)
+        if not text:
+            self._notify("先输入要合成的文字。", False)
             return
+        self.tts_status.setText("正在合成并发送…")
 
         def done(ok: bool, message: str) -> None:
+            self.tts_status.setText(message)
             self._notify(message, ok)
 
-        self.service.send_voice(target, clip, done)
-
-    def _send_random_voice(self) -> None:
-        target = self._voice_target_value()
-        if not target:
-            self._notify("先选择或填写发送对象。", False)
-            return
-
-        def done(ok: bool, message: str) -> None:
-            self._notify(message, ok)
-
-        self.service.send_random_voice(target, self._selected_voice_pack_path(), done)
+        self.service.send_tts(target, text, done)
 
     def _open_folder(self) -> None:
         path = Path(str(getattr(self.service, "state_root", "")))

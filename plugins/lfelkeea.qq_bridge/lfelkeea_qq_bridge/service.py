@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from PySide6.QtCore import QObject, Signal
 
-from . import analysis, vision, voicepacks
+from . import analysis, tts as tts_engine, vision
 from .commands import Command, help_text, parse_command
 from .onebot import EventServer, OneBotClient, OneBotError, split_conversation
 from .snowluma import SnowLumaManager
@@ -130,6 +130,16 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     trigger = str(data.get("group_trigger", "at") or "at").strip().lower()
     if trigger not in ("at", "all"):
         trigger = "at"
+    tts_engine_name = str(data.get("tts_engine", "windows") or "windows").strip().lower()
+    if tts_engine_name not in ("windows", "gpt_sovits"):
+        tts_engine_name = "windows"
+    tts_langs = ("zh", "en", "ja", "ko", "yue", "auto")
+    tts_prompt_lang = str(data.get("tts_prompt_lang", "zh") or "zh").strip().lower()
+    if tts_prompt_lang not in tts_langs:
+        tts_prompt_lang = "zh"
+    tts_text_lang = str(data.get("tts_text_lang", "zh") or "zh").strip().lower()
+    if tts_text_lang not in tts_langs:
+        tts_text_lang = "zh"
     private_ids = _as_ids(data.get("allow_private"))
     group_ids = _as_ids(data.get("allow_groups"))
     allowed_keys = {f"private:{item}" for item in private_ids} | {
@@ -191,11 +201,24 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         "auto_start_snowluma": _as_bool(data.get("auto_start_snowluma"), True),
         "snowluma_dir": str(data.get("snowluma_dir", "") or "").strip().strip('"'),
         "vision_enabled": _as_bool(data.get("vision_enabled"), True),
-        "voice_packs": _as_path_list(data.get("voice_packs")),
-        "voice_reply_enabled": _as_bool(data.get("voice_reply_enabled"), False),
-        "voice_reply_probability": _as_float(
-            data.get("voice_reply_probability"), 0.08, 0.0, 1.0
+        "tts_engine": tts_engine_name,
+        "tts_windows_voice": str(data.get("tts_windows_voice", "") or "").strip()[:120],
+        "tts_rate": _as_int(data.get("tts_rate"), 0, -10, 10),
+        "tts_volume": _as_int(data.get("tts_volume"), 100, 0, 100),
+        "tts_gpt_sovits_url": str(
+            data.get("tts_gpt_sovits_url", "http://127.0.0.1:9880")
+            or "http://127.0.0.1:9880"
+        ).strip(),
+        "tts_ref_audio": str(data.get("tts_ref_audio", "") or "").strip().strip('"'),
+        "tts_prompt_text": str(data.get("tts_prompt_text", "") or "").strip()[:300],
+        "tts_prompt_lang": tts_prompt_lang,
+        "tts_text_lang": tts_text_lang,
+        "tts_speed": _as_float(data.get("tts_speed"), 1.0, 0.5, 2.0),
+        "tts_reply_enabled": _as_bool(data.get("tts_reply_enabled"), False),
+        "tts_reply_probability": _as_float(
+            data.get("tts_reply_probability"), 0.08, 0.0, 1.0
         ),
+        "tts_max_chars": _as_int(data.get("tts_max_chars"), 120, 20, 500),
         "custom_face_enabled": _as_bool(data.get("custom_face_enabled"), False),
         "custom_face_probability": _as_float(
             data.get("custom_face_probability"), 0.05, 0.0, 1.0
@@ -606,8 +629,9 @@ class QQBridgeService(QObject):
             "auto_start_snowluma": bool(self.settings["auto_start_snowluma"]),
             "snowluma_dir": self.settings["snowluma_dir"],
             "vision_enabled": bool(self.settings["vision_enabled"]),
-            "voice_pack_count": len(self.settings["voice_packs"]),
-            "voice_reply_enabled": bool(self.settings["voice_reply_enabled"]),
+            "tts_engine": self.settings["tts_engine"],
+            "tts_configured": self._tts_ready(),
+            "tts_reply_enabled": bool(self.settings["tts_reply_enabled"]),
             "custom_face_enabled": bool(self.settings["custom_face_enabled"]),
             "custom_face_count": len(self._custom_faces)
             or len(self.settings["custom_face_ids"]),
@@ -816,89 +840,109 @@ class QQBridgeService(QObject):
             "group" if kind == "group" else "private", digits, add, note
         )
 
-    # ---------- 语音包 ----------
+    # ---------- TTS 语音 ----------
 
-    def voice_pack_list(self) -> list[dict[str, Any]]:
-        packs: list[dict[str, Any]] = []
-        for raw in self.settings["voice_packs"]:
-            folder = Path(raw).expanduser()
-            if not folder.is_dir():
-                continue
-            clips = voicepacks.find_clips(folder)
-            if not clips:
-                continue
-            packs.append(
-                {
-                    "path": str(folder.resolve()),
-                    "name": folder.name,
-                    "count": len(clips),
-                }
+    def _tts_ready(self) -> bool:
+        engine = self.settings["tts_engine"]
+        if engine == "windows":
+            return True
+        if engine == "gpt_sovits":
+            return bool(
+                self.settings["tts_gpt_sovits_url"]
+                and self.settings["tts_ref_audio"]
             )
-        return packs
+        return False
 
-    def _save_voice_settings(self) -> None:
+    def tts_voices(self) -> list[str]:
+        """列出 Windows 已安装语音；失败时返回空列表。"""
         try:
-            self.api.save_settings(
-                {
-                    "voice_packs": list(self.settings["voice_packs"]),
-                    "voice_reply_enabled": bool(self.settings["voice_reply_enabled"]),
-                    "voice_reply_probability": float(
-                        self.settings["voice_reply_probability"]
-                    ),
-                }
-            )
+            return tts_engine.windows_voices()
         except Exception as exc:
-            self._log(f"保存语音设置失败：{exc}")
+            self._log(f"读取 Windows 语音失败：{exc}")
+            return []
 
-    def add_voice_packs(self, paths: list[str]) -> str:
-        added = 0
-        for raw in paths:
-            folder = Path(str(raw or "").strip()).expanduser()
-            if not folder.is_dir() or not voicepacks.find_clips(folder, limit=1):
+    def _tts_output_dir(self) -> Path:
+        path = self.state_root / "tts"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _synthesize_tts(self, text: str) -> Path:
+        if not self._tts_ready():
+            raise tts_engine.TTSError("TTS 还没有配置好，先到「语音」页选择引擎。")
+        value = tts_engine.clean_text(text, self.settings["tts_max_chars"])
+        if not value:
+            raise tts_engine.TTSError("没有可合成的文字。")
+        stamp = f"{int(time.time() * 1000)}-{random.randint(100, 999)}"
+        out = self._tts_output_dir() / f"tts-{stamp}.wav"
+        if self.settings["tts_engine"] == "gpt_sovits":
+            path = tts_engine.synthesize_gpt_sovits(
+                value,
+                out,
+                base_url=self.settings["tts_gpt_sovits_url"],
+                ref_audio=self.settings["tts_ref_audio"],
+                prompt_text=self.settings["tts_prompt_text"],
+                prompt_lang=self.settings["tts_prompt_lang"],
+                text_lang=self.settings["tts_text_lang"],
+                speed=self.settings["tts_speed"],
+            )
+        else:
+            path = tts_engine.synthesize_windows(
+                value,
+                out,
+                voice=self.settings["tts_windows_voice"],
+                rate=self.settings["tts_rate"],
+                volume=self.settings["tts_volume"],
+            )
+        self._cleanup_tts_files()
+        return path
+
+    def _cleanup_tts_files(self, keep: int = 20) -> None:
+        try:
+            files = sorted(
+                self._tts_output_dir().glob("tts-*.wav"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return
+        for path in files[max(1, int(keep)):]:
+            try:
+                path.unlink()
+            except OSError:
                 continue
-            value = str(folder.resolve())
-            if value in self.settings["voice_packs"]:
-                continue
-            self.settings["voice_packs"].append(value)
-            added += 1
-        if added:
-            self._save_voice_settings()
-        return f"已导入 {added} 个语音包。" if added else "没有发现新的语音包。"
 
-    def remove_voice_pack(self, folder: str) -> str:
-        value = str(Path(str(folder or "").strip()).expanduser())
-        values = list(self.settings["voice_packs"])
-        kept = [item for item in values if item != folder and item != value]
-        if len(kept) == len(values):
-            return "列表里没有这个语音包。"
-        self.settings["voice_packs"] = kept
-        self._save_voice_settings()
-        return "已移除语音包。"
+    def _should_tts(self, explicit: bool) -> bool:
+        if not self._tts_ready():
+            return False
+        if explicit:
+            return True
+        if not self.settings["tts_reply_enabled"]:
+            return False
+        return random.random() < self.settings["tts_reply_probability"]
 
-    def scan_voice_packs(self, callback: Callable[[list[dict[str, Any]]], None]) -> None:
-        """扫描用户目录，结果回主线程。"""
+    def preview_tts(
+        self,
+        text: str,
+        callback: Callable[[str, str], None] | None = None,
+    ) -> None:
+        """合成一条试听语音，结果回主线程：(文件路径, 错误)。"""
 
         def work() -> None:
             try:
-                packs = voicepacks.scan_packs()
-                payload = [
-                    {"path": str(item.path), "name": item.name, "count": item.count}
-                    for item in packs
-                ]
+                path = str(self._synthesize_tts(text))
+                error = ""
             except Exception as exc:
-                payload = []
-                self._log(f"扫描语音包失败：{exc}")
-            self._dispatch.emit(lambda: callback(payload))
+                path, error = "", str(exc)
+                self._log(f"TTS 试听失败：{exc}")
+            if callback is not None:
+                self._dispatch.emit(lambda: callback(path, error))
 
-        threading.Thread(target=work, name="qq-bridge-voice-scan", daemon=True).start()
+        threading.Thread(target=work, name="qq-bridge-tts-preview", daemon=True).start()
 
-    def voice_clips(self, folder: str) -> list[str]:
-        return [str(item) for item in voicepacks.find_clips(folder)]
-
-    def send_voice(
+    def send_tts(
         self,
         conversation: str,
-        clip: str,
+        text: str,
         callback: Callable[[bool, str], None] | None = None,
     ) -> None:
         kind, target = split_conversation(conversation)
@@ -911,10 +955,9 @@ class QQBridgeService(QObject):
             if callback is not None:
                 callback(False, "这个对象不在白名单里，先在“白名单”页添加。")
             return
-        path = Path(str(clip or "").strip()).expanduser()
-        if not voicepacks.is_audio_file(path):
+        if not tts_engine.clean_text(text, self.settings["tts_max_chars"]):
             if callback is not None:
-                callback(False, "语音文件不存在，或不是支持的音频格式。")
+                callback(False, "要合成的文字为空。")
             return
         client = self.client
         if client is None:
@@ -924,52 +967,38 @@ class QQBridgeService(QObject):
 
         def work() -> None:
             try:
+                path = self._synthesize_tts(text)
                 client.send(
                     target_conversation,
-                    [{"type": "record", "data": {"file": str(path.resolve())}}],
+                    [{"type": "record", "data": {"file": str(path)}}],
                 )
-                result = (True, f"已发送语音到 {target_conversation}。")
+                result = (True, f"已发送 TTS 语音到 {target_conversation}。")
             except Exception as exc:
-                result = (False, f"发送语音失败：{exc}")
+                self._log(f"TTS 语音发送失败：{exc}")
+                result = (False, f"TTS 语音发送失败：{exc}")
             if callback is not None:
                 ok, message = result
                 self._dispatch.emit(lambda: callback(ok, message))
 
-        threading.Thread(target=work, name="qq-bridge-voice-send", daemon=True).start()
+        threading.Thread(target=work, name="qq-bridge-tts-send", daemon=True).start()
 
-    def send_random_voice(
-        self,
-        conversation: str,
-        folder: str = "",
-        callback: Callable[[bool, str], None] | None = None,
-    ) -> None:
-        packs = [folder] if folder else [item["path"] for item in self.voice_pack_list()]
-        packs = [item for item in packs if item]
-        if not packs:
-            if callback is not None:
-                callback(False, "还没有可用的语音包，先在“语音”页导入。")
+    def _speak_reply(self, conversation: str, text: str) -> None:
+        client = self.client
+        if client is None:
             return
-        chosen = random.choice(packs)
-        clip = voicepacks.choose_clip(chosen)
-        if clip is None:
-            if callback is not None:
-                callback(False, "这个语音包里没有音频文件。")
-            return
-        self.send_voice(conversation, str(clip), callback)
 
-    def _pick_voice_clip(self, explicit: bool) -> str:
-        if not self.settings["voice_packs"]:
-            return ""
-        if not explicit:
-            if not self.settings["voice_reply_enabled"]:
-                return ""
-            if random.random() >= self.settings["voice_reply_probability"]:
-                return ""
-        packs = [item["path"] for item in self.voice_pack_list()]
-        if not packs:
-            return ""
-        clip = voicepacks.choose_clip(random.choice(packs))
-        return str(clip) if clip is not None else ""
+        def work() -> None:
+            try:
+                path = self._synthesize_tts(text)
+                client.send(
+                    conversation,
+                    [{"type": "record", "data": {"file": str(path)}}],
+                )
+                self._log("已随回复发送 TTS 语音。")
+            except Exception as exc:
+                self._log(f"回复附带 TTS 语音失败：{exc}")
+
+        threading.Thread(target=work, name="qq-bridge-tts-reply", daemon=True).start()
 
     def habit_rows(self, limit: int = 60) -> list[dict[str, Any]]:
         conversations = self.store.habits.get("conversations", {})
@@ -1106,10 +1135,10 @@ class QQBridgeService(QObject):
         system_prompt = analysis.build_system_prompt(
             self.store.persona(), memory, slang, habit
         )
-        if self.settings["voice_packs"]:
+        if self._tts_ready():
             system_prompt += (
                 "\n\n你还可以发 QQ 语音：如果这句话适合用语音说，"
-                "在回复末尾加 [voice]，系统会从语音包里随机挑一条一起发出去。"
+                "在回复末尾加 [voice]，系统会用 TTS 把你这句话读成语音一起发出去。"
                 "不想发语音就不要加这个标记，也不要向对方解释这个标记。"
             )
         recent = self.store.recent(conversation, 9)
@@ -1132,19 +1161,20 @@ class QQBridgeService(QObject):
             if not cleaned:
                 return
             cleaned, wants_voice = parse_voice_tag(cleaned)
-            voice_clip = self._pick_voice_clip(wants_voice)
+            should_speak = self._should_tts(wants_voice)
             faces, images = self._pick_extras(conversation, cleaned)
             cleaned, explicit = parse_face_tags(cleaned)
             if explicit:
                 faces = explicit
             cleaned = clean_incoming_text(cleaned, limit=1000)
-            if not cleaned and not images and not voice_clip:
+            should_speak = should_speak and bool(cleaned)
+            if not cleaned and not images and not should_speak:
                 return
             segments = build_segments(cleaned, faces, images)
             if segments:
                 self._send_segments(conversation, segments, cleaned or "[表情]")
-            if voice_clip:
-                self.send_voice(conversation, voice_clip)
+            if should_speak:
+                self._speak_reply(conversation, cleaned)
             custom_face = self._pick_custom_face()
             if custom_face:
                 self._send_custom_face(conversation, custom_face)
@@ -1608,7 +1638,7 @@ class QQBridgeService(QObject):
 
     def _command_voice(self, command: Command, conversation: str) -> None:
         target_conversation = conversation
-        folder = ""
+        body = command.rest.strip()
         if command.args:
             first = command.args[0]
             if ":" in first or first.isdigit():
@@ -1619,21 +1649,19 @@ class QQBridgeService(QObject):
                     )
                     return
                 target_conversation = f"{kind}:{target}"
-                if len(command.args) > 1:
-                    folder = " ".join(command.args[1:]).strip()
-            elif len(command.args) > 1:
-                folder = command.rest.strip()
-        if folder:
-            candidate = Path(folder).expanduser()
-            if not candidate.is_dir():
-                self._reply_local(conversation, f"没有找到语音包目录：{folder}")
-                return
-            folder = str(candidate)
+                parts = command.rest.split(None, 1)
+                body = parts[1].strip() if len(parts) > 1 else ""
+        if not body:
+            self._reply_local(
+                conversation,
+                "用法：/voice 要读的文字，或 /voice group:123456 要读的文字",
+            )
+            return
 
         def done(ok: bool, message: str) -> None:
             self._reply_local(conversation, message)
 
-        self.send_random_voice(target_conversation, folder, done)
+        self.send_tts(target_conversation, body, done)
 
     def _command_qzone(self, command: Command, conversation: str) -> None:
         action = (command.args[0].lower() if command.args else "")
