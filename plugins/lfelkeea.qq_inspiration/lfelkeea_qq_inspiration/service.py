@@ -210,12 +210,13 @@ def _run_batches(
     ask: str,
     batch_size: int,
     per_item_chars: int = 120,
+    detail: str = "",
 ) -> None:
     global _busy
     if _busy or not items:
         return
     _busy = True
-    _set_busy(window, True, "正在准备提炼…")
+    _set_busy(window, True, f"正在准备提炼…{(' · ' + detail) if detail else ''}")
 
     batches = [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
     state = {"index": 0, "added": 0, "skipped": 0}
@@ -293,8 +294,8 @@ def _extract_qq(window) -> None:
         )
         return
     limit = _int_setting("max_items_per_run", 120, 12, 500)
+    total = len(items)
     if len(items) > limit:
-        window.status_label.setText(f"共 {len(items)} 条 QQ 记忆，本次处理最近 {limit} 条")
         items = items[-limit:]
     batch_size = _int_setting("max_memories_per_batch", 12, 4, 12)
     _run_batches(
@@ -306,6 +307,7 @@ def _extract_qq(window) -> None:
         ask="请提炼插件灵感。",
         batch_size=batch_size,
         per_item_chars=120,
+        detail=f"QQ 记忆 {total} 条，本次 {len(items)} 条",
     )
 
 
@@ -327,8 +329,8 @@ def _extract_pet(window) -> None:
     if len(items) > limit:
         items = items[:limit]
     batch_size = _int_setting("max_pet_items_per_batch", 6, 3, 10)
-    window.status_label.setText(
-        f"桌宠对话来源：当前会话 {details.get('live', 0)}、抓取 {details.get('captured', 0)}、"
+    detail = (
+        f"当前会话 {details.get('live', 0)}、抓取 {details.get('captured', 0)}、"
         f"导入 {details.get('imported', 0)}、内核历史 {details.get('alive', 0)}"
     )
     _run_batches(
@@ -340,6 +342,7 @@ def _extract_pet(window) -> None:
         ask="请从这些对话里提炼插件灵感。",
         batch_size=batch_size,
         per_item_chars=480,
+        detail=detail,
     )
 
 
