@@ -24,6 +24,7 @@ class PluginDialog(QDialog):
     def __init__(self, manager: PluginManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.manager = manager
+        self.market_dialog = None
         self.setWindowTitle("LFELKEEA · 插件")
         self.setWindowFlags(
             Qt.WindowType.Dialog
@@ -69,6 +70,11 @@ class PluginDialog(QDialog):
         self.summary.setObjectName("muted")
         title_box.addWidget(title)
         title_box.addWidget(self.summary)
+        market_btn = QPushButton("插件市场")
+        market_btn.setObjectName("primary")
+        market_btn.setFixedHeight(26)
+        market_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        market_btn.clicked.connect(self._open_market)
         close_btn = QPushButton("×")
         close_btn.setObjectName("ghost")
         close_btn.setFixedSize(28, 28)
@@ -79,6 +85,7 @@ class PluginDialog(QDialog):
         )
         close_btn.clicked.connect(self.reject)
         header_layout.addLayout(title_box, 1)
+        header_layout.addWidget(market_btn)
         header_layout.addWidget(close_btn)
         layout.addWidget(header)
 
@@ -352,6 +359,24 @@ class PluginDialog(QDialog):
         self.update_all_btn.setEnabled(False)
         self.update_status.setText(f"正在更新 {len(plugin_ids)} 个插件…")
         self.manager.update_plugins(plugin_ids)
+
+    def _open_market(self) -> None:
+        if self.market_dialog is not None:
+            self.market_dialog.show()
+            self.market_dialog.raise_()
+            self.market_dialog.activateWindow()
+            return
+        from plugin_market import MarketplaceDialog  # 延迟导入，减少启动开销
+
+        dialog = MarketplaceDialog(self.manager, self)
+        dialog.finished.connect(self._market_closed)
+        self.market_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _market_closed(self, result: int) -> None:
+        self.market_dialog = None
 
     def _open_folder(self) -> None:
         self.manager.plugins_dir.mkdir(parents=True, exist_ok=True)

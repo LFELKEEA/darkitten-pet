@@ -58,6 +58,39 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(release.sha256, "a" * 64)
         self.assertNotIn("bad", releases)
 
+    def test_releases_parse_market_metadata(self) -> None:
+        data = {
+            "plugins": [
+                {
+                    "id": "lfelkeea.demo",
+                    "name": "Demo",
+                    "version": "2.0.0",
+                    "file": "plugins/demo-2.0.0.zip",
+                    "sha256": "B" * 64,
+                    "size": 123,
+                    "description": "演示插件",
+                    "author": "tester",
+                    "permissions": ["pet.say", "ai.chat"],
+                    "requires": [
+                        {"name": "SnowLuma", "version": "1.0", "note": "自行安装"},
+                        "bad",
+                    ],
+                    "featured": True,
+                    "bundled": False,
+                }
+            ]
+        }
+        release = plugin_updater.releases_from_registry(
+            data, "https://example.com/plugins.json"
+        )["lfelkeea.demo"]
+        self.assertEqual(release.author, "tester")
+        self.assertEqual(release.permissions, ["pet.say", "ai.chat"])
+        self.assertTrue(release.featured)
+        self.assertFalse(release.bundled)
+        self.assertEqual(len(release.requires), 1)
+        self.assertEqual(release.requires[0]["name"], "SnowLuma")
+        self.assertEqual(release.requires[0]["note"], "自行安装")
+
     def test_check_updates_with_local_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)

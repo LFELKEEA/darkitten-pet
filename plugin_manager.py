@@ -24,7 +24,9 @@ from plugin_updater import (
     PluginRelease,
     check_updates as check_plugin_releases,
     download_plugin,
+    fetch_registry,
     install_plugin,
+    releases_from_registry,
 )
 from screen_watcher import ScreenContext, capture_screen
 
@@ -316,7 +318,11 @@ class PluginManager(QObject):
     changed = Signal()
     updates_checked = Signal(object, str)
     plugin_updated = Signal(str, str)
+    marketplace_loaded = Signal(object, str)
+    plugin_installed = Signal(str, str)
+    plugin_install_progress = Signal(str, int, str)
     _downloaded = Signal(str, str, str)
+    _market_downloaded = Signal(str, str, str)
 
     def __init__(
         self,
@@ -342,12 +348,17 @@ class PluginManager(QObject):
         self._errors: dict[str, int] = {}
         self._ui_windows: dict[str, Any] = {}
         self._releases: dict[str, PluginRelease] = {}
+        self._marketplace: dict[str, PluginRelease] = {}
+        self._marketplace_loading = False
+        self._installing = ""
         self._checking_updates = False
         self._update_queue: list[str] = []
         self._updating = False
         self.updates_checked.connect(self._on_updates_checked)
         self._downloaded.connect(self._on_plugin_downloaded)
         self.plugin_updated.connect(self._on_plugin_update_finished)
+        self.marketplace_loaded.connect(self._on_marketplace_loaded)
+        self._market_downloaded.connect(self._on_market_downloaded)
 
     # ---------- 目录与发现 ----------
 
@@ -723,6 +734,118 @@ class PluginManager(QObject):
     def _on_plugin_update_finished(self, plugin_id: str, error: str) -> None:
         self._updating = False
         QTimer.singleShot(0, self._start_next_update)
+
+    # ---------- 插件市场 ----------
+
+    @property
+    def loading_marketplace(self) -> bool:
+        return self._marketplace_loading
+
+    @property
+    def installing_plugin(self) -> str:
+        return self._installing
+
+    def marketplace_releases(self) -> list[PluginRelease]:
+        return sorted(
+            self._marketplace.values(),
+            key=lambda item: (not item.featured, item.bundled, item.name.lower(), item.id),
+        )
+
+    def marketplace_release(self, plugin_id: str) -> PluginRelease | None:
+        return self._marketplace.get(plugin_id)
+
+    def load_marketplace(self) -> bool:
+        """在后台读取插件库清单，结果通过 marketplace_loaded 回到主线程。"""
+        if self._marketplace_loading:
+            return False
+        self._marketplace_loading = True
+        url = self.registry_url()
+
+        def worker() -> None:
+            try:
+                data = fetch_registry(url)
+                found = releases_from_registry(data, url)
+            except Exception as exc:
+                self.marketplace_loaded.emit({}, str(exc))
+                return
+            self.marketplace_loaded.emit(found, "")
+
+        threading.Thread(
+            target=worker, name="plugin-market-fetch", daemon=True
+        ).start()
+        return True
+
+    def _on_marketplace_loaded(self, releases: object, error: str) -> None:
+        self._marketplace_loading = False
+        if not error and isinstance(releases, dict):
+            self._marketplace = dict(releases)
+        elif error:
+            # 刷新失败时保留上一次的清单，避免市场突然变空。
+            self.log("system", f"读取插件市场失败：{error}")
+        self.changed.emit()
+
+    def install_from_market(self, plugin_id: str) -> bool:
+        if self._installing:
+            return False
+        release = self._marketplace.get(plugin_id)
+        if release is None:
+            self.plugin_installed.emit(plugin_id, "插件市场里没有这个插件")
+            return False
+        self._installing = plugin_id
+        dest = self.data_dir / "updates" / "plugins"
+
+        def worker() -> None:
+            try:
+                archive = download_plugin(
+                    release,
+                    dest,
+                    progress_cb=lambda percent, message: self.plugin_install_progress.emit(
+                        plugin_id, percent, message
+                    ),
+                )
+            except Exception as exc:
+                self._market_downloaded.emit(plugin_id, "", str(exc))
+                return
+            self._market_downloaded.emit(plugin_id, str(archive), "")
+
+        threading.Thread(
+            target=worker, name="plugin-market-download", daemon=True
+        ).start()
+        return True
+
+    def _on_market_downloaded(self, plugin_id: str, archive: str, error: str) -> None:
+        self._installing = ""
+        if error:
+            self.plugin_installed.emit(plugin_id, error)
+            return
+        release = self._marketplace.get(plugin_id)
+        if release is None:
+            self.plugin_installed.emit(plugin_id, "插件已从市场清单移除")
+            return
+        info = self._infos.get(plugin_id)
+        enabled = bool(info and info.enabled)
+        if plugin_id in self._loaded:
+            self.unload_plugin(plugin_id)
+        try:
+            install_plugin(
+                Path(archive),
+                self.plugins_dir,
+                plugin_id,
+                release.version,
+                backup_root=self.state_dir / "backups",
+            )
+        except Exception as exc:
+            self.log(plugin_id, f"市场安装失败：{exc}")
+            if enabled:
+                self.load_plugin(plugin_id)
+            self.plugin_installed.emit(plugin_id, str(exc))
+            return
+        self.discover()
+        if enabled:
+            self.load_plugin(plugin_id)
+        self.log(plugin_id, f"已从插件市场安装 {release.version}")
+        self.plugin_installed.emit(plugin_id, "")
+        self.changed.emit()
 
     # ---------- 插件界面 ----------
 

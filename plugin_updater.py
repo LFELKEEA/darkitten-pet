@@ -38,6 +38,11 @@ class PluginRelease:
     description: str = ""
     page_url: str = ""
     notes: list[str] = field(default_factory=list)
+    author: str = ""
+    permissions: list[str] = field(default_factory=list)
+    requires: list[dict[str, str]] = field(default_factory=list)
+    featured: bool = False
+    bundled: bool = False
 
     @property
     def size_text(self) -> str:
@@ -93,6 +98,23 @@ def releases_from_registry(
             size = int(item.get("size") or 0)
         except (TypeError, ValueError):
             size = 0
+        permissions = [
+            str(value).strip()
+            for value in item.get("permissions", []) or []
+            if str(value).strip()
+        ]
+        requires: list[dict[str, str]] = []
+        for entry in item.get("requires", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            requires.append(
+                {
+                    "name": str(entry.get("name", "")).strip(),
+                    "version": str(entry.get("version", "")).strip(),
+                    "url": str(entry.get("url", "")).strip(),
+                    "note": str(entry.get("note", "")).strip(),
+                }
+            )
         releases[plugin_id] = PluginRelease(
             id=plugin_id,
             name=str(item.get("name", plugin_id)).strip() or plugin_id,
@@ -102,6 +124,11 @@ def releases_from_registry(
             size=max(0, size),
             description=str(item.get("description", "")).strip(),
             page_url=urllib.parse.urljoin(str(base_url or REGISTRY_URL), str(item.get("page_url", "") or "")),
+            author=str(item.get("author", "")).strip(),
+            permissions=permissions,
+            requires=requires,
+            featured=bool(item.get("featured", False)),
+            bundled=bool(item.get("bundled", False)),
         )
     return releases
 
