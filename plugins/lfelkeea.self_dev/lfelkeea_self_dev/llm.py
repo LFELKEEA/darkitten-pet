@@ -43,7 +43,6 @@ class LLMConfig:
     api_key: str = ""
     timeout: int = 60
     temperature: float = 0.3
-    max_tokens: int = 4096
 
 
 def _clamp_int(value: Any, fallback: int, low: int, high: int) -> int:
@@ -58,7 +57,6 @@ def load_llm_config(
     config_path: Path | str,
     *,
     model_override: str = "",
-    max_tokens: int = 4096,
     temperature: float = 0.3,
 ) -> LLMConfig:
     data: dict[str, Any] = {}
@@ -82,7 +80,6 @@ def load_llm_config(
         api_key=str(ai.get("api_key") or "").strip(),
         timeout=_clamp_int(ai.get("timeout"), 90, 45, 180),
         temperature=float(temperature),
-        max_tokens=max(512, min(8192, int(max_tokens))),
     )
 
 
@@ -95,7 +92,6 @@ def describe_config(config: LLMConfig) -> dict[str, Any]:
         "endpoint": endpoint,
         "key_configured": bool(config.api_key),
         "needs_key": config.provider == "openai" and not config.api_key,
-        "max_tokens": config.max_tokens,
     }
 
 
@@ -165,10 +161,11 @@ def _message_text(message: dict[str, Any]) -> str:
 def chat(
     config: LLMConfig,
     messages: list[dict[str, Any]],
-    max_tokens: int | None = None,
 ) -> tuple[str, str]:
-    """返回 (文本, finish_reason)。失败抛 LLMError。"""
-    budget = max(256, min(8192, int(max_tokens or config.max_tokens)))
+    """返回 (文本, finish_reason)。失败抛 LLMError。
+
+    不发送 max_tokens：输出长度完全交给模型和接口自身的默认值/上限决定。
+    """
     temperature = float(config.temperature)
 
     if config.provider == "pollinations":
@@ -176,7 +173,6 @@ def chat(
             "model": config.model or "openai-fast",
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": budget,
             "private": True,
             "referrer": "lfelkeea-self-dev",
             "seed": random.randint(1, 999_999),
@@ -212,30 +208,15 @@ def chat(
         "model": config.model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": budget,
     }
     if config.provider == "openai" and "deepseek" in config.model.lower():
         # 思考模式会吃掉输出预算，代码任务里最容易表现成空回复。
         payload["reasoning_effort"] = "none"
 
     url = _endpoint(base_url)
-    data, used_payload = _post(url, payload, headers, config.timeout)
+    data, _used_payload = _post(url, payload, headers, config.timeout)
     message, finish_reason = _first_message(data)
     text = _message_text(message)
-
-    if not text and finish_reason == "length":
-        retry = dict(used_payload)
-        retry["max_tokens"] = min(8192, budget * 2)
-        try:
-            retry_data, _ = _post(url, retry, headers, config.timeout)
-            retry_message, retry_finish = _first_message(retry_data)
-        except LLMError:
-            pass
-        else:
-            retry_text = _message_text(retry_message)
-            if retry_text:
-                return retry_text, retry_finish
-            data, message, finish_reason = retry_data, retry_message, retry_finish
 
     if not text:
         raise _empty_error(data, message, finish_reason)
@@ -270,5 +251,5 @@ def _empty_error(data: dict[str, Any], message: dict[str, Any], finish_reason: s
     if isinstance(reasoning, str) and reasoning:
         details.append(f"reasoning_content={len(reasoning)} 字")
     suffix = f"（{'，'.join(details)}）" if details else ""
-    hint = "。模型可能被输出上限截断，试试把任务拆小，或在设置里调低最大输出 tokens" if finish_reason == "length" else ""
+    hint = "。接口在自身输出上限处返回了空内容，可以重试，或把这一步拆成更小的动作" if finish_reason == "length" else ""
     return LLMError(f"接口返回了空回复{suffix}{hint}")

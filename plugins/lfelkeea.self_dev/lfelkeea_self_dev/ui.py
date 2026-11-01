@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QTimer, Qt, QUrl
@@ -27,7 +28,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QSplitter,
     QTextBrowser,
     QVBoxLayout,
@@ -139,7 +139,6 @@ class DevStudioDialog(QDialog):
         self.service = service
         self._files: list[str] = []
         self._last_step = 0
-        self._max_steps = 0
         self._started_at = 0.0
         self.setWindowTitle("LFELKEEA · 自开发工坊")
         self.setWindowFlags(
@@ -285,6 +284,14 @@ class DevStudioDialog(QDialog):
         self.files_list.setMinimumHeight(90)
         side_layout.addWidget(self.files_list, 1)
 
+        side_layout.addWidget(self._section("维护"))
+        self.restore_btn = QPushButton("一键还原到初始状态…")
+        self.restore_btn.clicked.connect(self._restore_all)
+        side_layout.addWidget(self.restore_btn)
+        self.export_btn = QPushButton("导出插件…")
+        self.export_btn.clicked.connect(self._export_plugin)
+        side_layout.addWidget(self.export_btn)
+
         side_layout.addWidget(self._section("会话日志"))
         self.session_label = QLabel("")
         self.session_label.setWordWrap(True)
@@ -360,6 +367,102 @@ class DevStudioDialog(QDialog):
         dialog.exec()
         self._refresh_header()
 
+    def _restore_all(self) -> None:
+        if self.service.running:
+            QMessageBox.information(self, "还在运行", "等这一轮结束再还原，避免改到一半。")
+            return
+        summary = self.service.change_summary()
+        if summary.get("error"):
+            QMessageBox.warning(self, "读不到改动记录", str(summary["error"]))
+            return
+        if not summary.get("count"):
+            QMessageBox.information(
+                self,
+                "没有可还原的改动",
+                "代理还没有在工作区、草稿或插件目录里改过东西。",
+            )
+            return
+        listing = "\n".join(
+            [f"文件：{item}" for item in summary["files"]]
+            + [f"插件：{item}" for item in summary["plugins"]]
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("一键还原")
+        box.setText(
+            f"将还原 {len(summary['files'])} 个文件、{len(summary['plugins'])} 个插件。"
+        )
+        box.setInformativeText(
+            "被改过的内容会回到代理第一次修改之前的状态；由代理新建的文件和插件会被移除。\n"
+            "还原前会把当前状态备份到 .backups/restore/，所以还原本身还能再找回来。"
+        )
+        if listing:
+            box.setDetailedText(listing)
+        yes = box.addButton("还原", QMessageBox.ButtonRole.DestructiveRole)
+        no = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        result = self.service.restore_all()
+        if result.get("error"):
+            QMessageBox.warning(self, "还原失败", str(result["error"]))
+            return
+        removed = len(result.get("removed_files", [])) + len(result.get("removed_plugins", []))
+        restored = len(result.get("restored_files", [])) + len(result.get("restored_plugins", []))
+        errors = result.get("errors") or []
+        message = (
+            f"已还原 {restored} 项，移除新增的 {removed} 项。\n"
+            f"还原前的状态备份在：\n{result.get('backup_dir', '')}"
+        )
+        if result.get("skipped_plugins"):
+            message += "\n跳过（自开发工坊自身）：" + "、".join(result["skipped_plugins"])
+        if errors:
+            message += f"\n\n有 {len(errors)} 个问题，详情已写进执行日志。"
+            QMessageBox.warning(self, "还原完成，但有提示", message)
+        else:
+            QMessageBox.information(self, "已还原", message)
+        self._files.clear()
+        self.files_list.clear()
+        self._refresh_header()
+
+    def _export_plugin(self) -> None:
+        if self.service.running:
+            QMessageBox.information(self, "还在运行", "等这一轮结束再导出，避免拿到写了一半的文件。")
+            return
+        plugins = self.service.installed_plugins()
+        if not plugins:
+            QMessageBox.information(self, "没有插件", "data/plugins 下还没有可导出的插件。")
+            return
+        labels = [
+            f"{item['name']} · {item['id']} v{item['version']}" for item in plugins
+        ]
+        label, ok = QInputDialog.getItem(
+            self, "导出插件", "选择要导出的插件：", labels, 0, False
+        )
+        if not ok or label not in labels:
+            return
+        chosen = plugins[labels.index(label)]
+        default = str(
+            Path.home() / f"{chosen['id']}-{chosen['version']}.zip"
+        )
+        path, ok = QFileDialog.getSaveFileName(
+            self, "导出为 ZIP", default, "ZIP 压缩包 (*.zip)"
+        )
+        if not ok or not path.strip():
+            return
+        result = self.service.export_plugin(chosen["id"], path)
+        if result.get("error"):
+            QMessageBox.warning(self, "导出失败", str(result["error"]))
+            return
+        QMessageBox.information(
+            self,
+            "已导出",
+            f"{result['name']} v{result['version']}\n"
+            f"{result['files']} 个文件，ZIP 大小 {result['zip_bytes']} B\n\n"
+            f"{result['path']}",
+        )
+
     def _open_workspace(self) -> None:
         self._open_path(self.service.paths.workspace)
 
@@ -386,9 +489,7 @@ class DevStudioDialog(QDialog):
             self.ai_label.setText(info["error"][:60])
             self.ai_label.setObjectName("bad")
         else:
-            self.ai_label.setText(
-                f"{info['provider']} / {info['model']} · 上限 {info.get('max_tokens', 0)} tokens"
-            )
+            self.ai_label.setText(f"{info['provider']} / {info['model']} · 不限步数")
             self.ai_label.setObjectName("muted")
         self.ai_label.style().unpolish(self.ai_label)
         self.ai_label.style().polish(self.ai_label)
@@ -405,19 +506,21 @@ class DevStudioDialog(QDialog):
         running = self.service.running
         self.start_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
+        if hasattr(self, "restore_btn"):
+            self.restore_btn.setEnabled(not running)
+            self.export_btn.setEnabled(not running)
         if not running:
             self.start_btn.setText("开始")
             self.status_label.setText("就绪")
             self.footer_label.setText(
-                f"最多 {self.service.settings['max_steps']} 步 · 模型输出上限 "
-                f"{self.service.settings['max_tokens']} tokens · 工作区 {self.service.paths.workspace}"
+                f"不限步数 · 输出长度由模型决定 · 工作区 {self.service.paths.workspace}"
             )
 
     def _tick(self) -> None:
         if not self.service.running:
             return
         elapsed = int(time.time() - self._started_at) if self._started_at else 0
-        step = f"第 {self._last_step}/{self._max_steps} 步 · " if self._last_step else ""
+        step = f"第 {self._last_step} 步 · " if self._last_step else ""
         self.status_label.setText(f"{step}{elapsed // 60:02d}:{elapsed % 60:02d}")
 
     # ------------------------------------------------------------ 事件渲染
@@ -437,7 +540,6 @@ class DevStudioDialog(QDialog):
         escape = html.escape
 
         if kind == "start":
-            self._max_steps = int(event.get("max_steps", 0) or 0)
             self._started_at = time.time()
             self._append(
                 f'<div style="color:{ACCENT_LIGHT};font-weight:700;margin-top:6px;">'
@@ -451,10 +553,9 @@ class DevStudioDialog(QDialog):
 
         if kind == "step":
             self._last_step = int(event.get("step", 0) or 0)
-            self._max_steps = int(event.get("max", self._max_steps) or self._max_steps)
             self._append(
                 f'<div style="color:{BORDER};margin:8px 0 2px 0;">'
-                f'<span style="color:{MUTED};font-size:11px;">— 第 {self._last_step} / {self._max_steps} 步 —</span></div>'
+                f'<span style="color:{MUTED};font-size:11px;">— 第 {self._last_step} 步 —</span></div>'
             )
             return
 
@@ -528,6 +629,8 @@ class DevStudioDialog(QDialog):
             self.status_label.setText("完成" if ok else "未完成")
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self.restore_btn.setEnabled(True)
+            self.export_btn.setEnabled(True)
             self.footer_label.setText(
                 f"本次 {int(event.get('steps', 0) or 0)} 步 · {elapsed}s · 改动 {len(self._files)} 个文件"
             )
@@ -601,7 +704,7 @@ class SettingsDialog(QDialog):
         title.setObjectName("title")
         layout.addWidget(title)
         note = QLabel(
-            "自开发工坊直接使用桌宠「AI 与桌宠设置」里的接口和密钥；这里只覆盖模型名、输出上限和工具行为。"
+            "自开发工坊直接使用桌宠「AI 与桌宠设置」里的接口和密钥；这里只覆盖模型名、温度和工具行为。"
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -626,15 +729,6 @@ class SettingsDialog(QDialog):
         ):
             self.shell_combo.addItem(label, value)
         form.addWidget(self._row("命令解释器", self.shell_combo))
-
-        self.steps_spin = QSpinBox()
-        self.steps_spin.setRange(4, 60)
-        form.addWidget(self._row("最多步数", self.steps_spin))
-
-        self.tokens_spin = QSpinBox()
-        self.tokens_spin.setRange(512, 8192)
-        self.tokens_spin.setSingleStep(512)
-        form.addWidget(self._row("单次输出上限", self.tokens_spin))
 
         self.temp_spin = QDoubleSpinBox()
         self.temp_spin.setRange(0.0, 1.5)
@@ -716,8 +810,6 @@ class SettingsDialog(QDialog):
         self.approval_combo.setCurrentIndex(max(0, index))
         index = self.shell_combo.findData(settings["shell_mode"])
         self.shell_combo.setCurrentIndex(max(0, index))
-        self.steps_spin.setValue(int(settings["max_steps"]))
-        self.tokens_spin.setValue(int(settings["max_tokens"]))
         self.temp_spin.setValue(float(settings["temperature"]))
         self.model_edit.setText(settings["model_override"])
         self.workspace_edit.setText(settings["workspace_dir"])
@@ -744,8 +836,6 @@ class SettingsDialog(QDialog):
         values = {
             "approval_mode": self.approval_combo.currentData(),
             "shell_mode": self.shell_combo.currentData(),
-            "max_steps": int(self.steps_spin.value()),
-            "max_tokens": int(self.tokens_spin.value()),
             "temperature": float(self.temp_spin.value()),
             "model_override": self.model_edit.text().strip(),
             "workspace_dir": self.workspace_edit.text().strip(),

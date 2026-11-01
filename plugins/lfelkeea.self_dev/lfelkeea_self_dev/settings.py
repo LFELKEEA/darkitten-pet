@@ -7,8 +7,6 @@ from typing import Any
 DEFAULTS: dict[str, Any] = {
     "approval_mode": "confirm_danger",
     "shell_mode": "auto",
-    "max_steps": 24,
-    "max_tokens": 4096,
     "temperature": 0.3,
     "allow_network": True,
     "allow_private_network": False,
@@ -21,14 +19,6 @@ DEFAULTS: dict[str, Any] = {
 
 APPROVAL_MODES = ("auto", "confirm_danger", "confirm_all")
 SHELL_MODES = ("auto", "bash", "cmd", "powershell", "sh", "off")
-
-
-def _as_int(value: Any, fallback: int, low: int, high: int) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return fallback
-    return max(low, min(high, number))
 
 
 def _as_float(value: Any, fallback: float, low: float, high: float) -> float:
@@ -68,8 +58,6 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "approval_mode": approval,
         "shell_mode": shell,
-        "max_steps": _as_int(data.get("max_steps"), 24, 4, 60),
-        "max_tokens": _as_int(data.get("max_tokens"), 4096, 512, 8192),
         "temperature": _as_float(data.get("temperature"), 0.3, 0.0, 1.5),
         "allow_network": _as_bool(data.get("allow_network"), True),
         "allow_private_network": _as_bool(data.get("allow_private_network"), False),

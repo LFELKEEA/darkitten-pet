@@ -47,14 +47,12 @@ class Agent:
     def __init__(
         self,
         *,
-        chat_fn: Callable[[list[dict[str, Any]], int], tuple[str, str]],
+        chat_fn: Callable[[list[dict[str, Any]]], tuple[str, str]],
         toolbox: ToolBox,
         system_prompt: str,
         user_prompt: str,
         emit: Callable[[dict[str, Any]], None],
         stop_event: threading.Event,
-        max_steps: int = 24,
-        max_tokens: int = 4096,
     ) -> None:
         self.chat_fn = chat_fn
         self.toolbox = toolbox
@@ -62,8 +60,6 @@ class Agent:
         self.user_prompt = user_prompt
         self.emit = emit
         self.stop_event = stop_event
-        self.max_steps = max(1, int(max_steps))
-        self.max_tokens = max(256, int(max_tokens))
 
     def run(self) -> dict[str, Any]:
         messages: list[dict[str, Any]] = [
@@ -74,11 +70,12 @@ class Agent:
         parse_failures = 0
         self._emit({"type": "info", "text": "已连接模型，开始工作。"})
 
-        for step in range(1, self.max_steps + 1):
+        # 不设步数上限：一直做到模型主动 final，或主人点停止。
+        while True:
             if self.stop_event.is_set():
                 return self._result(False, "已被主人停止。", steps, "stopped")
-            steps = step
-            self._emit({"type": "step", "step": step, "max": self.max_steps})
+            steps += 1
+            self._emit({"type": "step", "step": steps})
 
             try:
                 reply, finish = self._chat(messages)
@@ -99,7 +96,7 @@ class Agent:
                 self._emit(
                     {
                         "type": "info",
-                        "text": "模型输出被长度上限截断了；如果这一步失败，请把任务拆小或提高输出上限。",
+                        "text": "模型输出达到了接口自身的长度上限；请继续下一步，或把这一步拆成更小的动作。",
                     }
                 )
 
@@ -176,18 +173,10 @@ class Agent:
             )
             messages = self._trim(messages)
 
-        summary = self._summarize_after_limit(messages)
-        return self._result(
-            False,
-            f"达到最大步数 {self.max_steps}，任务还没收尾。\n{summary}".strip(),
-            steps,
-            "limit",
-        )
-
     # ------------------------------------------------------------------
 
     def _chat(self, messages: list[dict[str, Any]]) -> tuple[str, str]:
-        return self.chat_fn(messages, self.max_tokens)
+        return self.chat_fn(messages)
 
     def _emit(self, event: dict[str, Any]) -> None:
         try:
@@ -202,17 +191,6 @@ class Agent:
             "steps": steps,
             "reason": reason,
         }
-
-    def _summarize_after_limit(self, messages: list[dict[str, Any]]) -> str:
-        prompt = (
-            "不要再调用工具。请用中文简要总结：已经完成了什么、当前文件是什么状态、"
-            "还差什么没做。不要编造没有发生的结果。"
-        )
-        try:
-            reply, _ = self.chat_fn(messages + [{"role": "user", "content": prompt}], 800)
-            return reply.strip()[:2000]
-        except Exception as exc:
-            return f"（额外总结也失败了：{exc}）"
 
     def _trim(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         def total(items: list[dict[str, Any]]) -> int:

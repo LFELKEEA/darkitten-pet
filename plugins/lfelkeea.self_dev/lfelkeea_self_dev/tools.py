@@ -23,6 +23,8 @@ from html import unescape
 from pathlib import Path
 from typing import Any, Callable
 
+from .history import ChangeJournal, JournalError
+
 SELF_PLUGIN_ID = "lfelkeea.self_dev"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,63}$")
 
@@ -153,6 +155,7 @@ class ToolBox:
         enable_plugin: Callable[[str, bool], tuple[bool, str]] | None = None,
         stop_event: threading.Event | None = None,
         logger: Callable[[str], None] | None = None,
+        journal: ChangeJournal | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.dev_dir = Path(dev_dir).resolve()
@@ -167,6 +170,9 @@ class ToolBox:
         self.enable_plugin = enable_plugin
         self.stop_event = stop_event or threading.Event()
         self.log = logger or (lambda _message: None)
+        self.journal = journal or ChangeJournal(
+            self.dev_dir, self.plugins_dir, self.workspace, logger=self.log
+        )
         self.changed_files: list[str] = []
 
     # ------------------------------------------------------------------ 入口
@@ -245,6 +251,14 @@ class ToolBox:
 
     def _stamp(self) -> str:
         return datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+
+    def _record_file(self, path: Path) -> None:
+        """写入前记下原始版本；记录失败就中止，保证一键还原不会漏。"""
+        root = "drafts" if path == self.drafts or self.drafts in path.parents else "workspace"
+        try:
+            self.journal.record_file(root, path)
+        except JournalError as exc:
+            raise ToolError(f"没能记录还原基线，已中止这次写入：{exc}") from exc
 
     def _backup_file(self, path: Path) -> str:
         if not path.exists() or not path.is_file():
@@ -368,6 +382,7 @@ class ToolBox:
             "覆盖前会自动备份旧版本。",
         ):
             return f"主人拒绝了写入 {self._rel(target)}。"
+        self._record_file(target)
         backup = self._backup_file(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".tmp-selfdev")
@@ -407,6 +422,7 @@ class ToolBox:
             f"旧内容长度 {len(old_string)}，新内容长度 {len(new_string)}；覆盖前自动备份。",
         ):
             return f"主人拒绝了修改 {self._rel(target)}。"
+        self._record_file(target)
         backup = self._backup_file(target)
         updated = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
         target.write_bytes(updated.encode("utf-8"))
@@ -793,6 +809,11 @@ class ToolBox:
         ):
             return f"主人拒绝了写入插件 {pid}。"
 
+        if pid != SELF_PLUGIN_ID:
+            try:
+                self.journal.record_plugin(pid, target)
+            except JournalError as exc:
+                raise ToolError(f"没能记录插件还原基线，已中止这次安装：{exc}") from exc
         backup = self._backup_plugin_folder(target, pid) if existing else ""
         target.mkdir(parents=True, exist_ok=True)
         written: list[str] = []

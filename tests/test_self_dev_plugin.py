@@ -6,8 +6,10 @@ import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,8 +17,10 @@ ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugins" / "lfelkeea.self_dev"
 sys.path.insert(0, str(PLUGIN))
 
+from lfelkeea_self_dev import llm as llm_module  # noqa: E402
 from lfelkeea_self_dev.agent import Agent, extract_action  # noqa: E402
-from lfelkeea_self_dev.llm import describe_config, load_llm_config  # noqa: E402
+from lfelkeea_self_dev.exporter import ExportError, export_plugin, list_plugins  # noqa: E402
+from lfelkeea_self_dev.llm import LLMConfig, describe_config, load_llm_config  # noqa: E402
 from lfelkeea_self_dev.paths import DevPaths  # noqa: E402
 from lfelkeea_self_dev.session import SessionLog  # noqa: E402
 from lfelkeea_self_dev.settings import normalize_settings  # noqa: E402
@@ -231,6 +235,107 @@ class PluginForgeTests(unittest.TestCase):
         self.assertIn("未识别的权限", result)
 
 
+class RestoreTests(unittest.TestCase):
+    def test_restore_files_and_plugins(self):
+        box, root = make_box()
+        workspace = root / "workspace"
+        plugins = root / "data" / "plugins"
+
+        (workspace / "keep.txt").write_text("original\n", encoding="utf-8")
+        self.assertIn(
+            "已写入",
+            box.run("write_file", {"path": "keep.txt", "content": "changed\n"}),
+        )
+        self.assertIn(
+            "已写入",
+            box.run("write_file", {"path": "brand/new.txt", "content": "new\n"}),
+        )
+        self.assertIn(
+            "已修改",
+            box.run(
+                "edit_file",
+                {"path": "keep.txt", "old_string": "changed", "new_string": "changed again"},
+            ),
+        )
+
+        old = plugins / "demo.old"
+        old.mkdir(parents=True)
+        (old / "plugin.json").write_text(manifest("demo.old"), encoding="utf-8")
+        (old / "main.py").write_text("value = 1\n", encoding="utf-8")
+        self.assertIn(
+            "已更新插件",
+            box.run(
+                "create_plugin",
+                {"plugin_id": "demo.old", "files": {"main.py": "value = 2\n"}, "enable": False},
+            ),
+        )
+        self.assertIn(
+            "已创建插件",
+            box.run(
+                "create_plugin",
+                {
+                    "plugin_id": "demo.new",
+                    "files": {"plugin.json": manifest("demo.new"), "main.py": "x = 1\n"},
+                    "enable": False,
+                },
+            ),
+        )
+
+        self.assertEqual(box.journal.summary()["count"], 4)
+        restored = box.journal.restore_all(root / "dev" / ".backups" / "restore")
+
+        self.assertEqual(restored["errors"], [])
+        self.assertEqual((workspace / "keep.txt").read_text(encoding="utf-8"), "original\n")
+        self.assertFalse((workspace / "brand" / "new.txt").exists())
+        self.assertFalse((workspace / "brand").exists())
+        self.assertEqual((old / "main.py").read_text(encoding="utf-8"), "value = 1\n")
+        self.assertFalse((plugins / "demo.new").exists())
+        backup_dir = Path(restored["backup_dir"])
+        self.assertTrue((backup_dir / "files" / "workspace" / "keep.txt").is_file())
+        self.assertTrue((backup_dir / "plugins" / "demo.new").is_dir())
+        self.assertEqual(box.journal.summary()["count"], 0)
+
+
+class ExportTests(unittest.TestCase):
+    def _make_plugin(self, box):
+        files = {
+            "plugin.json": manifest(),
+            "main.py": "def setup(api):\n    api.say('hi')\n",
+        }
+        return box.run(
+            "create_plugin", {"plugin_id": "demo.hello", "files": files, "enable": False}
+        )
+
+    def test_export_zip_excludes_cache(self):
+        box, root = make_box()
+        self._make_plugin(box)
+        plugin = root / "data" / "plugins" / "demo.hello"
+        (plugin / "__pycache__").mkdir()
+        (plugin / "__pycache__" / "x.pyc").write_bytes(b"x")
+        (plugin / ".state").mkdir()
+        (plugin / ".state" / "data.json").write_text("{}", encoding="utf-8")
+
+        result = export_plugin(root / "data" / "plugins", "demo.hello", root / "out" / "demo")
+        self.assertEqual(result["files"], 2)
+        self.assertEqual(Path(result["path"]).name, "demo.zip")
+        with zipfile.ZipFile(result["path"]) as archive:
+            names = archive.namelist()
+        self.assertIn("demo.hello/plugin.json", names)
+        self.assertIn("demo.hello/main.py", names)
+        self.assertFalse(any("__pycache__" in name or ".state" in name for name in names))
+
+    def test_list_plugins_and_reject_bad_target(self):
+        box, root = make_box()
+        self._make_plugin(box)
+        items = list_plugins(root / "data" / "plugins")
+        self.assertEqual([item["id"] for item in items], ["demo.hello"])
+        self.assertEqual(items[0]["version"], "1.0.0")
+        with self.assertRaises(ExportError):
+            export_plugin(root / "data" / "plugins", "../escape", root / "x.zip")
+        with self.assertRaises(ExportError):
+            export_plugin(root / "data" / "plugins", "missing.plugin", root / "x.zip")
+
+
 class ProtocolTests(unittest.TestCase):
     def test_extract_plain_json(self):
         action = extract_action('{"tool": "read_file", "args": {"path": "a.py"}}')
@@ -261,8 +366,8 @@ class AgentLoopTests(unittest.TestCase):
         ]
         calls = []
 
-        def chat_fn(messages, max_tokens):
-            calls.append(max_tokens)
+        def chat_fn(messages):
+            calls.append(messages)
             return json.dumps(script[len(calls) - 1], ensure_ascii=False), "stop"
 
         events = []
@@ -273,7 +378,6 @@ class AgentLoopTests(unittest.TestCase):
             user_prompt="u",
             emit=events.append,
             stop_event=threading.Event(),
-            max_steps=6,
         )
         result = agent.run()
         self.assertTrue(result["ok"])
@@ -288,7 +392,7 @@ class AgentLoopTests(unittest.TestCase):
         box, _root = make_box()
         replies = iter(["这不是 JSON", '{"final": "这次好了"}'])
 
-        def chat_fn(messages, max_tokens):
+        def chat_fn(messages):
             return next(replies), "stop"
 
         events = []
@@ -299,7 +403,6 @@ class AgentLoopTests(unittest.TestCase):
             user_prompt="u",
             emit=events.append,
             stop_event=threading.Event(),
-            max_steps=4,
         )
         result = agent.run()
         self.assertTrue(result["ok"])
@@ -310,7 +413,7 @@ class AgentLoopTests(unittest.TestCase):
         stop = threading.Event()
         stop.set()
 
-        def chat_fn(messages, max_tokens):
+        def chat_fn(messages):
             raise AssertionError("不应该调用模型")
 
         result = Agent(
@@ -320,10 +423,33 @@ class AgentLoopTests(unittest.TestCase):
             user_prompt="u",
             emit=lambda _event: None,
             stop_event=stop,
-            max_steps=4,
         ).run()
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "stopped")
+
+    def test_agent_has_no_step_cap(self):
+        box, _root = make_box()
+        total = 30
+        calls = {"count": 0}
+
+        def chat_fn(messages):
+            index = calls["count"]
+            calls["count"] += 1
+            if index < total:
+                return json.dumps({"tool": "list_dir", "args": {}}), "stop"
+            return json.dumps({"final": "做完了"}), "stop"
+
+        result = Agent(
+            chat_fn=chat_fn,
+            toolbox=box,
+            system_prompt="s",
+            user_prompt="u",
+            emit=lambda _event: None,
+            stop_event=threading.Event(),
+        ).run()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["steps"], total + 1)
+        self.assertEqual(result["summary"], "做完了")
 
 
 class ConfigTests(unittest.TestCase):
@@ -344,14 +470,38 @@ class ConfigTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        loaded = load_llm_config(config, max_tokens=2048, temperature=0.2)
+        loaded = load_llm_config(config, temperature=0.2)
         self.assertEqual(loaded.provider, "openai")
         self.assertEqual(loaded.model, "gpt-4o")
-        self.assertEqual(loaded.max_tokens, 2048)
+        self.assertFalse(hasattr(loaded, "max_tokens"))
         self.assertEqual(loaded.api_key, "super-secret-key")
         description = json.dumps(describe_config(loaded), ensure_ascii=False)
         self.assertNotIn("super-secret-key", description)
+        self.assertNotIn("max_tokens", description)
         self.assertIn('"key_configured": true', description)
+
+    def test_chat_payload_omits_max_tokens(self):
+        config = LLMConfig(
+            provider="openai",
+            model="gpt-4o",
+            base_url="https://api.example.com/v1",
+            api_key="k",
+        )
+        captured = {}
+
+        def fake_http(url, payload, headers, timeout):
+            captured.update(payload)
+            return {
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"}
+                ]
+            }
+
+        with mock.patch.object(llm_module, "_http_json", side_effect=fake_http):
+            text, finish = llm_module.chat(config, [{"role": "user", "content": "hi"}])
+        self.assertEqual(text, "ok")
+        self.assertEqual(finish, "stop")
+        self.assertNotIn("max_tokens", captured)
 
     def test_missing_config_falls_back_to_pollinations(self):
         loaded = load_llm_config(Path(tempfile.mkdtemp()) / "missing.json")
@@ -370,8 +520,8 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(settings["approval_mode"], "confirm_danger")
         self.assertEqual(settings["shell_mode"], "auto")
-        self.assertEqual(settings["max_steps"], 60)
-        self.assertEqual(settings["max_tokens"], 512)
+        self.assertNotIn("max_steps", settings)
+        self.assertNotIn("max_tokens", settings)
         self.assertEqual(settings["temperature"], 1.5)
 
 
@@ -444,7 +594,6 @@ class UiSmokeTests(unittest.TestCase):
                     "endpoint": "http://127.0.0.1:11434/v1",
                     "needs_key": False,
                     "error": "",
-                    "max_tokens": 4096,
                     "session": "",
                 }
 

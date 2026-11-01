@@ -17,6 +17,8 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal
 
 from .agent import Agent
+from .exporter import ExportError, export_plugin, list_plugins
+from .history import ChangeJournal
 from .llm import LLMError, chat, describe_config, load_llm_config
 from .paths import DevPaths
 from .prompts import build_system_prompt, build_user_prompt
@@ -110,7 +112,6 @@ class DevService(QObject):
             config = load_llm_config(
                 self.paths.config_path,
                 model_override=self.settings["model_override"],
-                max_tokens=self.settings["max_tokens"],
                 temperature=self.settings["temperature"],
             )
             info.update(describe_config(config))
@@ -181,7 +182,6 @@ class DevService(QObject):
             config = load_llm_config(
                 paths.config_path,
                 model_override=settings["model_override"],
-                max_tokens=settings["max_tokens"],
                 temperature=settings["temperature"],
             )
             info = describe_config(config)
@@ -195,7 +195,6 @@ class DevService(QObject):
                     "workspace": str(paths.workspace),
                     "plugin_folder": str(paths.plugin_folder),
                     "session": str(session.path),
-                    "max_steps": settings["max_steps"],
                 }
             )
             if info["needs_key"]:
@@ -225,10 +224,10 @@ class DevService(QObject):
             )
             user_prompt = build_user_prompt(task, tree)
 
-            def chat_fn(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str, str]:
+            def chat_fn(messages: list[dict[str, Any]]) -> tuple[str, str]:
                 if stop.is_set():
                     raise LLMError("已停止")
-                return chat(config, messages, max_tokens)
+                return chat(config, messages)
 
             agent = Agent(
                 chat_fn=chat_fn,
@@ -237,8 +236,6 @@ class DevService(QObject):
                 user_prompt=user_prompt,
                 emit=self._emit,
                 stop_event=stop,
-                max_steps=settings["max_steps"],
-                max_tokens=settings["max_tokens"],
             )
             result = agent.run()
         except LLMError as exc:
@@ -415,6 +412,89 @@ class DevService(QObject):
             return True, "未启用"
         except Exception as exc:
             return False, f"操作插件管理器失败：{exc}"
+
+    # ------------------------------------------------------------ 还原与导出
+
+    def _journal(self) -> ChangeJournal:
+        return ChangeJournal(
+            self.paths.dev_dir,
+            self.paths.plugins_dir,
+            self.paths.workspace,
+            logger=self._log,
+        )
+
+    def change_summary(self) -> dict[str, Any]:
+        try:
+            return self._journal().summary()
+        except Exception as exc:
+            self._log(f"读取改动账本失败：{exc}")
+            return {"files": [], "plugins": [], "count": 0, "updated_at": "", "error": str(exc)}
+
+    def restore_all(self) -> dict[str, Any]:
+        if self._running:
+            return {"error": "任务还在运行，先等它结束或点停止。"}
+        self._emit({"type": "info", "text": "开始一键还原：先把当前状态备份到 .backups/restore…"})
+        try:
+            result = self._journal().restore_all(
+                self.paths.backups / "restore",
+                skip_plugins={"lfelkeea.self_dev"},
+            )
+        except Exception as exc:
+            self._log(f"一键还原异常：{exc}")
+            self._emit({"type": "info", "text": f"一键还原失败：{exc}"})
+            return {"error": str(exc)}
+        changed = (
+            len(result.get("restored_files", []))
+            + len(result.get("removed_files", []))
+            + len(result.get("restored_plugins", []))
+            + len(result.get("removed_plugins", []))
+        )
+        errors = result.get("errors") or []
+        lines = [
+            f"还原文件 {len(result.get('restored_files', []))} 个、移除新增文件 "
+            f"{len(result.get('removed_files', []))} 个、还原插件 "
+            f"{len(result.get('restored_plugins', []))} 个、移除新增插件 "
+            f"{len(result.get('removed_plugins', []))} 个。",
+            f"还原前的状态已备份到：{result.get('backup_dir', '')}",
+        ]
+        if result.get("skipped_plugins"):
+            lines.append("跳过（不还原自身）：" + "、".join(result["skipped_plugins"]))
+        if errors:
+            lines.append(f"有 {len(errors)} 个问题：" + "；".join(errors[:5]))
+        for line in lines:
+            self._emit({"type": "info", "text": line})
+        try:
+            storage = self.api.storage
+            storage["last_restore"] = str(result.get("stamp", ""))
+            storage["last_restore_count"] = changed
+            self.api.save_storage()
+        except Exception:
+            pass
+        return result
+
+    def installed_plugins(self) -> list[dict[str, Any]]:
+        try:
+            return list_plugins(self.paths.plugins_dir)
+        except Exception as exc:
+            self._log(f"读取插件列表失败：{exc}")
+            return []
+
+    def export_plugin(self, plugin_id: str, destination: str) -> dict[str, Any]:
+        try:
+            result = export_plugin(self.paths.plugins_dir, plugin_id, destination)
+        except ExportError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:
+            self._log(f"导出插件异常：{exc}")
+            return {"error": str(exc)}
+        self._emit(
+            {
+                "type": "info",
+                "text": f"已导出 {result['name']} v{result['version']}："
+                f"{result['files']} 个文件，{result['zip_bytes']} B → {result['path']}",
+            }
+        )
+        return result
 
     def _handle_finished(self, result: dict[str, Any]) -> None:
         try:
