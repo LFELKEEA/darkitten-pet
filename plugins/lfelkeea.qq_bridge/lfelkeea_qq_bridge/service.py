@@ -17,6 +17,7 @@ from . import analysis, tts as tts_engine, vision
 from .commands import Command, help_text, parse_command
 from .onebot import EventServer, OneBotClient, OneBotError, split_conversation
 from .snowluma import SnowLumaManager
+from .sovits import SovitsManager, detect_sovits_dir, ref_voice_files
 from .store import JsonStore
 from .text import (
     build_segments,
@@ -209,6 +210,8 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
             data.get("tts_gpt_sovits_url", "http://127.0.0.1:9880")
             or "http://127.0.0.1:9880"
         ).strip(),
+        "tts_sovits_dir": str(data.get("tts_sovits_dir", "") or "").strip().strip('"'),
+        "tts_auto_start": _as_bool(data.get("tts_auto_start"), True),
         "tts_ref_audio": str(data.get("tts_ref_audio", "") or "").strip().strip('"'),
         "tts_prompt_text": str(data.get("tts_prompt_text", "") or "").strip()[:300],
         "tts_prompt_lang": tts_prompt_lang,
@@ -244,6 +247,7 @@ class QQBridgeService(QObject):
         self.snowluma = SnowLumaManager(
             self.state_root, self._log, on_ready=self._after_snowluma_ready
         )
+        self.sovits = SovitsManager(self.state_root, self._log)
         self.client: OneBotClient | None = None
         self.server: EventServer | None = None
         self.started = False
@@ -352,12 +356,19 @@ class QQBridgeService(QObject):
         self._log("QQ 桥接已加载")
         self.snowluma.configure(self.settings, self.settings["snowluma_http"])
         self.snowluma.start_async()
+        self.sovits.configure(
+            self.settings,
+            self.settings["tts_gpt_sovits_url"],
+            self.settings["tts_engine"],
+        )
+        self.sovits.start_async()
         self.check_async()
         if self.settings["custom_face_enabled"]:
             self.refresh_custom_faces_async()
 
     def stop(self) -> None:
         self.snowluma.stop()
+        self.sovits.stop()
         if self.server is not None:
             self.server.stop()
             self.server = None
@@ -553,6 +564,10 @@ class QQBridgeService(QObject):
         )
         changed = any(self.settings.get(key) != updated.get(key) for key in link_keys)
         dir_changed = self.settings.get("snowluma_dir") != updated.get("snowluma_dir")
+        sovits_changed = any(
+            self.settings.get(key) != updated.get(key)
+            for key in ("tts_sovits_dir", "tts_gpt_sovits_url", "tts_engine")
+        )
         was_qzone_auto = bool(self.settings.get("qzone_auto_reply"))
         self.settings = updated
         if updated["qzone_auto_reply"] and not was_qzone_auto:
@@ -573,6 +588,15 @@ class QQBridgeService(QObject):
             if dir_changed:
                 self.snowluma.stop()
             self.snowluma.start_async()
+        self.sovits.configure(
+            updated, updated["tts_gpt_sovits_url"], updated["tts_engine"]
+        )
+        if updated["tts_engine"] != "gpt_sovits" or not updated["tts_auto_start"]:
+            self.sovits.stop()
+        else:
+            if sovits_changed:
+                self.sovits.stop()
+            self.sovits.start_async()
         return {"ok": True, "message": message, "settings": updated}
 
     def _rebuild_link(self) -> str:
@@ -632,6 +656,9 @@ class QQBridgeService(QObject):
             "tts_engine": self.settings["tts_engine"],
             "tts_configured": self._tts_ready(),
             "tts_reply_enabled": bool(self.settings["tts_reply_enabled"]),
+            "tts_sovits_dir": self.settings["tts_sovits_dir"],
+            "tts_auto_start": bool(self.settings["tts_auto_start"]),
+            "sovits_managed": self.sovits.status(),
             "custom_face_enabled": bool(self.settings["custom_face_enabled"]),
             "custom_face_count": len(self._custom_faces)
             or len(self.settings["custom_face_ids"]),
@@ -861,6 +888,64 @@ class QQBridgeService(QObject):
             self._log(f"读取 Windows 语音失败：{exc}")
             return []
 
+    def sovits_status(self) -> dict[str, Any]:
+        return self.sovits.status()
+
+    def sovits_voices(self, folder: str = "") -> list[dict[str, str]]:
+        """列出整合包 refs 目录里的参考音色，附带同名 .txt 里的参考文字。
+
+        传入 folder 时按界面里当前填写的目录扫描，方便还没保存就预览音色。
+        """
+        try:
+            if folder:
+                home = detect_sovits_dir(folder)
+                return ref_voice_files(home) if home is not None else []
+            return self.sovits.voices()
+        except Exception as exc:
+            self._log(f"读取 GPT-SoVITS 音色失败：{exc}")
+            return []
+
+    def detect_sovits_path(self) -> str:
+        """自动探测整合包目录，找不到返回空字符串。"""
+        folder = detect_sovits_dir(self.settings["tts_sovits_dir"])
+        return str(folder) if folder is not None else ""
+
+    def start_sovits(
+        self,
+        callback: Callable[[bool, str], None] | None = None,
+        folder: str = "",
+    ) -> None:
+        """手动启动 GPT-SoVITS（忽略自动启动开关），结果回主线程。"""
+        settings = dict(self.settings)
+        if folder:
+            settings["tts_sovits_dir"] = folder
+        self.sovits.configure(settings, settings["tts_gpt_sovits_url"], "gpt_sovits")
+
+        def work() -> None:
+            try:
+                ok = self.sovits.ensure_ready(force=True)
+                message = (
+                    "GPT-SoVITS 已就绪。"
+                    if ok
+                    else "没能启动 GPT-SoVITS，查看状态栏或 sovits-stdout.log。"
+                )
+            except Exception as exc:
+                ok, message = False, f"启动 GPT-SoVITS 失败：{exc}"
+            if callback is not None:
+                self._dispatch.emit(lambda: callback(ok, message))
+
+        threading.Thread(target=work, name="qq-bridge-sovits-start", daemon=True).start()
+
+    def stop_sovits(
+        self, callback: Callable[[bool, str], None] | None = None
+    ) -> None:
+        def work() -> None:
+            self.sovits.stop()
+            if callback is not None:
+                self._dispatch.emit(lambda: callback(True, "已停止由插件启动的 GPT-SoVITS。"))
+
+        threading.Thread(target=work, name="qq-bridge-sovits-stop", daemon=True).start()
+
     def _tts_output_dir(self) -> Path:
         path = self.state_root / "tts"
         path.mkdir(parents=True, exist_ok=True)
@@ -875,6 +960,10 @@ class QQBridgeService(QObject):
         stamp = f"{int(time.time() * 1000)}-{random.randint(100, 999)}"
         out = self._tts_output_dir() / f"tts-{stamp}.wav"
         if self.settings["tts_engine"] == "gpt_sovits":
+            if not self.sovits.ensure_ready():
+                raise tts_engine.TTSError(
+                    "GPT-SoVITS 服务没有启动，检查安装目录和自动启动设置。"
+                )
             path = tts_engine.synthesize_gpt_sovits(
                 value,
                 out,

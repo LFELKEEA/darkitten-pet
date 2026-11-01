@@ -1,10 +1,10 @@
 {
   "id": "lfelkeea.qq_bridge",
   "name": "QQ 桥接（SnowLuma）",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "api_version": 1,
   "entry": "main.py",
-  "description": "通过 SnowLuma 把 QQ 私聊和群聊接进桌宠：可视化设置面板、人格卡、长期记忆、黑话库、可加备注的白名单、盯人即时回复、习惯化回复、收藏表情、QQ 空间与评论自动回复、SnowLuma 自动启停、聊天图片识别，以及 Windows 本地语音 / GPT-SoVITS 自定义音色的 TTS 语音回复。",
+  "description": "通过 SnowLuma 把 QQ 私聊和群聊接进桌宠：可视化设置面板、人格卡、长期记忆、黑话库、可加备注的白名单、盯人即时回复、习惯化回复、收藏表情、QQ 空间与评论自动回复、SnowLuma 自动启停、聊天图片识别，以及 Windows 本地语音 / GPT-SoVITS 自定义音色的 TTS 语音回复。1.6.0 起 GPT-SoVITS 也能自动探测安装目录、后台无窗口启动，并在设置面板里切换参考音色。",
   "author": "LFELKEEA",
   "highlights": [
     {
@@ -33,7 +33,7 @@
     },
     {
       "label": "语音消息",
-      "value": "TTS 合成 / 自定义音色"
+      "value": "TTS / 音色可切换"
     },
     {
       "label": "盯人",
@@ -120,6 +120,8 @@
     "tts_rate": 0,
     "tts_volume": 100,
     "tts_gpt_sovits_url": "http://127.0.0.1:9880",
+    "tts_sovits_dir": "",
+    "tts_auto_start": true,
     "tts_ref_audio": "",
     "tts_prompt_text": "",
     "tts_prompt_lang": "zh",

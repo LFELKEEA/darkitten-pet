@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugins" / "lfelkeea.qq_bridge"
 sys.path.insert(0, str(PLUGIN))
 
-from lfelkeea_qq_bridge import text, tts  # noqa: E402
+from lfelkeea_qq_bridge import sovits, text, tts  # noqa: E402
 from lfelkeea_qq_bridge.service import (  # noqa: E402
     QQBridgeService,
     normalize_settings,
@@ -76,6 +76,8 @@ class TTSUtilityTests(unittest.TestCase):
         self.assertEqual(settings["tts_engine"], "windows")
         self.assertEqual(settings["tts_windows_voice"], "")
         self.assertEqual(settings["tts_gpt_sovits_url"], "http://127.0.0.1:9880")
+        self.assertEqual(settings["tts_sovits_dir"], "")
+        self.assertTrue(settings["tts_auto_start"])
         self.assertEqual(settings["tts_ref_audio"], "")
         self.assertEqual(settings["tts_prompt_lang"], "zh")
         self.assertEqual(settings["tts_text_lang"], "zh")
@@ -229,7 +231,9 @@ class TTSServiceTests(unittest.TestCase):
             Path(out).write_bytes(b"RIFF" + b"0" * 2000)
             return Path(out)
 
-        with mock.patch.object(tts, "synthesize_gpt_sovits", fake_gpt):
+        with mock.patch.object(
+            service.sovits, "ensure_ready", lambda *a, **k: True
+        ), mock.patch.object(tts, "synthesize_gpt_sovits", fake_gpt):
             path = service._synthesize_tts("こんにちは")
         self.assertTrue(path.is_file())
         self.assertEqual(calls[0][0], "こんにちは")
@@ -358,6 +362,95 @@ class TTSServiceTests(unittest.TestCase):
             if segment.get("type") == "record"
         ]
         self.assertEqual(records, [{"type": "record", "data": {"file": str(clip)}}])
+
+    def test_synthesize_gpt_requires_service(self) -> None:
+        api, service = self.make_service(
+            {"tts_engine": "gpt_sovits", "tts_ref_audio": "C:/voice/ref.wav"}
+        )
+        with mock.patch.object(
+            service.sovits, "ensure_ready", lambda *a, **k: False
+        ), mock.patch.object(tts, "synthesize_gpt_sovits") as fake:
+            with self.assertRaises(tts.TTSError):
+                service._synthesize_tts("你好")
+        fake.assert_not_called()
+
+
+class SovitsManagerTests(unittest.TestCase):
+    def make_home(self) -> Path:
+        home = Path(tempfile.mkdtemp()) / "app"
+        (home / "runtime").mkdir(parents=True)
+        (home / "runtime" / "python.exe").write_bytes(b"MZ")
+        (home / "api_v2.py").write_text("", encoding="utf-8")
+        return home
+
+    def make_manager(self, **settings) -> sovits.SovitsManager:
+        manager = sovits.SovitsManager(Path(tempfile.mkdtemp()), lambda message: None)
+        manager.configure(
+            {
+                "tts_engine": "gpt_sovits",
+                "tts_auto_start": True,
+                **settings,
+            }
+        )
+        return manager
+
+    def test_detect_explicit_dir(self) -> None:
+        home = self.make_home()
+        self.assertEqual(sovits.detect_sovits_dir(str(home)), home.resolve())
+
+    def test_detect_parent_with_app(self) -> None:
+        home = self.make_home()
+        self.assertEqual(sovits.detect_sovits_dir(str(home.parent)), home.resolve())
+
+    def test_detect_missing_returns_none(self) -> None:
+        self.assertIsNone(sovits.detect_sovits_dir(str(Path(tempfile.mkdtemp()))))
+
+    def test_ref_voice_files_reads_sidecar(self) -> None:
+        home = self.make_home()
+        refs = home.parent / "refs"
+        refs.mkdir()
+        (refs / "a.wav").write_bytes(b"RIFF")
+        (refs / "a.txt").write_text("你好呀", encoding="utf-8")
+        (home / "refs").mkdir()
+        (home / "refs" / "b.wav").write_bytes(b"RIFF")
+        voices = sovits.ref_voice_files(home)
+        self.assertEqual([item["name"] for item in voices], ["a", "b"])
+        self.assertEqual(voices[0]["text"], "你好呀")
+
+    def test_ensure_ready_true_when_port_open(self) -> None:
+        manager = self.make_manager()
+        with mock.patch.object(sovits, "port_open", return_value=True):
+            self.assertTrue(manager.ensure_ready())
+
+    def test_ensure_ready_respects_auto_off(self) -> None:
+        manager = self.make_manager(tts_auto_start=False)
+        with mock.patch.object(sovits, "port_open", return_value=False), mock.patch.object(
+            manager, "start_async"
+        ) as start:
+            self.assertFalse(manager.ensure_ready())
+        start.assert_not_called()
+
+    def test_ensure_ready_force_starts(self) -> None:
+        manager = self.make_manager(tts_auto_start=False)
+        with mock.patch.object(
+            sovits, "port_open", side_effect=[False, True]
+        ), mock.patch.object(manager, "start_async") as start:
+            self.assertTrue(manager.ensure_ready(force=True, timeout=2))
+        start.assert_called_once_with(force=True)
+
+    def test_ensure_started_without_dir_logs(self) -> None:
+        messages: list[str] = []
+        manager = sovits.SovitsManager(Path(tempfile.mkdtemp()), messages.append)
+        manager.configure(
+            {"tts_engine": "gpt_sovits", "tts_auto_start": True, "tts_sovits_dir": str(Path(tempfile.mkdtemp()))}
+        )
+        with mock.patch.object(sovits, "port_open", return_value=False):
+            manager.start_async(force=True)
+            thread = manager._thread
+            if thread is not None:
+                thread.join(5)
+        self.assertTrue(any("没找到 GPT-SoVITS 目录" in item for item in messages))
+        self.assertIn("没找到", manager.status()["error"])
 
 
 if __name__ == "__main__":

@@ -1040,6 +1040,48 @@ class QQBridgeDialog(QDialog):
 
         self.tts_gpt_box = QGroupBox("GPT-SoVITS 本地 API")
         gpt_form = QFormLayout(self.tts_gpt_box)
+        dir_row = QHBoxLayout()
+        self.tts_sovits_dir = QLineEdit()
+        self.tts_sovits_dir.setPlaceholderText(
+            "整合包根目录，里面要有 api_v2.py 和 runtime\\python.exe"
+        )
+        detect_dir = QPushButton("自动检测")
+        detect_dir.setObjectName("ghost")
+        detect_dir.clicked.connect(self._detect_sovits_dir)
+        browse_dir = QPushButton("选择")
+        browse_dir.setObjectName("ghost")
+        browse_dir.clicked.connect(self._browse_sovits_dir)
+        dir_row.addWidget(self.tts_sovits_dir, 1)
+        dir_row.addWidget(detect_dir)
+        dir_row.addWidget(browse_dir)
+        gpt_form.addRow("安装目录", dir_row)
+        self.tts_auto_start = QCheckBox(
+            "插件启用时在后台启动 GPT-SoVITS（隐藏窗口，不弹控制台）"
+        )
+        gpt_form.addRow(self.tts_auto_start)
+        service_row = QHBoxLayout()
+        self.sovits_state = QLabel("服务状态未知")
+        self.sovits_state.setWordWrap(True)
+        start_sovits = QPushButton("启动服务")
+        start_sovits.setObjectName("ghost")
+        start_sovits.clicked.connect(self._start_sovits)
+        stop_sovits = QPushButton("停止服务")
+        stop_sovits.setObjectName("ghost")
+        stop_sovits.clicked.connect(self._stop_sovits)
+        service_row.addWidget(self.sovits_state, 1)
+        service_row.addWidget(start_sovits)
+        service_row.addWidget(stop_sovits)
+        gpt_form.addRow("服务", service_row)
+        voice_row_gpt = QHBoxLayout()
+        self.tts_sovits_voice = QComboBox()
+        self.tts_sovits_voice.setMinimumWidth(240)
+        self.tts_sovits_voice.currentIndexChanged.connect(self._apply_sovits_voice)
+        scan_voices = QPushButton("扫描音色")
+        scan_voices.setObjectName("ghost")
+        scan_voices.clicked.connect(lambda: self._refresh_sovits_voices(force=True))
+        voice_row_gpt.addWidget(self.tts_sovits_voice, 1)
+        voice_row_gpt.addWidget(scan_voices)
+        gpt_form.addRow("音色", voice_row_gpt)
         self.tts_gpt_url = QLineEdit()
         self.tts_gpt_url.setPlaceholderText("http://127.0.0.1:9880")
         gpt_form.addRow("API 地址", self.tts_gpt_url)
@@ -1084,9 +1126,11 @@ class QQBridgeDialog(QDialog):
         gpt_form.addRow("数据集", dataset_link)
         gpt_form.addRow(
             _hint(
-                "需要在本机运行 GPT-SoVITS 的 api_v2.py（默认 9880 端口），"
-                "参考音频和参考文字要对应。数据集只提供音色素材，请仅用于个人非商业用途，"
-                "不要冒充他人或用于诈骗。"
+                "填好安装目录后，插件会在后台用整合包自带的 runtime\\python.exe 启动 "
+                "api_v2.py，控制台窗口是隐藏的；桌宠退出时一并结束。"
+                "音色下拉列表会扫描整合包和它上一级目录里的 refs\\*.wav，"
+                "同名 .txt 会自动填进参考文字。数据集只提供音色素材，"
+                "请仅用于个人非商业用途，不要冒充他人或用于诈骗。"
             )
         )
         layout.addWidget(self.tts_gpt_box)
@@ -1327,6 +1371,12 @@ class QQBridgeDialog(QDialog):
         self.tts_rate.setValue(int(settings["tts_rate"]))
         self.tts_volume.setValue(int(settings["tts_volume"]))
         self.tts_gpt_url.setText(str(settings["tts_gpt_sovits_url"]))
+        self.tts_sovits_dir.setText(str(settings["tts_sovits_dir"]))
+        if not str(settings["tts_sovits_dir"]).strip():
+            detected = self.service.detect_sovits_path()
+            if detected:
+                self.tts_sovits_dir.setText(detected)
+        self.tts_auto_start.setChecked(bool(settings["tts_auto_start"]))
         self.tts_ref_audio.setText(str(settings["tts_ref_audio"]))
         self.tts_prompt_text.setText(str(settings["tts_prompt_text"]))
         prompt_index = self.tts_prompt_lang.findData(settings["tts_prompt_lang"])
@@ -1339,6 +1389,7 @@ class QQBridgeDialog(QDialog):
         self.tts_max_chars.setValue(int(settings["tts_max_chars"]))
         self._update_tts_engine_visibility()
         self._refresh_tts_voices()
+        self._refresh_sovits_voices()
         self._refresh_voice_targets()
 
         self.persona_edit.setPlainText(self.service.persona_text())
@@ -1417,6 +1468,8 @@ class QQBridgeDialog(QDialog):
             "tts_rate": self.tts_rate.value(),
             "tts_volume": self.tts_volume.value(),
             "tts_gpt_sovits_url": self.tts_gpt_url.text().strip(),
+            "tts_sovits_dir": self.tts_sovits_dir.text().strip(),
+            "tts_auto_start": self.tts_auto_start.isChecked(),
             "tts_ref_audio": self.tts_ref_audio.text().strip(),
             "tts_prompt_text": self.tts_prompt_text.text().strip(),
             "tts_prompt_lang": self.tts_prompt_lang.currentData() or "zh",
@@ -1468,6 +1521,19 @@ class QQBridgeDialog(QDialog):
         else:
             auto_text = "等待自动启动，或 SnowLuma 已经在别处运行。"
         self.auto_state_label.setText(auto_text)
+        if hasattr(self, "sovits_state"):
+            service_state = snapshot.get("sovits_managed") or {}
+            if service_state.get("managed"):
+                text = f"插件已启动（PID {service_state.get('pid')}）"
+            elif service_state.get("external"):
+                text = "已在别处运行，插件不接管这个实例"
+            elif service_state.get("error"):
+                text = str(service_state["error"])
+            elif not snapshot.get("tts_auto_start"):
+                text = "未运行（自动启动已关闭）"
+            else:
+                text = "未运行"
+            self.sovits_state.setText(text)
         self.owner_label.setText(
             f"主人 QQ：{snapshot['owner_qq'] or '未设置'}（主人消息会自动放行）"
         )
@@ -1915,6 +1981,79 @@ class QQBridgeDialog(QDialog):
         )
         if path:
             self.tts_ref_audio.setText(path)
+
+    def _detect_sovits_dir(self) -> None:
+        folder = self.service.detect_sovits_path()
+        if not folder:
+            self._notify(
+                "没找到 GPT-SoVITS，请手动选择包含 api_v2.py 的整合包根目录。", False
+            )
+            return
+        self.tts_sovits_dir.setText(folder)
+        self._refresh_sovits_voices(force=True)
+        self._notify(f"已找到 GPT-SoVITS：{folder}")
+
+    def _browse_sovits_dir(self) -> None:
+        start = self.tts_sovits_dir.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "选择 GPT-SoVITS 目录", start)
+        if folder:
+            self.tts_sovits_dir.setText(folder)
+            self._refresh_sovits_voices(force=True)
+
+    def _refresh_sovits_voices(self, force: bool = False) -> None:
+        current = self.tts_ref_audio.text().strip()
+        voices = self.service.sovits_voices(self.tts_sovits_dir.text().strip())
+        self._sovits_voices = voices
+        self.tts_sovits_voice.blockSignals(True)
+        self.tts_sovits_voice.clear()
+        self.tts_sovits_voice.addItem("（直接使用下面的参考音频路径）", "")
+        for item in voices:
+            path = str(item.get("path") or "")
+            label = str(item.get("name") or Path(path).stem)
+            text = str(item.get("text") or "").strip()
+            if text:
+                label = f"{label} · {text[:16]}"
+            self.tts_sovits_voice.addItem(label, path)
+        index = self.tts_sovits_voice.findData(current)
+        if index >= 0:
+            self.tts_sovits_voice.setCurrentIndex(index)
+        self.tts_sovits_voice.blockSignals(False)
+        if voices:
+            self.tts_status.setText(f"扫描到 {len(voices)} 个参考音色。")
+        else:
+            self.tts_status.setText(
+                "没在 refs 目录里找到 wav，先把参考音频放进去再扫描。"
+            )
+
+    def _apply_sovits_voice(self, index: int) -> None:
+        if index < 0:
+            return
+        path = str(self.tts_sovits_voice.itemData(index) or "")
+        if not path:
+            return
+        self.tts_ref_audio.setText(path)
+        for item in getattr(self, "_sovits_voices", []):
+            if item.get("path") == path:
+                if item.get("text"):
+                    self.tts_prompt_text.setText(str(item["text"]))
+                break
+        self.tts_status.setText(f"已选择音色：{Path(path).stem}")
+
+    def _start_sovits(self) -> None:
+        self.sovits_state.setText("正在启动 GPT-SoVITS…首次加载模型约 20~40 秒。")
+
+        def done(ok: bool, message: str) -> None:
+            self._notify(message, ok)
+            self._refresh_status()
+
+        self.service.start_sovits(done, self.tts_sovits_dir.text().strip())
+
+    def _stop_sovits(self) -> None:
+        def done(ok: bool, message: str) -> None:
+            self._notify(message, ok)
+            self._refresh_status()
+
+        self.service.stop_sovits(done)
 
     def _refresh_voice_targets(self) -> None:
         current = self.voice_target.currentText().strip()
