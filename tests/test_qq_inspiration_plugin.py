@@ -100,6 +100,23 @@ class ExtractorTests(unittest.TestCase):
         self.assertIn("旧点子", messages[1]["content"])
         self.assertIn("3 条", messages[1]["content"])
 
+    def test_slang_prompt_focuses_on_real_slang_and_skips_harmful(self):
+        prompt = extractor.SLANG_SYSTEM_PROMPT
+        self.assertIn("黑话", prompt)
+        self.assertIn("网络流行语", prompt)
+        self.assertIn("不要编造", prompt)
+        self.assertIn("违法", prompt)
+        self.assertIn("跳过", prompt)
+        messages = extractor.build_memory_messages(
+            [{"text": "这波操作太绝绝子了"}],
+            system_prompt=prompt,
+            intro="以下是聊天：",
+            ask="提炼黑话灵感。",
+            max_items=3,
+        )
+        self.assertEqual(messages[0]["content"], prompt)
+        self.assertIn("绝绝子", messages[1]["content"])
+
 
 class MemoryReaderTests(unittest.TestCase):
     def setUp(self):
@@ -245,6 +262,52 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(api.saved, saved + 1)
 
 
+class SlangTests(unittest.TestCase):
+    def test_corpus_interleaves_qq_and_pet_and_removes_duplicates(self):
+        from lfelkeea_qq_inspiration import service
+
+        original_qq = service.load_qq_memories
+        original_pet = service.gather_pet_items
+        try:
+            service.load_qq_memories = lambda _data_dir: (
+                [{"text": "绝绝子啊"}, {"text": "yyds"}, {"text": "yyds"}],
+                [],
+            )
+            service.gather_pet_items = lambda _api, _data_dir, limit: (
+                [{"text": "绝绝子啊"}, {"text": "显眼包呀"}],
+                {},
+            )
+            items = service._slang_corpus(10)
+        finally:
+            service.load_qq_memories = original_qq
+            service.gather_pet_items = original_pet
+
+        self.assertEqual(
+            [item["text"] for item in items], ["yyds", "绝绝子啊", "显眼包呀"]
+        )
+
+    def test_slang_corpus_honors_limit(self):
+        from lfelkeea_qq_inspiration import service
+
+        original_qq = service.load_qq_memories
+        original_pet = service.gather_pet_items
+        try:
+            service.load_qq_memories = lambda _data_dir: (
+                [{"text": f"QQ 黑话 {index}"} for index in range(20)],
+                [],
+            )
+            service.gather_pet_items = lambda _api, _data_dir, limit: (
+                [{"text": f"对话梗 {index}"} for index in range(20)],
+                {},
+            )
+            items = service._slang_corpus(6)
+        finally:
+            service.load_qq_memories = original_qq
+            service.gather_pet_items = original_pet
+
+        self.assertEqual(len(items), 6)
+
+
 class PathTests(unittest.TestCase):
     def test_data_dir_is_plugin_parent_parent(self):
         from lfelkeea_qq_inspiration.service import _data_dir
@@ -283,7 +346,9 @@ class UISmokeTests(unittest.TestCase):
         self.assertIn("[AI]", dialog.list_widget.item(0).text())
         self.assertIn("共 1 条", dialog.count_label.text())
         self.assertIn("提醒喝水", dialog.detail.toPlainText())
-        self.assertGreaterEqual(len(dialog.action_buttons), 6)
+        labels = [button.text() for button in dialog.action_buttons]
+        self.assertIn("从黑话提炼", labels)
+        self.assertGreaterEqual(len(dialog.action_buttons), 7)
         dialog.close()
         self.app.processEvents()
         plugin_main.teardown()

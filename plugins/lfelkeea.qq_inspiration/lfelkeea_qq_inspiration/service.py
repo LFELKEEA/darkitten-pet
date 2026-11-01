@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 from .extractor import (
     PET_SYSTEM_PROMPT,
     QQ_SYSTEM_PROMPT,
+    SLANG_SYSTEM_PROMPT,
     build_generation_messages,
     build_memory_messages,
     parse_ideas,
@@ -44,6 +45,8 @@ from .memory_reader import (
     record_capture,
     store_imported_text,
 )
+
+SLANG_SOURCE = "黑话"
 
 _api = None
 _store = None
@@ -121,6 +124,8 @@ def _source_prefix(source: str) -> str:
         return "AI"
     if source == "导入对话":
         return "导入"
+    if source == SLANG_SOURCE:
+        return "黑话"
     return "灵感"
 
 
@@ -155,7 +160,7 @@ def _refresh_list(window) -> None:
 
     counts = _store.source_counts()
     parts = [f"共 {len(_store.all())} 条"]
-    for source in (QQ_SOURCE, PET_SOURCE, "AI 生成", "导入对话"):
+    for source in (QQ_SOURCE, PET_SOURCE, SLANG_SOURCE, "AI 生成", "导入对话"):
         if counts.get(source):
             parts.append(f"{_source_prefix(source)} {counts[source]}")
     window.count_label.setText(" · ".join(parts))
@@ -359,6 +364,58 @@ def _extract_pet(window) -> None:
         batch_size=batch_size,
         per_item_chars=480,
         detail=detail,
+    )
+
+
+def _slang_corpus(limit: int) -> list[dict]:
+    """合并 QQ 记忆和桌宠对话，作为找黑话的语料，最近的内容优先。"""
+    qq_items, _ = load_qq_memories(_data_dir())
+    pet_items, _ = gather_pet_items(_api, _data_dir(), limit=limit)
+    qq_recent = list(reversed(qq_items[-limit:]))
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for index in range(limit):
+        for group in (qq_recent, pet_items):
+            if index >= len(group):
+                continue
+            text = str(group[index].get("text") or "").strip()
+            key = " ".join(text.split()).casefold()
+            if len(text) < 4 or key in seen:
+                continue
+            seen.add(key)
+            items.append(group[index])
+            if len(items) >= limit:
+                return items
+    return items
+
+
+def _extract_slang(window) -> None:
+    if _busy:
+        return
+    limit = _int_setting("max_items_per_run", 120, 12, 500)
+    items = _slang_corpus(limit)
+    if not items:
+        QMessageBox.information(
+            window,
+            "还没有黑话语料",
+            "没有找到可以提炼的聊天内容。可以先做任意一种：\n\n"
+            "· 让 QQ 桥接产生群聊记忆；\n"
+            "· 打开聊天框和桌宠聊几句；\n"
+            "· 点「导入对话…」粘贴一段群聊或弹幕。",
+        )
+        return
+    batch_size = _int_setting("max_memories_per_batch", 12, 4, 12)
+    _run_batches(
+        window,
+        items,
+        source=SLANG_SOURCE,
+        system_prompt=SLANG_SYSTEM_PROMPT,
+        intro="以下是 QQ 群聊、桌宠对话和手动导入的聊天片段：",
+        ask="请找出里面真实出现的黑话、梗、缩写或圈内用语，提炼成桌宠插件灵感。",
+        batch_size=batch_size,
+        per_item_chars=180,
+        detail=f"黑话语料 {len(items)} 条",
     )
 
 
@@ -623,6 +680,7 @@ def open_settings(api, parent=None):
     for text, handler in (
         ("从 QQ 桥接提炼", lambda: _extract_qq(dialog)),
         ("从桌宠对话提炼", lambda: _extract_pet(dialog)),
+        ("从黑话提炼", lambda: _extract_slang(dialog)),
         ("AI 直接生成", lambda: _generate_dialog(dialog)),
     ):
         button = QPushButton(text)
