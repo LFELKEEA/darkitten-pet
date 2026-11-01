@@ -40,7 +40,14 @@ PLUGIN_ID = "lfelkeea.qq_bridge"
 QZONE_RIGHTS = {"public": 1, "friends": 4, "some": 16, "private": 64, "hide": 128}
 DEFAULT_PERSONA = "# 人格卡\n\n你是一只桌面小猫，说话简短、自然。"
 # 这几个设置会被宿主用内存里的旧配置回写覆盖，额外在插件目录留一份。
-LOCAL_SETTINGS_KEYS = ("auto_start_snowluma", "snowluma_dir", "vision_enabled")
+LOCAL_SETTINGS_KEYS = (
+    "auto_start_snowluma",
+    "snowluma_dir",
+    "vision_enabled",
+    "alive_enabled",
+    "alive_recall",
+    "alive_report",
+)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
