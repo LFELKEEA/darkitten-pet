@@ -680,8 +680,8 @@ def open_settings(api, parent=None):
     dialog.status_label.setWordWrap(True)
     root.addWidget(dialog.status_label)
 
-    delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), dialog)
-    delete_shortcut.activated.connect(lambda: _delete_selected(dialog))
+    dialog.delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), dialog)
+    dialog.delete_shortcut.activated.connect(lambda: _delete_selected(dialog))
 
     dialog.finished.connect(lambda _result: _on_dialog_closed(dialog))
     _refresh_list(dialog)
