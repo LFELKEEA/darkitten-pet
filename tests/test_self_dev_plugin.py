@@ -257,6 +257,10 @@ class RestoreTests(unittest.TestCase):
                 {"path": "keep.txt", "old_string": "changed", "new_string": "changed again"},
             ),
         )
+        self.assertIn(
+            "已写入",
+            box.run("write_file", {"path": "drafts/tmp/x.py", "content": "x = 1\n"}),
+        )
 
         old = plugins / "demo.old"
         old.mkdir(parents=True)
@@ -281,13 +285,14 @@ class RestoreTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(box.journal.summary()["count"], 4)
+        self.assertEqual(box.journal.summary()["count"], 5)
         restored = box.journal.restore_all(root / "dev" / ".backups" / "restore")
 
         self.assertEqual(restored["errors"], [])
         self.assertEqual((workspace / "keep.txt").read_text(encoding="utf-8"), "original\n")
         self.assertFalse((workspace / "brand" / "new.txt").exists())
         self.assertFalse((workspace / "brand").exists())
+        self.assertFalse((root / "dev" / "drafts" / "tmp").exists())
         self.assertEqual((old / "main.py").read_text(encoding="utf-8"), "value = 1\n")
         self.assertFalse((plugins / "demo.new").exists())
         backup_dir = Path(restored["backup_dir"])
