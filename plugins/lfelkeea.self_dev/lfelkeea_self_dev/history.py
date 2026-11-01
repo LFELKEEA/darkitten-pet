@@ -254,7 +254,7 @@ class ChangeJournal:
                 try:
                     backup = destination / "plugins" / pid
                     backup.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(target), str(backup))
+                    shutil.copytree(target, backup, ignore=_ignore)
                 except OSError as exc:
                     result["errors"].append(f"备份当前插件失败：{pid}：{exc}")
 
@@ -301,16 +301,12 @@ class ChangeJournal:
                             result["errors"].append(f"插件基线丢失：{pid}")
                             continue
                         if target.exists():
-                            fallback = destination / "plugins" / f"{pid}-late"
-                            fallback.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(target), str(fallback))
-                        shutil.copytree(baseline, target)
+                            shutil.rmtree(target)
+                        shutil.copytree(baseline, target, ignore=_ignore)
                         result["restored_plugins"].append(pid)
                     else:
                         if target.exists():
-                            fallback = destination / "plugins" / f"{pid}-late"
-                            fallback.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(target), str(fallback))
+                            shutil.rmtree(target)
                         result["removed_plugins"].append(pid)
                 except OSError as exc:
                     result["errors"].append(f"还原插件失败：{pid}：{exc}")
