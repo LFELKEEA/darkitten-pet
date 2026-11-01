@@ -54,6 +54,24 @@ class SnowLumaUtilityTests(unittest.TestCase):
         self.assertEqual(url_endpoint("http://localhost"), ("localhost", 80))
         self.assertEqual(url_endpoint("https://127.0.0.1"), ("127.0.0.1", 443))
 
+    def test_start_hides_console_for_respawned_child(self) -> None:
+        if not snowluma.IS_WINDOWS:
+            self.skipTest("Windows only")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            process = snowluma.SnowLumaProcess(
+                folder, "node.exe", folder / "log.txt"
+            )
+            fake = SimpleNamespace(pid=1234, poll=lambda: None)
+            with mock.patch.object(
+                snowluma.subprocess, "Popen", return_value=fake
+            ) as popen, mock.patch.object(process._job, "open", return_value=False):
+                self.assertEqual(process.start(), 1234)
+        flags = popen.call_args.kwargs["creationflags"]
+        # DETACHED_PROCESS 会让 SnowLuma 内部 respawn 的 node 子进程弹出新窗口。
+        self.assertTrue(flags & snowluma.CREATE_NO_WINDOW)
+        self.assertFalse(flags & 0x00000008)
+
     def test_normalize_auto_start(self) -> None:
         settings = normalize_settings(
             {"auto_start_snowluma": "on", "snowluma_dir": '  "D:/SnowLuma"  '}

@@ -21,8 +21,11 @@ from urllib.parse import urlparse
 
 IS_WINDOWS = os.name == "nt"
 
-# Windows 进程创建标志：不显示控制台窗口，并让子进程独立于桌宠的控制台。
-DETACHED_PROCESS = 0x00000008
+# Windows 进程创建标志：给子进程一个隐藏的控制台，并让它独立于桌宠的进程组。
+# 这里不能用 DETACHED_PROCESS：SnowLuma 启动后还会自己再 spawn 一个 node 子进程，
+# 父进程没有控制台时，Windows 会给这个子进程新建一个可见窗口
+# （Win11 默认终端下就是截图里那个 Windows Terminal 标签页）。
+CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 SW_HIDE = 0
 
@@ -340,7 +343,7 @@ class SnowLumaProcess:
                 startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startup.wShowWindow = SW_HIDE
                 kwargs["startupinfo"] = startup
-                kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                kwargs["creationflags"] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
             else:
                 kwargs["start_new_session"] = True
             job_ready = self._job.open()
