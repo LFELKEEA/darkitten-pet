@@ -241,6 +241,14 @@ class SpeechSignals(QObject):
     fail = Signal(str)
 
 
+class RecorderSignals(QObject):
+    """把后台线程里的麦克风开关结果送回主线程。"""
+
+    ready = Signal(object, int)  # recorder, token
+    failed = Signal(str, int)  # error, token
+    stopped = Signal(object, object, int, str)  # recorder, wav_path, token, error
+
+
 class SpeechToTextRequest:
     """调用 Windows 自带的中文听写引擎，在后台线程里识别 WAV。"""
 
@@ -347,6 +355,13 @@ class VoiceChatController(QObject):
         self._state = "idle"
         self._token = 0
         self._recorder: VoiceRecorder | None = None
+        self._pending_start = False
+        self._prime_blocked_until = 0.0
+        self._recorder_factory = VoiceRecorder
+        self._recorder_signals = RecorderSignals(self)
+        self._recorder_signals.ready.connect(self._on_recorder_ready)
+        self._recorder_signals.failed.connect(self._on_recorder_failed)
+        self._recorder_signals.stopped.connect(self._on_recorder_stopped)
         self._stt: SpeechToTextRequest | None = None
         self._ai: AIRequest | None = None
         self._transcript_at = 0.0
@@ -356,45 +371,42 @@ class VoiceChatController(QObject):
         self._max_timer.timeout.connect(self.finish_listening)
 
     def prime(self) -> None:
-        """按下鼠标就开始收音，等长按触发时不会漏掉开头几个字。"""
+        """按下鼠标就开始收音，等长按触发时不会漏掉开头几个字。
+
+        麦克风初始化在 Windows 上要 50-200 ms，必须放到后台线程，
+        否则每次点击桌宠都会先卡一下。
+        """
         if self._state != "idle":
             return
-        recorder = VoiceRecorder()
-        try:
-            recorder.start()
-        except Exception:
+        if time.monotonic() < self._prime_blocked_until:
             return
-        self._recorder = recorder
+        self._token += 1
+        self._pending_start = False
         self._state = "priming"
+        self._open_in_background(self._token)
 
     def start_listening(self) -> None:
         if self._state == "recording":
             return
-        if self._state == "priming" and self._recorder is not None:
-            self._state = "recording"
-            self._max_timer.start()
-            self.pet.say("● 我在听，松开结束。", 60000)
+        if self._state in ("priming", "pending"):
+            self._pending_start = True
+            if self._recorder is not None:
+                self._begin_recording()
+            else:
+                self._state = "pending"
             return
         self._reset_active()
         self.pet._last_interaction = time.monotonic()
-        recorder = VoiceRecorder()
-        try:
-            recorder.start()
-        except VoiceError as exc:
-            self._state = "idle"
-            self.pet.say(f"{exc} 请在 Windows 设置里允许麦克风访问。", 5600)
-            return
-        except Exception as exc:
-            self._state = "idle"
-            self.pet.say(f"麦克风出错了：{exc}", 5600)
-            return
-
-        self._recorder = recorder
-        self._state = "recording"
-        self._max_timer.start()
-        self.pet.say("● 我在听，松开结束。", 60000)
+        self._state = "pending"
+        self._pending_start = True
+        self._open_in_background(self._token)
 
     def finish_listening(self) -> None:
+        if self._state == "pending":
+            # 麦克风还没打开就松手了，这一轮没有录到声音。
+            self._reset_active()
+            self.pet.say("我没听到声音，长按我再说一次吧。", 4800)
+            return
         if self._state != "recording":
             return
         self._max_timer.stop()
@@ -403,13 +415,116 @@ class VoiceChatController(QObject):
         recorder = self._recorder
         self._recorder = None
         self.pet._last_interaction = time.monotonic()
-        try:
-            wav_path = recorder.stop() if recorder is not None else None
-        except Exception as exc:
+        if recorder is None:
             self._state = "idle"
-            self.pet.say(f"保存录音失败了：{exc}", 5200)
             return
-        if wav_path is None:
+        threading.Thread(
+            target=self._stop_recorder,
+            args=(recorder, token),
+            name="pet-mic-stop",
+            daemon=True,
+        ).start()
+
+    def cancel_listening(self) -> None:
+        if self._state not in ("priming", "pending", "recording", "stopping"):
+            return
+        if self._state == "recording":
+            self.pet.bubble.hide_now()
+        self._reset_active()
+
+    # ---------- 后台开关麦克风 ----------
+
+    def _open_in_background(self, token: int) -> None:
+        threading.Thread(
+            target=self._open_recorder,
+            args=(token,),
+            name="pet-mic-open",
+            daemon=True,
+        ).start()
+
+    def _open_recorder(self, token: int) -> None:
+        recorder = None
+        try:
+            recorder = self._recorder_factory()
+            recorder.start()
+        except VoiceError as exc:
+            self._close_quietly(recorder)
+            self._recorder_signals.failed.emit(
+                f"{exc} 请在 Windows 设置里允许麦克风访问。", token
+            )
+        except Exception as exc:
+            self._close_quietly(recorder)
+            self._recorder_signals.failed.emit(f"麦克风出错了：{exc}", token)
+        else:
+            self._recorder_signals.ready.emit(recorder, token)
+
+    def _stop_recorder(self, recorder: VoiceRecorder, token: int) -> None:
+        wav_path: Path | None = None
+        error = ""
+        try:
+            wav_path = recorder.stop()
+        except Exception as exc:
+            error = str(exc)
+        self._recorder_signals.stopped.emit(recorder, wav_path, token, error)
+
+    @staticmethod
+    def _close_quietly(recorder: VoiceRecorder | None) -> None:
+        if recorder is None:
+            return
+        try:
+            recorder.cancel()
+        except Exception:
+            pass
+
+    def _close_in_background(self, recorder: VoiceRecorder) -> None:
+        threading.Thread(
+            target=self._close_quietly,
+            args=(recorder,),
+            name="pet-mic-close",
+            daemon=True,
+        ).start()
+
+    def _begin_recording(self) -> None:
+        self._pending_start = False
+        self._state = "recording"
+        self._max_timer.start()
+        self.pet.say("● 我在听，松开结束。", 60000)
+
+    def _on_recorder_ready(self, recorder: object, token: int) -> None:
+        if token != self._token or self._state not in ("priming", "pending"):
+            self._close_in_background(recorder)  # type: ignore[arg-type]
+            return
+        self._recorder = recorder  # type: ignore[assignment]
+        if self._state == "pending" or self._pending_start:
+            self._begin_recording()
+
+    def _on_recorder_failed(self, error: str, token: int) -> None:
+        if token != self._token or self._state not in ("priming", "pending"):
+            return
+        announce = self._state == "pending" or self._pending_start
+        self._pending_start = False
+        self._state = "idle"
+        if announce:
+            self.pet.say(error, 5600)
+        else:
+            # 没有麦克风权限时不要每次点击都重试，避免反复卡后台。
+            self._prime_blocked_until = time.monotonic() + 20.0
+
+    def _on_recorder_stopped(
+        self, recorder: object, wav_path: object, token: int, error: str
+    ) -> None:
+        if token != self._token or self._state != "stopping":
+            if isinstance(wav_path, Path):
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return
+        if error:
+            self._state = "idle"
+            self.pet.say(f"保存录音失败了：{error}", 5200)
+            return
+        if not isinstance(wav_path, Path):
             self._state = "idle"
             self.pet.say("我没听到声音，长按我再说一次吧。", 4800)
             return
@@ -421,13 +536,6 @@ class VoiceChatController(QObject):
         request.signals.ok.connect(lambda text, t=token: self._on_speech_ok(text, t))
         request.signals.fail.connect(lambda error, t=token: self._on_speech_fail(error, t))
         request.start()
-
-    def cancel_listening(self) -> None:
-        if self._state not in ("priming", "recording"):
-            return
-        if self._state == "recording":
-            self.pet.bubble.hide_now()
-        self._reset_active()
 
     def _on_speech_ok(self, text: str, token: int) -> None:
         if token != self._token or self._state != "transcribing":
@@ -501,9 +609,11 @@ class VoiceChatController(QObject):
     def _reset_active(self) -> None:
         self._token += 1
         self._max_timer.stop()
-        if self._recorder is not None:
-            self._recorder.cancel()
-            self._recorder = None
+        self._pending_start = False
+        recorder = self._recorder
+        self._recorder = None
+        if recorder is not None:
+            self._close_in_background(recorder)
         if self._stt is not None:
             self._stt.cancel()
             self._stt = None
