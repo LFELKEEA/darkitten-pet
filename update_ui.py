@@ -360,9 +360,12 @@ class UpdateDialog(QDialog):
             self._on_failed("上一次更新还没结束，请稍后再试。")
 
     def _apply_and_restart(self) -> None:
+        self.status.setText("正在启动更新脚本…")
+        self.action_btn.setEnabled(False)
         try:
             self.manager.schedule_apply(restart=True)
         except UpdateError as exc:
+            self.action_btn.setEnabled(True)
             self.status.setText(f"无法启动更新：{exc}")
             return
         self.status.setText("桌宠即将退出，替换文件后会自动重新启动。")

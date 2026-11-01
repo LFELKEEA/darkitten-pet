@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -516,6 +517,75 @@ def write_apply_script(root: Path | None = None) -> Path:
     return script
 
 
+def apply_flags() -> int:
+    """隐藏窗口启动 PowerShell 的创建标志。
+
+    不能用 DETACHED_PROCESS：那种方式下 powershell.exe 没有控制台，
+    进程会立刻退出，脚本一行都不会执行。CREATE_NO_WINDOW 既隐藏窗口
+    又能正常执行；CREATE_NEW_PROCESS_GROUP 让脚本不受父进程控制台影响。
+    """
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    )
+
+
+def _apply_command(
+    script: Path,
+    payload_root: Path,
+    install: Path,
+    log_path: Path,
+    restart: bool,
+    pid: int,
+) -> list[str]:
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        str(script),
+        "-PetPid",
+        str(pid),
+        "-Source",
+        str(Path(payload_root).resolve()),
+        "-Install",
+        str(install.resolve()),
+        "-Restart",
+        "1" if restart else "0",
+        "-LogPath",
+        str(log_path.resolve()),
+    ]
+
+
+def read_apply_log(install: Path | None = None, limit: int = 400) -> str:
+    """读更新脚本日志的最后一段，用于失败提示。"""
+    path = updates_dir(install) / "apply.log"
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " / ".join(lines[-3:])[-limit:]
+
+
+def _wait_script_started(log_path: Path, timeout: float = 3.0) -> bool:
+    deadline = timeout
+    while deadline > 0:
+        try:
+            if log_path.is_file() and log_path.stat().st_size > 0:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.15)
+        deadline -= 0.15
+    return False
+
+
+_apply_process: subprocess.Popen | None = None
+
+
 def schedule_apply(
     payload_root: Path,
     install: Path | None = None,
@@ -525,42 +595,48 @@ def schedule_apply(
 ) -> Path:
     if os.name != "nt":
         raise UpdateError("桌宠自动更新只支持 Windows")
+    global _apply_process
     install = Path(install or install_dir())
     script = write_apply_script(install)
     log_path = updates_dir(install) / "apply.log"
-    flags = (
-        getattr(subprocess, "DETACHED_PROCESS", 0)
-        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    )
     try:
-        subprocess.Popen(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-                str(script),
-                "-PetPid",
-                str(os.getpid() if pid is None else int(pid)),
-                "-Source",
-                str(Path(payload_root).resolve()),
-                "-Install",
-                str(install.resolve()),
-                "-Restart",
-                "1" if restart else "0",
-                "-LogPath",
-                str(log_path.resolve()),
-            ],
-            cwd=str(install),
-            creationflags=flags,
-            close_fds=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        raise UpdateError(f"启动更新脚本失败：{exc}") from exc
-    return script
+        log_path.unlink()
+    except OSError:
+        pass
+    command = _apply_command(
+        script,
+        payload_root,
+        install,
+        log_path,
+        restart,
+        os.getpid() if pid is None else int(pid),
+    )
+    # 先试隐藏控制台；万一环境不允许，再退回无创建标志（可能闪一下窗口）。
+    attempts = [apply_flags(), 0]
+    last_error = ""
+    for flags in attempts:
+        try:
+            proc = subprocess.Popen(
+                command,
+                cwd=str(install),
+                creationflags=flags,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        _apply_process = proc
+        if _wait_script_started(log_path):
+            return script
+        if proc.poll() is None:
+            # 进程还活着，只是日志写得慢，不要重复启动第二个脚本。
+            return script
+        last_error = "更新脚本没有启动"
+    detail = last_error or "未知原因"
+    tail = read_apply_log(install)
+    if tail:
+        detail = f"{detail}（{tail}）"
+    raise UpdateError(f"启动更新脚本失败：{detail}")

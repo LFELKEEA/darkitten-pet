@@ -136,11 +136,11 @@ class PetApp(QObject):
         self.update_manager.checked.connect(self._on_update_checked)
         self._update_timer = QTimer(self)
         self._update_timer.setInterval(6 * 60 * 60 * 1000)
-        self._update_timer.timeout.connect(self._auto_check_updates)
+        self._update_timer.timeout.connect(self._periodic_check_updates)
         self._update_timer.start()
         QTimer.singleShot(1200, self._start_services)
         QTimer.singleShot(900, self._welcome)
-        QTimer.singleShot(9000, self._auto_check_updates)
+        QTimer.singleShot(9000, self._startup_check_updates)
 
     def _start_services(self) -> None:
         if self._cleaned:
@@ -156,7 +156,14 @@ class PetApp(QObject):
         value = self.config.get("updates", {})
         return dict(value) if isinstance(value, dict) else {}
 
-    def _auto_check_updates(self) -> None:
+    def _startup_check_updates(self) -> None:
+        """启动时总是查一次，避免 6 小时节流把重启后的检查也挡掉。"""
+        self._auto_check_updates(startup=True)
+
+    def _periodic_check_updates(self) -> None:
+        self._auto_check_updates()
+
+    def _auto_check_updates(self, startup: bool = False) -> None:
         if self._cleaned:
             return
         updates = self._update_config()
@@ -166,7 +173,7 @@ class PetApp(QObject):
             last = int(updates.get("last_check", 0) or 0)
         except (TypeError, ValueError):
             last = 0
-        if time.time() - last < 6 * 60 * 60:
+        if not startup and time.time() - last < 6 * 60 * 60:
             return
         if self.update_manager.busy:
             return
