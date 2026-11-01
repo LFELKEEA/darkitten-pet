@@ -220,26 +220,38 @@ def build_user_prompt(
     return "\n".join(lines) if lines else "对方（现在）：" + target
 
 
-def compaction_prompt(inbox: Iterable[dict[str, Any]] | None, existing_terms: Iterable[str] | None = None) -> str:
-    """请模型把一段聊天整理成长期记忆和新黑话。"""
+def compaction_prompt(
+    inbox: Iterable[dict[str, Any]] | None,
+    existing_terms: Iterable[str] | None = None,
+    short: bool = False,
+) -> str:
+    """请模型把一段聊天整理成长期记忆和新黑话。
+
+    short=True 时缩小窗口、减少条数，供第一次失败后的重试使用。
+    """
     existing = [str(item) for item in (existing_terms or []) if str(item).strip()]
     existing_line = "、".join(existing[:60]) if existing else "（暂无）"
+    max_memories = 2 if short else 4
+    max_terms = 2 if short else 3
+    body_limit = 120 if short else 240
+    window = 12 if short else 80
     lines = [
         "下面是一段 QQ 聊天记录。请整理出值得长期记住的信息，以及可能有特殊含义的黑话。",
         "只输出一个 JSON 对象，单行，不要解释，不要代码块标记，不要多余文字。格式：",
-        '{"memories": ["一句话一条，最多 4 条"], "slang": [{"term": "词", "meaning": "含义"}]}',
+        f'{{"memories": ["一句话一条，最多 {max_memories} 条"], '
+        f'"slang": [{{"term": "词", "meaning": "含义"}}]}}',
         "规则：",
-        "1. memories 只记稳定的事实、偏好、称呼、约定、重要事件；不要记寒暄和一次性内容。",
-        "2. slang 最多 3 条，只收 2 到 8 个字、确实有特殊含义或圈内用法的词；普通词、地名、人名不要收。",
+        f"1. memories 只记稳定的事实、偏好、称呼、约定、重要事件；最多 {max_memories} 条，不要记寒暄和一次性内容。",
+        f"2. slang 最多 {max_terms} 条，只收 2 到 8 个字、确实有特殊含义或圈内用法的词；普通词、地名、人名不要收。",
         "3. 没有可整理的内容就返回 {\"memories\": [], \"slang\": []}，不要写别的。",
         f"4. 已经收录的黑话（不要重复）：{existing_line}",
         "",
         "聊天记录：",
     ]
-    for item in list(inbox or [])[-80:]:
+    for item in list(inbox or [])[-window:]:
         if not isinstance(item, dict):
             continue
-        body = _clean(item.get("text"), 240)
+        body = _clean(item.get("text"), body_limit)
         if not body:
             continue
         name = _clean(item.get("name"), 24) or ("我" if str(item.get("role")) == "assistant" else "对方")
@@ -331,6 +343,7 @@ def transient_ai_error(error: str) -> bool:
             "timeout",
             "网络",
             "连接失败",
+            "空回复",
             "429",
             "500",
             "502",

@@ -24,7 +24,7 @@ from screen_watcher import (
     WindowInfo,
     capture_screen,
 )
-from ai_client import request_chat, supports_vision
+from ai_client import AIError, request_chat, supports_vision
 
 APP = QGuiApplication.instance() or QGuiApplication([])
 
@@ -270,6 +270,120 @@ class AIClientTests(unittest.TestCase):
         content = captured["payload"]["messages"][0]["content"]
         self.assertEqual(content[1]["type"], "image_url")
         self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertNotIn("reasoning_effort", captured["payload"])
+
+    def test_deepseek_disables_thinking(self) -> None:
+        captured = {}
+
+        def fake_http(url, payload, headers, timeout):
+            captured["payload"] = payload
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "哼"}}]}
+
+        with mock.patch("ai_client._http_json", side_effect=fake_http):
+            reply = request_chat(
+                {
+                    "provider": "openai",
+                    "model": "deepseek-v4.1-flash-1017",
+                    "base_url": "https://example.com/v1",
+                    "api_key": "test",
+                    "timeout": 10,
+                },
+                [{"role": "user", "content": "在吗"}],
+            )
+        self.assertEqual(reply, "哼")
+        self.assertEqual(captured["payload"]["reasoning_effort"], "none")
+
+    def test_rejected_reasoning_param_falls_back(self) -> None:
+        payloads = []
+
+        def fake_http(url, payload, headers, timeout):
+            payloads.append(dict(payload))
+            if "reasoning_effort" in payload:
+                raise AIError("接口返回 400。unknown field reasoning_effort")
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "好"}}]}
+
+        with mock.patch("ai_client._http_json", side_effect=fake_http):
+            reply = request_chat(
+                {
+                    "provider": "openai",
+                    "model": "deepseek-chat",
+                    "base_url": "https://example.com/v1",
+                    "api_key": "test",
+                    "timeout": 10,
+                },
+                [{"role": "user", "content": "在吗"}],
+            )
+        self.assertEqual(reply, "好")
+        self.assertEqual(len(payloads), 2)
+        self.assertNotIn("reasoning_effort", payloads[1])
+
+    def test_empty_reply_retries_with_larger_budget(self) -> None:
+        payloads = []
+
+        def fake_http(url, payload, headers, timeout):
+            payloads.append(dict(payload))
+            if len(payloads) == 1:
+                return {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": "", "reasoning_content": "思考"},
+                        }
+                    ],
+                    "usage": {"completion_tokens": 500},
+                }
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"content": '{"memories": []}'}}]
+            }
+
+        with mock.patch("ai_client._http_json", side_effect=fake_http):
+            reply = request_chat(
+                {
+                    "provider": "openai",
+                    "model": "deepseek-chat",
+                    "base_url": "https://example.com/v1",
+                    "api_key": "test",
+                    "timeout": 10,
+                },
+                [{"role": "user", "content": "整理"}],
+            )
+        self.assertEqual(reply, '{"memories": []}')
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[1]["max_tokens"], 1500)
+
+    def test_empty_reply_reports_diagnostics(self) -> None:
+        calls = []
+
+        def fake_http(url, payload, headers, timeout):
+            calls.append(dict(payload))
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "", "reasoning_content": "思考"},
+                    }
+                ],
+                "usage": {"completion_tokens": 500},
+            }
+
+        with mock.patch("ai_client._http_json", side_effect=fake_http):
+            with self.assertRaises(AIError) as ctx:
+                request_chat(
+                    {
+                        "provider": "openai",
+                        "model": "deepseek-chat",
+                        "base_url": "https://example.com/v1",
+                        "api_key": "test",
+                        "timeout": 10,
+                    },
+                    [{"role": "user", "content": "整理"}],
+                )
+        message = str(ctx.exception)
+        self.assertIn("空回复", message)
+        self.assertIn("finish_reason=length", message)
+        self.assertIn("completion_tokens=500", message)
+        self.assertIn("reasoning_content=2 字", message)
+        self.assertEqual(len(calls), 2)
 
 
 class ScreenTests(unittest.TestCase):

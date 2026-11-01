@@ -303,6 +303,27 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(slang, [])
         self.assertFalse(analysis.looks_like_compaction("好的，我已经整理完了。"))
 
+    def test_compaction_short_prompt(self) -> None:
+        records = [
+            {"name": "小明", "role": "user", "text": f"第{index}句"}
+            for index in range(20)
+        ]
+        full = analysis.compaction_prompt(records, ["旧词"])
+        short = analysis.compaction_prompt(records, ["旧词"], short=True)
+        self.assertLess(len(short), len(full))
+        self.assertIn("小明：第19句", short)
+        self.assertNotIn("小明：第7句", short)
+        self.assertIn("最多 2 条", short)
+        self.assertIn("旧词", short)
+
+    def test_empty_reply_is_transient(self) -> None:
+        self.assertTrue(
+            analysis.transient_ai_error(
+                "接口返回了空回复（finish_reason=length，completion_tokens=500）"
+            )
+        )
+        self.assertFalse(analysis.transient_ai_error("接口返回 401。invalid api key"))
+
 
 class CommandTests(unittest.TestCase):
     def test_parse(self) -> None:

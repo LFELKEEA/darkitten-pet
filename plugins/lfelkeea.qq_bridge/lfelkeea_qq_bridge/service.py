@@ -1645,16 +1645,22 @@ class QQBridgeService(QObject):
                 self._reply_local(notify, f"整理失败：{reason}")
             report(f"整理失败：{reason}")
 
-        def request() -> None:
+        def request(short: bool = False) -> None:
             nonlocal attempts
             attempts += 1
+            # 第二次尝试缩短输入和条数，降低思考预算和输出长度的压力。
+            request_prompt = prompt
+            if short:
+                request_prompt = analysis.compaction_prompt(
+                    batch[-12:], self.store.slang_terms().keys(), short=True
+                )
 
             def on_done(reply: str | None, error: str | None) -> None:
                 if error:
                     # 网络抖动、限流、5xx 重试一次；输入太长导致的超时也能借此恢复。
                     if attempts < 2 and analysis.transient_ai_error(error):
-                        self._log(f"记忆整理失败，重试一次：{error}")
-                        request()
+                        self._log(f"记忆整理失败，换短一点的输入重试一次：{error}")
+                        request(short=True)
                         return
                     fail(error)
                     return
@@ -1663,6 +1669,10 @@ class QQBridgeService(QObject):
                 memories, slang = analysis.parse_compaction(content)
                 if not memories and not slang and not analysis.looks_like_compaction(content):
                     # 模型没按 JSON 返回时不能清空聊天记录，否则这批内容就永久丢了。
+                    if attempts < 2:
+                        self._log("模型没有返回可用的 JSON，换短一点的输入重试一次。")
+                        request(short=True)
+                        return
                     fail("模型没有返回可用的 JSON，聊天记录已保留，稍后再试")
                     return
 
@@ -1707,7 +1717,7 @@ class QQBridgeService(QObject):
                             "role": "system",
                             "content": "你是聊天记录整理助手，只输出 JSON，不要输出其他内容。",
                         },
-                        {"role": "user", "content": prompt},
+                        {"role": "user", "content": request_prompt},
                     ],
                     on_done,
                 )

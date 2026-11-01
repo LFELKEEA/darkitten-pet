@@ -11,13 +11,13 @@
   [https://github.com/SnowLuma/SnowLuma/releases](https://github.com/SnowLuma/SnowLuma/releases)
 - Windows 部署说明：
   [https://snowluma.github.io/zh/docs/guide/deploy/windows](https://snowluma.github.io/zh/docs/guide/deploy/windows)
-- 桌宠 1.1.1 或更高版本
+- 桌宠 1.1.1 或更高版本（建议 1.2.1，修复了 DeepSeek 思考模式导致的空回复）
 
 SnowLuma 的许可允许个人使用，但不允许把它的原生组件打包进第三方安装包。所以这里只给官方下载链接，不附带 SnowLuma 文件。
 
 ## 安装
 
-1. 从插件库下载 `lfelkeea.qq_bridge-1.4.4.zip`。
+1. 从插件库下载 `lfelkeea.qq_bridge-1.4.5.zip`。
 2. 解压得到 `lfelkeea.qq_bridge` 文件夹，整个放进桌宠的插件目录。
    - 右键桌宠 →「插件管理」→「打开插件目录」，或手动放到 `data/plugins/`。
 3. 回到插件管理，点「重新扫描」，勾选「QQ 桥接（SnowLuma）」启用。
@@ -282,6 +282,7 @@ SnowLuma 的日志里如果出现 `listen EADDRINUSE: address already in use 127
 
 ## 更新记录
 
+- **1.4.5**：修复记忆整理提示“接口返回了空回复”。DeepSeek 默认开启思考模式，思维链会占掉回复的 token 预算；桌宠 1.2.1 起会在 DeepSeek 模型上关闭思考模式，空回复错误也会带上 finish_reason 和 token 诊断。插件侧遇到空回复或非 JSON 时，会用更短的输入和更少的条数自动重试一次，仍失败则保留聊天记录。
 - **1.4.4**：白名单里的好友和群可以添加文字备注。设置面板新增备注输入框和「保存备注」，列表会显示「号码 · 备注」；新增时可直接带备注，删除条目会一并清理备注。`/allow add 123456 备注` 和 `/allow list` 也支持备注，备注不参与白名单匹配，旧配置无需迁移。
 - **1.4.3**：修复自动启动或接管后弹出 SnowLuma 控制台窗口的问题。改用隐藏控制台方式启动，SnowLuma 内部再启动的 node 子进程也不会再弹出 Windows Terminal；插件卸载、关闭桌宠或桌宠异常退出时，仍由作业对象结束整棵 SnowLuma 进程树。
 - **1.4.2**：修复记忆整理失败与记录被误清空的问题：模型输出被截断或夹杂解释时会先抢救能读到的 JSON；模型完全没有返回 JSON 时保留聊天记录并提示原因；网络抖动、限流和 5xx 会自动重试一次；单次整理条数下调，避免输入过长导致超时。「记忆」页新增「立即整理」，「习惯」页可以选择会话删除统计。

@@ -85,6 +85,63 @@ def _clean_reply(text: str) -> str:
     return text
 
 
+def _is_deepseek(model: str) -> bool:
+    return "deepseek" in str(model or "").lower()
+
+
+def _post_chat(url: str, payload: dict, headers: dict, timeout: int) -> tuple[dict, dict]:
+    """POST 一次；兼容接口不认识 reasoning_effort 时去掉它再试一次。"""
+    try:
+        return _http_json(url, payload, headers, timeout), payload
+    except AIError as exc:
+        if "reasoning_effort" in payload and re.search(r"接口返回 (?:400|422)", str(exc)):
+            fallback = dict(payload)
+            fallback.pop("reasoning_effort", None)
+            return _http_json(url, fallback, headers, timeout), fallback
+        raise
+
+
+def _first_message(data: dict) -> tuple[dict, str]:
+    try:
+        choice = data["choices"][0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        error_text = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error_text, dict):
+            error_text = error_text.get("message")
+        raise AIError(f"接口没有返回有效回复。{error_text or ''}".strip()) from exc
+    if not isinstance(message, dict):
+        message = {}
+    finish_reason = ""
+    if isinstance(choice, dict):
+        finish_reason = str(choice.get("finish_reason") or "")
+    return message, finish_reason
+
+
+def _message_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return _clean_reply(content or "")
+
+
+def _empty_reply_error(data: dict, message: dict, finish_reason: str) -> AIError:
+    """带上诊断信息，方便从日志判断是思考模式吃掉了 token 还是被截断。"""
+    details: list[str] = []
+    if finish_reason:
+        details.append(f"finish_reason={finish_reason}")
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
+        details.append(f"completion_tokens={usage.get('completion_tokens')}")
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        details.append(f"reasoning_content={len(reasoning)} 字")
+    suffix = f"（{'，'.join(details)}）" if details else ""
+    return AIError(f"接口返回了空回复{suffix}")
+
+
 def _endpoint(base_url: str) -> str:
     base = (base_url or "").strip().rstrip("/")
     if not base:
@@ -151,45 +208,59 @@ def request_chat(ai_config: dict[str, Any], messages: list[dict[str, Any]]) -> s
             },
             timeout,
         )
+        message, finish_reason = _first_message(data)
+        reply = _message_text(message)
+        if not reply:
+            raise _empty_reply_error(data, message, finish_reason)
+        return reply
+
+    api_key = (ai_config.get("api_key") or "").strip()
+    if provider == "ollama":
+        base_url = (ai_config.get("base_url") or "http://127.0.0.1:11434/v1").strip()
+        model = model or "qwen2.5:7b"
+        headers = {"Content-Type": "application/json; charset=utf-8"}
     else:
-        api_key = (ai_config.get("api_key") or "").strip()
-        if provider == "ollama":
-            base_url = (ai_config.get("base_url") or "http://127.0.0.1:11434/v1").strip()
-            model = model or "qwen2.5:7b"
-            headers = {"Content-Type": "application/json; charset=utf-8"}
-        else:
-            base_url = (ai_config.get("base_url") or "https://api.openai.com/v1").strip()
-            model = model or "gpt-4o-mini"
-            if not api_key:
-                raise AIError("还没有填写 API Key")
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {api_key}",
-            }
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": 500,
+        base_url = (ai_config.get("base_url") or "https://api.openai.com/v1").strip()
+        model = model or "gpt-4o-mini"
+        if not api_key:
+            raise AIError("还没有填写 API Key")
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {api_key}",
         }
-        data = _http_json(_endpoint(base_url), payload, headers, timeout)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 500,
+    }
+    if provider == "openai" and _is_deepseek(model):
+        # DeepSeek 默认开启思考模式，思维链会占掉 max_tokens，
+        # 长一点的输入（例如记忆整理）就容易只剩空 content。
+        payload["reasoning_effort"] = "none"
 
-    try:
-        message = data["choices"][0]["message"]
-    except (KeyError, IndexError, TypeError) as exc:
-        error_text = data.get("error") if isinstance(data, dict) else None
-        if isinstance(error_text, dict):
-            error_text = error_text.get("message")
-        raise AIError(f"接口没有返回有效回复。{error_text or ''}".strip()) from exc
+    url = _endpoint(base_url)
+    data, used_payload = _post_chat(url, payload, headers, timeout)
+    message, finish_reason = _first_message(data)
+    reply = _message_text(message)
 
-    content = message.get("content")
-    if isinstance(content, list):
-        content = "".join(
-            part.get("text", "") for part in content if isinstance(part, dict)
-        )
-    reply = _clean_reply(content or "")
+    if not reply and finish_reason == "length":
+        # 被截断时放宽一次上限，避免长输入直接判定为空回复。
+        retry_payload = dict(used_payload)
+        retry_payload["max_tokens"] = 1500
+        try:
+            retry_data, _ = _post_chat(url, retry_payload, headers, timeout)
+            retry_message, retry_finish = _first_message(retry_data)
+        except AIError:
+            pass
+        else:
+            retry_reply = _message_text(retry_message)
+            if retry_reply:
+                return retry_reply
+            data, message, finish_reason = retry_data, retry_message, retry_finish
+
     if not reply:
-        raise AIError("接口返回了空回复")
+        raise _empty_reply_error(data, message, finish_reason)
     return reply
 
 
