@@ -2,9 +2,9 @@
 
 住在 Windows 桌面上的白发红瞳猫耳少女。支持 AI 聊天、长按语音对话、主动搭话、定时观察屏幕，以及本地插件扩展。
 
-当前源码版本：`1.3.4`。
+当前源码版本：`1.3.5`。
 
-- 下载安装包：[pet-v1.3.4](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.3.4)
+- 下载安装包：[pet-v1.3.5](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.3.5)
 - 插件库：[lfelkeea.github.io/darkitten-launcher/plugins.html](https://lfelkeea.github.io/darkitten-launcher/plugins.html)
 - 插件源码：[`plugins/`](plugins)（示例插件、专注守护、QQ 桥接）
 

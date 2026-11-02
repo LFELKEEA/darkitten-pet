@@ -154,10 +154,16 @@ class MarketplaceDialog(QDialog):
     # ---------- 数据 ----------
 
     def _ensure_loaded(self) -> None:
-        if self.manager.marketplace_releases():
-            return
+        # 每次打开市场都重新拉一次清单。只依赖内存缓存会让窗口一直显示
+        # 程序启动时那一版，安装时也会下到旧版本；更新检查是实时请求，
+        # 所以会出现「市场 1.4.0、更新检查 1.6.1」的不一致。
         if self.manager.load_marketplace():
-            self.status.setText("正在读取插件库…")
+            self.refresh_btn.setEnabled(False)
+            self.status.setText(
+                "正在刷新插件库…"
+                if self.manager.marketplace_releases()
+                else "正在读取插件库…"
+            )
 
     def _reload(self) -> None:
         self._error = ""
@@ -378,6 +384,9 @@ class MarketplaceDialog(QDialog):
     # ---------- 操作 ----------
 
     def _install(self, plugin_id: str) -> None:
+        if self.manager.loading_marketplace:
+            self.status.setText("正在刷新插件库，请稍候再安装。")
+            return
         button = self._buttons.get(plugin_id)
         if not self.manager.install_from_market(plugin_id):
             self.status.setText("另一个安装任务正在进行，请稍候。")

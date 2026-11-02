@@ -209,6 +209,29 @@ class MarketplaceTests(unittest.TestCase):
         )
         self.assertEqual(len(backups), 1)
 
+    def test_market_dialog_refreshes_cached_registry(self) -> None:
+        self._load()
+        self.assertEqual(
+            self.manager.marketplace_release(PLUGIN_ID).version, "1.0.0"
+        )
+
+        archive = build_market_zip(self.root, version="2.0.0")
+        self.registry = write_registry(self.root, archive, version="2.0.0")
+        self.config.set("updates", {"plugin_registry": self.registry.as_uri()})
+
+        dialog = MarketplaceDialog(self.manager)
+        self.addCleanup(dialog.deleteLater)
+        try:
+            self.assertTrue(
+                self._wait(
+                    lambda: self.manager.marketplace_release(PLUGIN_ID) is not None
+                    and self.manager.marketplace_release(PLUGIN_ID).version == "2.0.0"
+                ),
+                "市场窗口没有刷新缓存的旧清单",
+            )
+        finally:
+            dialog.close()
+
     def test_bad_sha_does_not_install(self) -> None:
         self.registry = write_registry(self.root, self.archive, sha256="f" * 64)
         self.config.set("updates", {"plugin_registry": self.registry.as_uri()})
