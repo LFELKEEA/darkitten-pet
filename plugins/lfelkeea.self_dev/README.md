@@ -10,7 +10,7 @@
 - **技能**：把“这种情况该怎么做”沉淀成可复用的做法库，下次直接读；本地没有合适的，就自己上 GitHub 搜索、浏览仓库里的 `SKILL.md` 并安装回来。技能用勾选框开关，关闭后不进入系统提示，也不需要删除。
 - **知识库**：把资料、旧结论、任务总结存进本地文件，用中文或代码关键词检索，并保留 `[K文档#片段]` 引用。
 - **连接器**：接入 HTTP API，或按需启动 MCP stdio 服务器，把外部能力带进任务；缺连接器时会搜 MCP 仓库、读 README、推断 `npx` / `uvx` 启动命令后安装。连接器同样用勾选框开关。
-- **自带目录**：插件内置 44 个技能和 42 个连接器，覆盖 GitHub、GitLab、飞书、Notion、SearXNG、只读 SQL 网关、Context7、Playwright、Blender、各语言包管理器和常用 MCP；也包含 Word / PDF / Excel / PPT 处理、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索、自然化写作，以及 OpenAI 兼容 API、Tavily、arXiv、Crossref、OpenAlex、维基百科。全部默认关闭，勾选后才生效。
+- **自带目录**：插件内置 45 个技能和 43 个连接器，覆盖 GitHub 公开资源（免令牌）、GitHub 自有仓库（令牌）、GitLab、飞书、Notion、SearXNG、只读 SQL 网关、Context7、Playwright、Blender、各语言包管理器和常用 MCP；也包含 Word / PDF / Excel / PPT 处理、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索、自然化写作，以及 OpenAI 兼容 API、Tavily、arXiv、Crossref、OpenAlex、维基百科。全部默认关闭，勾选后才生效。
 - **依赖检查**：启用后可以先查环境变量、启动命令和下载资源；环境变量可本机保存，界面只显示「已配置 / 缺失」，代理只看到名称和状态。MCP 的 npm / PyPI 包、Playwright 浏览器和技能声明的资源可以在确认后预下载。
 - **申请启用**：代理做到一半发现需要某个关闭的技能或连接器时，会说明理由并弹窗申请打开；主人同意后才启用。
 - **联网检索**：不熟悉的库、报错、版本差异，可以搜网页、GitHub 仓库和 PyPI 包。
@@ -58,18 +58,18 @@ data/dev/
 
 ### 开发专区
 
-「开发专区」把插件自带的 44 个技能和 42 个连接器按用途分成五组，每组一个独立界面：
+「开发专区」把插件自带的 45 个技能和 43 个连接器按用途分成五组，每组一个独立界面：
 
 | 分组 | 内容 | 数量 |
 | --- | --- | --- |
 | 编程核心 | 代码评审、测试、调试、Git、发布、安全、工程规范等 | 26 个技能 |
 | 文档与创作 | Word / PDF / Excel / PPT、长文、知识库、draw.io、技术图表、图像、调研、本地搜索、自然化写作 | 12 个技能 |
-| API 专用 | GitHub / 飞书 / Notion / SQL / SearXNG / 网页抓取 | 6 个技能 |
-| HTTP 连接器 | GitHub、包管理器、模型与搜索 API、论文与百科等 | 26 个连接器 |
+| API 专用 | GitHub 公开资源 / GitHub 自有仓库 / 飞书 / Notion / SQL / SearXNG / 网页抓取 | 7 个技能 |
+| HTTP 连接器 | GitHub 公开资源、GitHub 自有仓库、包管理器、模型与搜索 API、论文与百科等 | 27 个连接器 |
 | MCP 连接器 | Context7、文件系统、Git、SQLite、Playwright、Blender 等 | 16 个连接器 |
 
-- 「一键开启推荐套装」：打开 10 个常用开发技能和 7 个常用连接器（列表里带 ★ 标记）。
-- 「全部开启」：打开全部 44 个技能和 42 个连接器。
+- 「一键开启推荐套装」：打开 11 个常用开发技能和 7 个常用连接器（列表里带 ★ 标记）。推荐套装里的 GitHub 是免令牌的公开资源版，不会要求配置 `GITHUB_PAT`。
+- 「全部开启」：打开全部 45 个技能和 43 个连接器。
 - 「全部关闭」：把这批内置条目全部关掉。
 - 每组的「开启本组 / 关闭本组」只影响当前分组；列表里的勾选框可以单独开关，双击可以编辑。
 - 开启只改开关，不会自动申请密钥或安装运行时；缺什么到「环境与依赖」里处理。
@@ -85,7 +85,7 @@ data/dev/
 
 技能默认关闭。资源界面左侧每个技能前都有勾选框，勾选即启用，取消即关闭；`set_skill_enabled(skill_id, true/false)` 也可以让代理自己切换。关闭的技能不会进入系统提示，`read_skill` 也会拒绝读取，但目录和内容仍然保留，随时可以再打开。旧版本没有 `enabled` 字段的技能按启用处理，不会被这次升级误关。
 
-插件还会自动补入 44 个技能，同样默认关闭，统一显示在「开发专区」的编程核心、文档与创作、API 专用三组里。开发类包括：代码评审、GitHub API、飞书 API、Notion API、只读 SQL、SearXNG、网页抓取、MCP 工具链、Git 工作流、Python 工程、前端、API 设计、数据库设计、测试、调试、性能、安全、重构、发布、Docker、Windows 命令行、CLI 设计、Python 打包、技术写作、架构图、视觉设计、3D 建模、数据分析、依赖审计、可访问性、文档维护和技能编写。日常与创作类包括：Word、PDF、Excel、PPT、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索和自然化写作。
+插件还会自动补入 45 个技能，同样默认关闭，统一显示在「开发专区」的编程核心、文档与创作、API 专用三组里。开发类包括：代码评审、GitHub 公开资源、GitHub 自有仓库、飞书 API、Notion API、只读 SQL、SearXNG、网页抓取、MCP 工具链、Git 工作流、Python 工程、前端、API 设计、数据库设计、测试、调试、性能、安全、重构、发布、Docker、Windows 命令行、CLI 设计、Python 打包、技术写作、架构图、视觉设计、3D 建模、数据分析、依赖审计、可访问性、文档维护和技能编写。日常与创作类包括：Word、PDF、Excel、PPT、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索和自然化写作。
 
 技能可以在 frontmatter 里声明 `requires_env` / `requires_commands`，也可以在技能目录放 `requirements.json`：
 
@@ -122,8 +122,13 @@ data/dev/
 
 自带连接器全部默认关闭，统一显示在「开发专区」的 HTTP 连接器和 MCP 连接器两组里：
 
-- HTTP：`github`、`gitlab`、`feishu`、`notion`、`searxng`、`sql-gateway`、`fetch-gateway`、`pypi`、`npm-registry`、`crates-io`、`nuget`、`maven-central`、`rubygems`、`packagist`、`pub-dev`、`dockerhub`、`huggingface`、`stackexchange`、`devto`、`hackernews`、`openai-api`、`tavily`、`arxiv`、`crossref`、`openalex`、`wikipedia`。
+- HTTP：`github-public`、`github`、`gitlab`、`feishu`、`notion`、`searxng`、`sql-gateway`、`fetch-gateway`、`pypi`、`npm-registry`、`crates-io`、`nuget`、`maven-central`、`rubygems`、`packagist`、`pub-dev`、`dockerhub`、`huggingface`、`stackexchange`、`devto`、`hackernews`、`openai-api`、`tavily`、`arxiv`、`crossref`、`openalex`、`wikipedia`。
 - MCP：`context7`、`mcp-filesystem`、`mcp-git`、`mcp-sqlite`、`mcp-playwright`、`mcp-chrome-devtools`、`mcp-fetch`、`mcp-markitdown`、`mcp-duckduckgo`、`mcp-memory`、`mcp-sequential-thinking`、`mcp-time`、`mcp-blender`、`mcp-github`、`mcp-brave-search`、`mcp-everything`。
+
+GitHub 分成两条互不影响的通道：
+
+- `github-public`：浏览别人的公开仓库、issue、PR、release 和文件，只读，不带 `Authorization`，不需要任何令牌。匿名限速约 60 次/小时，搜索接口更低。
+- `github`：操作自己账号下的仓库，支持私有仓库、issue/PR 读写和评论，需要 `GITHUB_PAT`。只是看公开内容时不需要启用它，也不应向用户索要令牌。
 
 密钥只在运行时从环境变量解析，界面和模型看到的普通密钥值会显示为 `***`；响应里如果回显密钥，也会先打码再交给模型。连接器调用和 MCP 工具调用默认需要确认。
 

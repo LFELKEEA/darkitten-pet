@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,7 +16,11 @@ PLUGIN = ROOT / "plugins" / "lfelkeea.self_dev"
 sys.path.insert(0, str(PLUGIN))
 
 from lfelkeea_self_dev import web as web_module  # noqa: E402
-from lfelkeea_self_dev.catalog import BUNDLED_CONNECTORS, BUNDLED_SKILLS  # noqa: E402
+from lfelkeea_self_dev.catalog import (  # noqa: E402
+    BUNDLED_CONNECTORS,
+    BUNDLED_SKILLS,
+    seed_catalog,
+)
 from lfelkeea_self_dev.connectors import ConnectorStore  # noqa: E402
 from lfelkeea_self_dev.knowledge import KnowledgeBase  # noqa: E402
 from lfelkeea_self_dev.net import NetworkError, Response  # noqa: E402
@@ -749,6 +754,7 @@ class BundledCatalogTests(unittest.TestCase):
         self.assertTrue(all(item["enabled"] is False for item in BUNDLED_SKILLS))
         self.assertTrue(all(item["enabled"] is False for item in BUNDLED_CONNECTORS))
         self.assertIn("github", connector_ids)
+        self.assertIn("github-public", connector_ids)
         self.assertIn("feishu", connector_ids)
         self.assertIn("notion", connector_ids)
         self.assertIn("searxng", connector_ids)
@@ -790,6 +796,59 @@ class BundledCatalogTests(unittest.TestCase):
         self.assertEqual(len(items), len(BUNDLED_SKILLS))
         self.assertTrue(all(not item["enabled"] for item in items))
         self.assertIn("关", store.index_text())
+
+    def test_legacy_github_entries_are_renamed_without_losing_settings(self):
+        root = temp_root()
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True)
+        skills = SkillStore(root / "skills", root / ".trash")
+        connectors = ConnectorStore(
+            root / "connectors.json", workspace, root / ".trash"
+        )
+        connectors.save(
+            {
+                "id": "github",
+                "name": "GitHub REST API",
+                "type": "http",
+                "description": "旧描述",
+                "enabled": True,
+                "base_url": "https://api.github.com",
+                "headers": {"Authorization": "Bearer ${GITHUB_PAT}"},
+                "timeout": 45,
+            }
+        )
+        skills.save(
+            "github-rest-api",
+            "GitHub REST API",
+            "旧描述",
+            "# 旧正文\n保留这段内容。\n",
+            enabled=True,
+        )
+
+        seed_catalog(
+            SimpleNamespace(
+                skills=root / "skills",
+                connectors=root / "connectors.json",
+                workspace=workspace,
+                trash=root / ".trash",
+            )
+        )
+
+        own = connectors.get("github")
+        self.assertEqual(own["name"], "GitHub 自己的仓库（令牌）")
+        self.assertTrue(own["enabled"])
+        self.assertEqual(
+            own["headers"]["Authorization"], "Bearer ${GITHUB_PAT}"
+        )
+        public = connectors.get("github-public")
+        self.assertNotIn("Authorization", public["headers"])
+
+        skill = skills.get("github-rest-api")
+        self.assertEqual(skill["name"], "GitHub 自己的仓库（令牌）")
+        self.assertTrue(skill["enabled"])
+        self.assertEqual(skill["requires_env"], ["GITHUB_PAT"])
+        self.assertIn("保留这段内容", skill["body"])
+        self.assertTrue((root / "skills" / "github-public-api" / "SKILL.md").is_file())
 
 
 class SettingsTests(unittest.TestCase):

@@ -40,17 +40,54 @@ BUNDLED_SKILLS: list[dict[str, Any]] = [
 """,
     },
     {
+        "id": "github-public-api",
+        "name": "GitHub 公开资源（免令牌）",
+        "description": "浏览别人的公开仓库、issue、PR、release 和源码文件；只读，不需要令牌。",
+        "enabled": False,
+        "body": """# 适用场景
+看公开仓库的 README、目录、源码、issue、PR、release，或搜索公开仓库。
+不需要登录，也不要向用户索要 GitHub 令牌。
+
+# 连接器
+使用 `github-public` 连接器（`https://api.github.com`，不带 Authorization）。
+只读；不要在这里做写操作或访问私有仓库。
+
+# 常用请求
+- 仓库信息：`call_connector("github-public", "repos/OWNER/REPO")`
+- 目录/文件：`repos/OWNER/REPO/contents/PATH?ref=BRANCH`，返回 base64，需要解码
+- 列 issue：`repos/OWNER/REPO/issues`, query `{"state": "open", "per_page": 30}`
+- issue 详情/评论：`repos/OWNER/REPO/issues/NUMBER`、`repos/OWNER/REPO/issues/NUMBER/comments`
+- 列 PR：`repos/OWNER/REPO/pulls`, query `{"state": "open"}`
+- PR diff：同一路径，额外 header `{"Accept": "application/vnd.github.diff"}`
+- 最新 release：`repos/OWNER/REPO/releases/latest`
+- 搜仓库：`search/repositories`, query `{"q": "关键词", "sort": "stars", "per_page": 10}`
+- 搜 issue：`search/issues`, query `{"q": "repo:OWNER/REPO 关键词"}`
+
+# 限制
+- 匿名限速约 60 次/小时（按出口 IP），搜索接口更低；遇到 403/429 就停下说明，不要反复重试。
+- 只能读公开资源。私有仓库、写 issue/评论、代码搜索需要令牌，改用 `github` 连接器并配置 `GITHUB_PAT`。
+- 分页用 `per_page` 和 `page`，不要把第一页当成全部。
+
+# 检查点
+- 先确认 owner/repo 拼写和分支名；404 多半是路径、分支或大小写问题。
+- 不把匿名限速说成“登录失败”，也不要因此向用户要令牌。
+- 只读，不新建 issue、不发评论。
+""",
+    },
+    {
         "id": "github-rest-api",
-        "name": "GitHub REST API",
-        "description": "通过 github 连接器查 issue、PR、仓库文件，或在用户确认后新建 issue。",
+        "name": "GitHub 自己的仓库（令牌）",
+        "description": "操作自己账号下的仓库：私有仓库、issue/PR 读写、发评论；需要 GITHUB_PAT。",
         "enabled": False,
         "requires_env": ["GITHUB_PAT"],
         "body": """# 适用场景
-需要读取 GitHub 仓库信息、issue、PR、源码文件，或记录一个待办 issue。
+操作自己账号下的 GitHub 仓库：读私有仓库、查自己可见的 issue/PR、新建 issue、发评论等写操作。
+只是浏览别人的公开仓库时，改用免令牌的 `github-public-api`，不要向用户要令牌。
 
 # 连接器
-优先使用 `github` 连接器，环境变量 `GITHUB_PAT`。
-只读场景令牌只勾选 repo:status、repo:contents；写入才需要 issue 写权限。
+使用 `github` 连接器，环境变量 `GITHUB_PAT`。
+只读自己的仓库：fine-grained token 勾选目标仓库的 Contents / Issues / Pull requests 只读；
+需要写 issue 或评论时再给 Issues 写权限。经典 token 私有仓库用 `repo`，只碰公开仓库用 `public_repo`。
 
 # 常用请求
 - 列 issue：`call_connector("github", "repos/OWNER/REPO/issues", query={"state": "open", "per_page": 30})`
@@ -60,13 +97,13 @@ BUNDLED_SKILLS: list[dict[str, Any]] = [
 - PR 详情：`repos/OWNER/REPO/pulls/NUMBER`
 - PR diff：同一路径，额外 header `{"Accept": "application/vnd.github.diff"}`
 - 仓库文件：`repos/OWNER/REPO/contents/PATH?ref=BRANCH`，返回 base64，需要解码
-- 搜索代码：`search/code?q=...`（需要相应权限）
+- 搜索代码：`search/code?q=...`（必须带令牌）
 - 新建 issue（写入）：POST `repos/OWNER/REPO/issues`，body 至少含 title
 
 # 检查点
-- 分页用 `per_page` 和 `page`，不要把第一页当成全部。
+- 401 先检查 `GITHUB_PAT` 是否配置、是否过期；403 看令牌权限和仓库范围。
 - 404 先确认 owner/repo/分支大小写和私有权限。
-- 新建 issue 前把标题和正文给用户确认，不要自动提交。
+- 新建 issue、发评论前把内容给用户确认，不要自动提交。
 - 不把令牌写进命令、日志或回答；只引用环境变量名。
 """,
     },
@@ -1327,10 +1364,23 @@ token 只有约 2 小时有效期，优先在平台侧自动刷新，不要手�
 
 BUNDLED_CONNECTORS: list[dict[str, Any]] = [
     {
-        "id": "github",
-        "name": "GitHub REST API",
+        "id": "github-public",
+        "name": "GitHub 公开资源（免令牌）",
         "type": "http",
-        "description": "读取仓库、issue、PR、文件；写入 issue 前需确认。环境变量：GITHUB_PAT。",
+        "description": "浏览别人的公开仓库、issue、PR、release 和文件；只读，不需要令牌。匿名限速约 60 次/小时。",
+        "enabled": False,
+        "base_url": "https://api.github.com",
+        "headers": {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        "timeout": 45,
+    },
+    {
+        "id": "github",
+        "name": "GitHub 自己的仓库（令牌）",
+        "type": "http",
+        "description": "操作自己账号下的仓库：私有仓库、issue、PR、文件读写。环境变量：GITHUB_PAT。",
         "enabled": False,
         "base_url": "https://api.github.com",
         "headers": {
@@ -1805,6 +1855,7 @@ BUNDLED_CONNECTORS: list[dict[str, Any]] = [
 # 推荐套装覆盖写代码、测试、调试、Git、发布、安全和常用 MCP 工具。
 DEV_STARTER_SKILL_IDS = [
     "code-review-agent",
+    "github-public-api",
     "python-project-craft",
     "testing-strategy",
     "debugging-playbook",
@@ -1817,7 +1868,7 @@ DEV_STARTER_SKILL_IDS = [
 ]
 
 DEV_STARTER_CONNECTOR_IDS = [
-    "github",
+    "github-public",
     "pypi",
     "npm-registry",
     "context7",
@@ -1885,8 +1936,9 @@ DEV_SKILL_GROUPS: list[dict[str, Any]] = [
         "key": "api",
         "title": "API 专用",
         "kind": "skill",
-        "hint": "通过具体 API 或网关完成任务；启用前先在「环境与依赖」配置变量。",
+        "hint": "GitHub 公开资源免令牌，自有仓库和写操作才需要令牌；其余条目先在「环境与依赖」配置变量。",
         "ids": [
+            "github-public-api",
             "github-rest-api",
             "feishu-open-api",
             "notion-api",
@@ -1902,8 +1954,9 @@ DEV_CONNECTOR_GROUPS: list[dict[str, Any]] = [
         "key": "http",
         "title": "HTTP 连接器",
         "kind": "connector",
-        "hint": "直接请求 HTTP API。带密钥的条目需要先在「环境与依赖」填写环境变量。",
+        "hint": "直接请求 HTTP API。GitHub 公开资源免令牌；带密钥的条目需要先在「环境与依赖」填写环境变量。",
         "ids": [
+            "github-public",
             "github",
             "gitlab",
             "feishu",
@@ -1968,6 +2021,51 @@ DEV_CONNECTOR_ID_SET = frozenset(DEV_CONNECTOR_IDS)
 DEV_STARTER_SKILL_ID_SET = frozenset(DEV_STARTER_SKILL_IDS)
 DEV_STARTER_CONNECTOR_ID_SET = frozenset(DEV_STARTER_CONNECTOR_IDS)
 
+LEGACY_GITHUB_DEFAULT_NAME = "GitHub REST API"
+GITHUB_OWN_SKILL_NAME = "GitHub 自己的仓库（令牌）"
+GITHUB_OWN_SKILL_DESCRIPTION = (
+    "操作自己账号下的仓库：私有仓库、issue/PR 读写、发评论；需要 GITHUB_PAT。"
+)
+GITHUB_OWN_CONNECTOR_NAME = "GitHub 自己的仓库（令牌）"
+GITHUB_OWN_CONNECTOR_DESCRIPTION = (
+    "操作自己账号下的仓库：私有仓库、issue、PR、文件读写。环境变量：GITHUB_PAT。"
+)
+
+
+def _migrate_legacy_github_split(skills: Any, connectors: Any) -> int:
+    """把 1.6.1 及更早的 GitHub 条目改成“自有仓库（令牌）”的命名。
+
+    只处理仍叫旧默认名 “GitHub REST API” 的条目；用户改过名字的不动，
+    开关、请求头、正文和资源都原样保留。
+    """
+    changed = 0
+    for item in connectors.list():
+        if item.get("id") != "github" or item.get("name") != LEGACY_GITHUB_DEFAULT_NAME:
+            continue
+        payload = dict(item)
+        payload["name"] = GITHUB_OWN_CONNECTOR_NAME
+        payload["description"] = GITHUB_OWN_CONNECTOR_DESCRIPTION
+        connectors.save(payload)
+        changed += 1
+    for item in skills.list():
+        if (
+            item.get("id") != "github-rest-api"
+            or item.get("name") != LEGACY_GITHUB_DEFAULT_NAME
+        ):
+            continue
+        full = skills.get("github-rest-api")
+        skills.save(
+            "github-rest-api",
+            GITHUB_OWN_SKILL_NAME,
+            GITHUB_OWN_SKILL_DESCRIPTION,
+            str(full.get("body") or ""),
+            enabled=bool(full.get("enabled")),
+            requires_env=full.get("requires_env") or ["GITHUB_PAT"],
+            requires_commands=full.get("requires_commands"),
+        )
+        changed += 1
+    return changed
+
 
 def seed_catalog(paths: Any) -> dict[str, int]:
     """把自带目录补进数据目录，返回新增数量；同 id 不覆盖。"""
@@ -1976,7 +2074,12 @@ def seed_catalog(paths: Any) -> dict[str, int]:
 
     skills = SkillStore(paths.skills, paths.trash)
     connectors = ConnectorStore(paths.connectors, paths.workspace, paths.trash)
-    return {
+    result = {
         "skills": skills.seed_bundled(BUNDLED_SKILLS),
         "connectors": connectors.seed_bundled(BUNDLED_CONNECTORS),
     }
+    try:
+        _migrate_legacy_github_split(skills, connectors)
+    except Exception:
+        pass
+    return result

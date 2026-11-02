@@ -668,6 +668,7 @@ class UiSmokeTests(unittest.TestCase):
 
         from lfelkeea_self_dev.catalog import (
             BUNDLED_CONNECTORS,
+            BUNDLED_SKILLS,
             DEV_CONNECTOR_GROUPS,
             DEV_CONNECTOR_IDS,
             DEV_GROUPS,
@@ -688,10 +689,10 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(sorted(grouped_skills), sorted(DEV_SKILL_IDS))
         self.assertEqual(sorted(grouped_connectors), sorted(DEV_CONNECTOR_IDS))
         self.assertEqual(
-            [len(group["ids"]) for group in DEV_SKILL_GROUPS], [26, 12, 6]
+            [len(group["ids"]) for group in DEV_SKILL_GROUPS], [26, 12, 7]
         )
         self.assertEqual(
-            [len(group["ids"]) for group in DEV_CONNECTOR_GROUPS], [26, 16]
+            [len(group["ids"]) for group in DEV_CONNECTOR_GROUPS], [27, 16]
         )
         connector_types = {
             item["id"]: item["type"] for item in BUNDLED_CONNECTORS
@@ -700,6 +701,21 @@ class UiSmokeTests(unittest.TestCase):
             expected = "http" if group["key"] == "http" else "mcp"
             for item_id in group["ids"]:
                 self.assertEqual(connector_types[item_id], expected, item_id)
+
+        connectors = {item["id"]: item for item in BUNDLED_CONNECTORS}
+        self.assertNotIn("Authorization", connectors["github-public"]["headers"])
+        self.assertEqual(
+            connectors["github"]["headers"]["Authorization"],
+            "Bearer ${GITHUB_PAT}",
+        )
+        skills = {item["id"]: item for item in BUNDLED_SKILLS}
+        self.assertNotIn("requires_env", skills["github-public-api"])
+        self.assertEqual(
+            skills["github-rest-api"]["requires_env"], ["GITHUB_PAT"]
+        )
+        self.assertIn("github-public-api", DEV_STARTER_SKILL_IDS)
+        self.assertIn("github-public", DEV_STARTER_CONNECTOR_IDS)
+        self.assertNotIn("github", DEV_STARTER_CONNECTOR_IDS)
 
         root = Path(tempfile.mkdtemp())
         for name in ("workspace", "skills", "knowledge", ".trash"):
