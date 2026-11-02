@@ -116,6 +116,8 @@ data/dev/
 - `http`：固定 `base_url`，调用时拼相对路径和查询参数；请求头里可以用 `${ENV_NAME}` 引用环境变量。整个 `base_url` 也可以写成 `${ENV_NAME}`，适合自托管 SearXNG 或 SQL 网关。
 - `mcp`：填写命令、参数、环境变量和工作目录，插件会按需启动 stdio 服务器，完成 `initialize → tools/list → tools/call` 后关闭。
 
+旧版手工写成 `{{ENV_NAME}}` 的占位符会在读取和保存时自动迁移为 `${ENV_NAME}`，依赖检查也会重新识别；这样请求头不会把变量名当令牌原样发出去。
+
 连接器默认关闭。资源界面左侧勾选即启用，取消即关闭；`set_connector_enabled(connector_id, true/false)` 同样可用。关闭的连接器不会进入系统提示，`call_connector` / `mcp_tools` / `call_mcp_tool` 会直接拒绝，但定义仍保留在 `connectors.json` 里。
 
 自带连接器全部默认关闭，统一显示在「开发专区」的 HTTP 连接器和 MCP 连接器两组里：

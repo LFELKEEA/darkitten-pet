@@ -25,6 +25,16 @@ from .resource_util import RESOURCE_ID_RE, ResourceError, atomic_write, inside, 
 MCP_PROTOCOL = "2025-06-18"
 CLIENT_INFO = {"name": "LFELKEEA-SelfDev", "version": "1.2.0"}
 MAX_CONNECTOR_BYTES = 120_000
+LEGACY_ENV_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def _normalize_env_refs(value: Any) -> str:
+    """把旧写法 {{NAME}} 统一成 ${NAME}。
+
+    早期手工编辑或旧版说明里出现过双花括号，运行时只认 ${NAME}，
+    旧写法会原样发给接口（例如 GitHub 直接 401）。这里在加载和保存时兜底迁移。
+    """
+    return LEGACY_ENV_RE.sub(r"${\1}", str(value))
 
 
 def _as_timeout(value: Any, fallback: int = 45) -> int:
@@ -198,7 +208,7 @@ class ConnectorStore:
             "timeout": _as_timeout(raw.get("timeout")),
         }
         if kind == "http":
-            base_url = str(raw.get("base_url") or "").strip()
+            base_url = _normalize_env_refs(raw.get("base_url") or "").strip()
             if not re.match(r"^https?://", base_url, re.IGNORECASE) and not re.fullmatch(
                 r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", base_url
             ):
@@ -211,7 +221,10 @@ class ConnectorStore:
             item.update(
                 {
                     "base_url": base_url.rstrip("/"),
-                    "headers": {str(key): str(value) for key, value in headers.items()},
+                    "headers": {
+                        str(key): _normalize_env_refs(value)
+                        for key, value in headers.items()
+                    },
                     "allow_private": bool(raw.get("allow_private", False)),
                 }
             )
@@ -234,7 +247,10 @@ class ConnectorStore:
                 {
                     "command": command,
                     "args": [str(part) for part in args],
-                    "env": {str(key): str(value) for key, value in env.items()},
+                    "env": {
+                        str(key): _normalize_env_refs(value)
+                        for key, value in env.items()
+                    },
                     "cwd": cwd,
                 }
             )

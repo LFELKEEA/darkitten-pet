@@ -262,6 +262,33 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn("demo.api", store.index_text())
         self.assertNotIn("plain-token", json.dumps(public, ensure_ascii=False))
 
+    def test_legacy_double_brace_env_refs_are_migrated(self):
+        store, _root = self._store()
+        item = store.save(
+            {
+                "id": "legacy.api",
+                "type": "http",
+                "base_url": "{{DEMO_BASE_URL}}",
+                "headers": {"Authorization": "Bearer {{DEMO_TOKEN}}"},
+            }
+        )
+        self.assertEqual(item["base_url"], "${DEMO_BASE_URL}")
+        self.assertEqual(item["headers"]["Authorization"], "Bearer ${DEMO_TOKEN}")
+        self.assertEqual(
+            ConnectorStore.public(store.get("legacy.api"))["headers"]["Authorization"],
+            "Bearer ${DEMO_TOKEN}",
+        )
+        store.save(
+            {
+                "id": "legacy.mcp",
+                "type": "mcp",
+                "command": "npx",
+                "args": ["-y", "demo-mcp"],
+                "env": {"DEMO_TOKEN": "{{DEMO_TOKEN}}"},
+            }
+        )
+        self.assertEqual(store.get("legacy.mcp")["env"]["DEMO_TOKEN"], "${DEMO_TOKEN}")
+
     def test_http_call_expands_env_and_redacts_response(self):
         store, _root = self._store()
         store.save(
