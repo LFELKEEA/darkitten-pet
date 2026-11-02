@@ -149,6 +149,11 @@ class KnowledgeBaseTests(unittest.TestCase):
         self.assertEqual(result["title"], "note")
         self.assertEqual(kb.get_document(result["id"])["kind"], "file")
 
+        binary = root / "image.bin"
+        binary.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00")
+        with self.assertRaises(ResourceError):
+            kb.import_file(binary)
+
         title, backup = kb.archive_and_delete(result["id"], root / ".trash")
         self.assertEqual(title, "note")
         self.assertTrue(backup.is_file())

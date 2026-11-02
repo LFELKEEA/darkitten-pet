@@ -174,6 +174,12 @@ class KnowledgeBase:
             raise ResourceError(f"文件不存在：{target}")
         if target.stat().st_size > 4 * 1024 * 1024:
             raise ResourceError("文件超过 4 MB，请先提取需要的部分。")
+        try:
+            with target.open("rb") as handle:
+                if b"\x00" in handle.read(4096):
+                    raise ResourceError("文件看起来是二进制，知识库只收文本。")
+        except OSError as exc:
+            raise ResourceError(f"读不了文件：{exc}") from exc
         text = read_text(target)
         return self.add_document(
             title or target.stem,

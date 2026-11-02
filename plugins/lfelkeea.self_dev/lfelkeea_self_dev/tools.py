@@ -1125,6 +1125,8 @@ class ToolBox:
             raise ToolError(f"文件不存在：{path}")
         if target.stat().st_size > 2 * 1024 * 1024:
             raise ToolError("文件超过 2 MB，请先提取需要的部分。")
+        if self._is_binary(target):
+            raise ToolError("这个文件看起来是二进制，知识库只收文本；请先提取正文。")
         text = self._read_text(target)
         return self.tool_import_knowledge(
             title or target.stem, text, source=self._rel(target), kind="file"
