@@ -150,12 +150,20 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
         "desc": "按关键词搜索技能正文，找到该用哪个技能。",
     },
     "save_skill": {
-        "usage": 'save_skill(skill_id, name, description, body, resources={})',
-        "desc": "新建或更新技能；resources 是 {相对路径: 文本}，可放 references/、templates/。",
+        "usage": 'save_skill(skill_id, name, description, body, resources={}, enabled=null)',
+        "desc": "新建或更新技能；新建默认启用，更新时省略 enabled 会保持原状态。",
     },
     "delete_skill": {
         "usage": "delete_skill(skill_id)",
         "desc": "删除技能（会移到回收目录，且必须主人确认）。",
+    },
+    "set_skill_enabled": {
+        "usage": "set_skill_enabled(skill_id, enabled)",
+        "desc": "打开或关闭一个技能；关闭的技能不会进入系统提示，也不会被读取。",
+    },
+    "set_connector_enabled": {
+        "usage": "set_connector_enabled(connector_id, enabled)",
+        "desc": "打开或关闭一个连接器；关闭的连接器不能调用。",
     },
     "search_skills_online": {
         "usage": 'search_skills_online(query="", limit=8)',
@@ -166,8 +174,8 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
         "desc": "列出一个 GitHub 仓库里的 SKILL.md 路径（一个仓库可能有多个技能）。",
     },
     "install_skill": {
-        "usage": 'install_skill(repo, path, ref="", skill_id="")',
-        "desc": "从 GitHub 安装一个技能（SKILL.md 和同目录文本资源）；需要主人确认。",
+        "usage": 'install_skill(repo, path, ref="", skill_id="", enabled=false)',
+        "desc": "从 GitHub 安装一个技能（默认关闭）；需要主人确认。",
     },
     "read_repo_file": {
         "usage": 'read_repo_file(repo, path, ref="")',
@@ -178,8 +186,8 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
         "desc": "搜索 GitHub 上的 MCP 服务器，找现成连接器。",
     },
     "install_mcp_server": {
-        "usage": 'install_mcp_server(package, connector_id="", command="", args=[], env={}, description="")',
-        "desc": "按 npm/PyPI 包名生成并保存 MCP 连接器；需要主人确认。",
+        "usage": 'install_mcp_server(package, connector_id="", command="", args=[], env={}, description="", enabled=false)',
+        "desc": "按 npm/PyPI 包名生成并保存 MCP 连接器（默认关闭）；需要主人确认。",
     },
     "list_connectors": {
         "usage": "list_connectors()",
@@ -198,7 +206,7 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
         "desc": "调用 MCP 服务器上的一个工具。",
     },
     "save_connector": {
-        "usage": "save_connector(payload)",
+        "usage": 'save_connector(payload, enabled=true)',
         "desc": "新建或更新连接器定义（HTTP 或 MCP），密钥请用 ${ENV_NAME} 引用环境变量。",
     },
     "delete_connector": {
@@ -881,13 +889,36 @@ class ToolBox:
     # ---------------------------------------------------------- 技能
 
     def tool_list_skills(self) -> str:
-        return self.skills.index_text()
+        items = self.skills.list()
+        if not items:
+            return "（还没有技能。可以用 save_skill 新建，或在线搜索安装。）"
+        active = sum(1 for item in items if item.get("enabled"))
+        lines = [f"技能（共 {len(items)} 个，已启用 {active} 个）："]
+        for item in items:
+            state = "开" if item.get("enabled") else "关"
+            lines.append(
+                f"- [{state}] `{item['id']}` — {item['name']}：{item['description']}"
+            )
+        lines.append("关闭的技能不会进入系统提示；用 set_skill_enabled(skill_id, true) 打开。")
+        return "\n".join(lines)
+
+    def tool_set_skill_enabled(self, skill_id: str, enabled: bool = True) -> str:
+        try:
+            skill = self.skills.set_enabled(skill_id, bool(enabled))
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        state = "已启用" if skill.get("enabled") else "已关闭"
+        return f"技能 {skill['id']}「{skill['name']}」{state}。"
 
     def tool_read_skill(self, skill_id: str, resource: str = "") -> str:
         try:
+            skill = self.skills.get(skill_id)
+            if not skill.get("enabled"):
+                raise ToolError(
+                    f"技能 {skill_id} 处于关闭状态；需要时用 set_skill_enabled('{skill_id}', true) 打开。"
+                )
             if str(resource or "").strip():
                 return self.skills.read_resource(skill_id, resource)
-            skill = self.skills.get(skill_id)
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
         extras = [name for name in skill["files"] if name != "SKILL.md"]
@@ -903,11 +934,13 @@ class ToolBox:
 
     def tool_search_skills(self, query: str, limit: int = 10) -> str:
         try:
-            hits = self.skills.search(query, limit=limit)
+            hits = self.skills.search(query, limit=limit, include_disabled=False)
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
         if not hits:
-            return f"没有找到和「{query}」相关的技能。可以用 list_skills 看全部。"
+            disabled = sum(1 for item in self.skills.list() if not item.get("enabled"))
+            extra = f"还有 {disabled} 个关闭的技能，可在资源界面打开。" if disabled else ""
+            return f"没有找到和「{query}」相关的已启用技能。可以用 list_skills 看全部。{extra}"
         lines = [f"找到 {len(hits)} 个相关技能："]
         for item in hits:
             lines.append(f"- `{item['id']}` — {item['name']}：{item['description']}")
@@ -921,18 +954,27 @@ class ToolBox:
         description: str = "",
         body: str = "",
         resources: Any = None,
+        enabled: bool | None = None,
     ) -> str:
+        if enabled is None:
+            try:
+                enabled = self.skills.get(skill_id).get("enabled", True)
+            except ResourceError:
+                enabled = True
         try:
-            skill = self.skills.save(skill_id, name, description, body, resources)
+            skill = self.skills.save(
+                skill_id, name, description, body, resources, enabled=bool(enabled)
+            )
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
         self.changed_files.append(f"data/dev/skills/{skill['id']}")
         extras = [item for item in skill["files"] if item != "SKILL.md"]
+        state = "已启用" if skill.get("enabled") else "默认关闭，需要时在资源界面打开"
         return (
             f"已保存技能 {skill['id']}「{skill['name']}」"
             f"（正文 {len(skill['body'])} 字"
             + (f"，附件：{'、'.join(extras)}" if extras else "")
-            + "）。系统提示里的技能索引会在下一轮生效。"
+            + f"；{state}）。系统提示里的技能索引会在下一轮生效。"
         )
 
     def tool_delete_skill(self, skill_id: str) -> str:
@@ -1028,6 +1070,7 @@ class ToolBox:
         path: str,
         ref: str = "",
         skill_id: str = "",
+        enabled: bool = False,
     ) -> str:
         self._require_network()
         try:
@@ -1057,14 +1100,20 @@ class ToolBox:
                 description,
                 data["body"],
                 data["resources"],
+                enabled=bool(enabled),
             )
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
         self.changed_files.append(f"data/dev/skills/{saved['id']}")
         skipped = f"；跳过 {len(data['skipped'])} 个二进制或超大文件" if data["skipped"] else ""
+        state = (
+            "已启用"
+            if saved.get("enabled")
+            else f"默认关闭，需要时用 set_skill_enabled('{saved['id']}', true) 打开"
+        )
         return (
             f"已安装技能 {saved['id']}「{saved['name']}」（来源 {repo}/{data['path']}"
-            f"{skipped}）。现在可以用 read_skill('{saved['id']}') 读取。"
+            f"{skipped}；{state}）。"
         )
 
     # ---------------------------------------------------------- 连接器
@@ -1072,6 +1121,18 @@ class ToolBox:
     @staticmethod
     def _public_connector(item: dict[str, Any]) -> dict[str, Any]:
         return ConnectorStore.public(item)
+
+    def _require_enabled_connector(self, connector_id: str) -> dict[str, Any]:
+        try:
+            item = self.connectors.get(connector_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if not item.get("enabled"):
+            raise ToolError(
+                f"连接器 {connector_id} 处于关闭状态；需要时用 "
+                f"set_connector_enabled('{connector_id}', true) 打开。"
+            )
+        return item
 
     def tool_list_connectors(self) -> str:
         items = self.connectors.list()
@@ -1081,12 +1142,30 @@ class ToolBox:
                 "HTTP 连接器示例：{\"id\":\"github\",\"type\":\"http\","
                 "\"base_url\":\"https://api.github.com\",\"headers\":{\"Authorization\":\"Bearer ${GITHUB_TOKEN}\"}}"
             )
-        lines = [f"连接器（{len(items)} 个）："]
+        enabled = [item for item in items if item.get("enabled")]
+        lines = [f"连接器（{len(items)} 个，已启用 {len(enabled)} 个）："]
         for item in items:
             kind = "HTTP" if item["type"] == "http" else "MCP"
-            lines.append(f"- `{item['id']}`（{kind}）{item['name']}：{item.get('description', '')}")
+            state = "开" if item.get("enabled") else "关"
+            lines.append(
+                f"- [{state}] `{item['id']}`（{kind}）{item['name']}：{item.get('description', '')}"
+            )
             lines.append(json.dumps(self._public_connector(item), ensure_ascii=False, indent=2))
+        if len(enabled) < len(items):
+            lines.append(
+                f"有 {len(items) - len(enabled)} 个连接器处于关闭状态，不会出现在系统提示里，"
+                "也不能调用。需要时用 set_connector_enabled(connector_id, true) 打开，不要删除。"
+            )
         return "\n".join(lines)
+
+    def tool_set_connector_enabled(self, connector_id: str, enabled: bool = True) -> str:
+        try:
+            item = self.connectors.set_enabled(connector_id, bool(enabled))
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        self.changed_files.append("data/dev/connectors.json")
+        state = "已启用" if item.get("enabled") else "已关闭"
+        return f"连接器 {item['id']}「{item['name']}」{state}。"
 
     def tool_save_connector(self, payload: Any = None, **fields: Any) -> str:
         if isinstance(payload, str):
@@ -1100,7 +1179,12 @@ class ToolBox:
             payload = {**fields, **payload}
         if not isinstance(payload, dict):
             raise ToolError("payload 必须是连接器 JSON 对象。")
-        connector_id = str(payload.get("id") or "").strip() or "新连接器"
+        payload = dict(payload)
+        wanted_id = str(payload.get("id") or "").strip()
+        existing = any(item["id"] == wanted_id for item in self.connectors.list())
+        if not existing:
+            payload.setdefault("enabled", True)
+        connector_id = wanted_id or "新连接器"
         if not self._approve(
             "save_connector",
             "保存连接器",
@@ -1114,8 +1198,13 @@ class ToolBox:
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
         self.changed_files.append("data/dev/connectors.json")
+        state = (
+            "已启用"
+            if saved.get("enabled")
+            else f"已关闭，需要时用 set_connector_enabled('{saved['id']}', true) 打开"
+        )
         return (
-            f"已保存连接器 {saved['id']}（{saved['type']}）。\n"
+            f"已保存连接器 {saved['id']}（{saved['type']}；{state}）。\n"
             + json.dumps(self._public_connector(saved), ensure_ascii=False, indent=2)
             + "\n下一轮任务会看到这个连接器。"
         )
@@ -1169,6 +1258,7 @@ class ToolBox:
         args: Any = None,
         env: Any = None,
         description: str = "",
+        enabled: bool = False,
     ) -> str:
         if not str(command or "").strip():
             self._require_network()
@@ -1211,6 +1301,7 @@ class ToolBox:
             "args": resolved["args"],
             "env": {str(key): str(value) for key, value in (env or {}).items()},
             "timeout": 60,
+            "enabled": bool(enabled),
         }
         if not self._approve(
             "install_mcp_server",
@@ -1225,8 +1316,13 @@ class ToolBox:
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
         self.changed_files.append("data/dev/connectors.json")
+        state = (
+            "已启用"
+            if saved.get("enabled")
+            else f"默认关闭，需要时用 set_connector_enabled('{saved['id']}', true) 打开"
+        )
         return (
-            f"已保存 MCP 连接器 {saved['id']}：{executable} {' '.join(saved['args'])}"
+            f"已保存 MCP 连接器 {saved['id']}：{executable} {' '.join(saved['args'])}（{state}）"
             "\n下一步：mcp_tools(connector_id) 检查它实际提供的工具；参数不对时用 save_connector 修正。"
         )
 
@@ -1241,6 +1337,7 @@ class ToolBox:
     ) -> str:
         self._require_network()
         self._require_connectors()
+        self._require_enabled_connector(connector_id)
         if not self._approve(
             "call_connector",
             "调用 HTTP 连接器",
@@ -1268,6 +1365,7 @@ class ToolBox:
 
     def tool_mcp_tools(self, connector_id: str) -> str:
         self._require_connectors()
+        self._require_enabled_connector(connector_id)
         if not self._approve(
             "mcp_tools",
             "读取 MCP 工具",
@@ -1294,6 +1392,7 @@ class ToolBox:
 
     def tool_call_mcp_tool(self, connector_id: str, tool: str, arguments: Any = None) -> str:
         self._require_connectors()
+        self._require_enabled_connector(connector_id)
         name = str(tool or "").strip()
         if not name:
             raise ToolError("tool 不能为空。")

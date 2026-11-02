@@ -7,9 +7,10 @@
 ## 它能做什么
 
 - 在专属开发区里读文件、搜代码、改文件、跑命令、查语法、读网页。
-- **技能**：把“这种情况该怎么做”沉淀成可复用的做法库，下次直接读；本地没有合适的，就自己上 GitHub 搜索、浏览仓库里的 `SKILL.md` 并安装回来。
+- **技能**：把“这种情况该怎么做”沉淀成可复用的做法库，下次直接读；本地没有合适的，就自己上 GitHub 搜索、浏览仓库里的 `SKILL.md` 并安装回来。技能用勾选框开关，关闭后不进入系统提示，也不需要删除。
 - **知识库**：把资料、旧结论、任务总结存进本地文件，用中文或代码关键词检索，并保留 `[K文档#片段]` 引用。
-- **连接器**：接入 HTTP API，或按需启动 MCP stdio 服务器，把外部能力带进任务；缺连接器时会搜 MCP 仓库、读 README、推断 `npx` / `uvx` 启动命令后安装。
+- **连接器**：接入 HTTP API，或按需启动 MCP stdio 服务器，把外部能力带进任务；缺连接器时会搜 MCP 仓库、读 README、推断 `npx` / `uvx` 启动命令后安装。连接器同样用勾选框开关。
+- **自带目录**：插件内置 31 个开发技能和 36 个连接器，覆盖 GitHub、GitLab、飞书、Notion、SearXNG、只读 SQL 网关、Context7、Playwright、Blender、各语言包管理器和常用 MCP；全部默认关闭，勾选后才生效。
 - **联网检索**：不熟悉的库、报错、版本差异，可以搜网页、GitHub 仓库和 PyPI 包。
 - 不限制步数和输出长度：一直做到任务完成，而不是数到 24 步就收工。
 - 把成果直接做成新的桌宠插件：写入 `data/plugins/<id>/`，通过检查后自动启用并重载。
@@ -54,11 +55,15 @@ data/dev/
 
 ### 技能
 
-技能是一个带 `SKILL.md` 的目录，文件头用 YAML 写 `name` 和 `description`，正文写适用场景、步骤和检查点。首次运行会放入三个示例技能：
+技能是一个带 `SKILL.md` 的目录，文件头用 YAML 写 `name`、`description` 和 `enabled`，正文写适用场景、步骤和检查点。首次运行会放入三个示例技能：
 
 - `pet-plugin-craft`：桌宠插件开发流程；
 - `verify-before-finish`：交付前自检；
 - `research-before-coding`：先查官方文档再写代码。
+
+技能默认关闭。资源界面左侧每个技能前都有勾选框，勾选即启用，取消即关闭；`set_skill_enabled(skill_id, true/false)` 也可以让代理自己切换。关闭的技能不会进入系统提示，`read_skill` 也会拒绝读取，但目录和内容仍然保留，随时可以再打开。旧版本没有 `enabled` 字段的技能按启用处理，不会被这次升级误关。
+
+插件还会自动补入 31 个开发技能，同样默认关闭，包括：代码评审、GitHub API、飞书 API、Notion API、只读 SQL、SearXNG、网页抓取、MCP 工具链、Git 工作流、Python 工程、前端、API 设计、数据库设计、测试、调试、性能、安全、重构、发布、Docker、Windows 命令行、CLI 设计、Python 打包、技术写作、架构图、视觉设计、3D 建模、数据分析、依赖审计、可访问性和文档维护。
 
 代理用 `list_skills` / `read_skill` / `search_skills` 读取，用 `save_skill` 沉淀新做法。技能正文上限 4 万字，超过时把细节拆到 `references/` 资源里。
 
@@ -66,7 +71,7 @@ data/dev/
 
 1. `search_skills_online(query)` 搜索带技能生态的仓库；
 2. `list_repo_skills(repo)` 列出仓库里的全部 `SKILL.md`；
-3. `install_skill(repo, path)` 拉取正文和同目录的 `references/` / `scripts/` / `assets/` 文本资源，写进本地技能库。
+3. `install_skill(repo, path)` 拉取正文和同目录的 `references/` / `scripts/` / `assets/` 文本资源，写进本地技能库（默认关闭，需要时再打开）。
 
 安装有大小和数量上限（单个附件 64 KB、每个技能最多 16 个附件、总计 256 KB），二进制和超大文件直接跳过；同名技能会自动加 `-2`、`-3` 后缀，不会覆盖已有的。外部技能只是参考材料，里面如果出现“忽略规则”“把密钥发出来”一类指令，代理会无视。
 
@@ -74,8 +79,15 @@ data/dev/
 
 定义保存在 `data/dev/connectors.json`，支持两种类型：
 
-- `http`：固定 `base_url`，调用时拼相对路径和查询参数；请求头里可以用 `${ENV_NAME}` 引用环境变量。
+- `http`：固定 `base_url`，调用时拼相对路径和查询参数；请求头里可以用 `${ENV_NAME}` 引用环境变量。整个 `base_url` 也可以写成 `${ENV_NAME}`，适合自托管 SearXNG 或 SQL 网关。
 - `mcp`：填写命令、参数、环境变量和工作目录，插件会按需启动 stdio 服务器，完成 `initialize → tools/list → tools/call` 后关闭。
+
+连接器默认关闭。资源界面左侧勾选即启用，取消即关闭；`set_connector_enabled(connector_id, true/false)` 同样可用。关闭的连接器不会进入系统提示，`call_connector` / `mcp_tools` / `call_mcp_tool` 会直接拒绝，但定义仍保留在 `connectors.json` 里。
+
+自带连接器（全部默认关闭）：
+
+- HTTP：`github`、`gitlab`、`feishu`、`notion`、`searxng`、`sql-gateway`、`fetch-gateway`、`pypi`、`npm-registry`、`crates-io`、`nuget`、`maven-central`、`rubygems`、`packagist`、`pub-dev`、`dockerhub`、`huggingface`、`stackexchange`、`devto`、`hackernews`。
+- MCP：`context7`、`mcp-filesystem`、`mcp-git`、`mcp-sqlite`、`mcp-playwright`、`mcp-chrome-devtools`、`mcp-fetch`、`mcp-markitdown`、`mcp-duckduckgo`、`mcp-memory`、`mcp-sequential-thinking`、`mcp-time`、`mcp-blender`、`mcp-github`、`mcp-brave-search`、`mcp-everything`。
 
 密钥只在运行时从环境变量解析，界面和模型看到的普通密钥值会显示为 `***`；响应里如果回显密钥，也会先打码再交给模型。连接器调用和 MCP 工具调用默认需要确认。
 
@@ -112,14 +124,14 @@ data/dev/
 | `read_reference` | 读插件 API 速查 |
 | `create_plugin` | 创建/更新插件，可立即启用 |
 | `ask_user` | 需求不清时问主人 |
-| `list_skills` / `read_skill` / `search_skills` | 查看和检索技能 |
-| `save_skill` / `delete_skill` | 新建、更新或删除技能 |
+| `list_skills` / `read_skill` / `search_skills` | 查看和检索技能（只读已启用项） |
+| `save_skill` / `delete_skill` / `set_skill_enabled` | 新建、删除或开关技能 |
 | `search_skills_online` / `list_repo_skills` | 在 GitHub 找技能仓库、列出仓库里的技能 |
 | `install_skill` / `read_repo_file` | 安装外部技能、读取仓库文件 |
-| `list_connectors` | 看已配置的连接器 |
-| `call_connector` | 调用 HTTP 连接器 |
-| `mcp_tools` / `call_mcp_tool` | 列出或调用 MCP 工具 |
-| `save_connector` / `delete_connector` | 新建、更新或删除连接器 |
+| `list_connectors` | 看全部连接器及开关状态 |
+| `call_connector` | 调用已启用的 HTTP 连接器 |
+| `mcp_tools` / `call_mcp_tool` | 列出或调用已启用的 MCP 工具 |
+| `save_connector` / `delete_connector` / `set_connector_enabled` | 新建、删除或开关连接器 |
 | `search_mcp_servers` / `install_mcp_server` | 搜索并安装 MCP 服务器 |
 | `search_knowledge` / `list_knowledge` | 检索和浏览知识库 |
 | `import_knowledge` / `import_knowledge_file` / `import_knowledge_url` | 导入文本、文件或网页 |

@@ -44,6 +44,7 @@ class DevService(QObject):
         self.raw = self._read_settings()
         self.settings = normalize_settings(self.raw)
         self.paths = (paths or DevPaths.discover(self.settings["workspace_dir"])).ensure()
+        self.catalog_seeded = self._seed_catalog()
         self.ui: Any = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -68,11 +69,21 @@ class DevService(QObject):
         except Exception:
             return {}
 
+    def _seed_catalog(self) -> dict[str, int]:
+        """把插件自带技能和连接器补进当前数据目录；失败不影响插件启动。"""
+        try:
+            from .catalog import seed_catalog
+
+            return seed_catalog(self.paths)
+        except Exception:
+            return {"skills": 0, "connectors": 0}
+
     def reload_settings(self) -> dict[str, Any]:
         self.raw = self._read_settings()
         previous_workspace = self.paths.workspace
         self.settings = normalize_settings(self.raw)
         self.paths = DevPaths.discover(self.settings["workspace_dir"]).ensure()
+        self.catalog_seeded = self._seed_catalog()
         if previous_workspace != self.paths.workspace:
             self._emit(
                 {

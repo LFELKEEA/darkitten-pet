@@ -15,6 +15,7 @@ PLUGIN = ROOT / "plugins" / "lfelkeea.self_dev"
 sys.path.insert(0, str(PLUGIN))
 
 from lfelkeea_self_dev import web as web_module  # noqa: E402
+from lfelkeea_self_dev.catalog import BUNDLED_CONNECTORS, BUNDLED_SKILLS  # noqa: E402
 from lfelkeea_self_dev.connectors import ConnectorStore  # noqa: E402
 from lfelkeea_self_dev.knowledge import KnowledgeBase  # noqa: E402
 from lfelkeea_self_dev.net import NetworkError, Response  # noqa: E402
@@ -108,6 +109,50 @@ class SkillStoreTests(unittest.TestCase):
         self.assertIn("research-before-coding", ids)
         store.delete("verify-before-finish")
         self.assertEqual(store.seed_defaults(), 0)
+
+    def test_enabled_default_false_and_index_filter(self):
+        root = temp_root()
+        store = SkillStore(root / "skills", root / ".trash")
+        saved = store.save("off-skill", "关闭技能", "默认关闭", "# 内容\n正文\n")
+        self.assertFalse(saved["enabled"])
+        self.assertNotIn("off-skill", store.index_text())
+        self.assertEqual(store.search("正文", include_disabled=False), [])
+
+        turned_on = store.set_enabled("off-skill", True)
+        self.assertTrue(turned_on["enabled"])
+        self.assertIn("off-skill", store.index_text())
+        self.assertEqual(len(store.search("正文", include_disabled=False)), 1)
+
+        turned_off = store.set_enabled("off-skill", False)
+        self.assertFalse(turned_off["enabled"])
+        self.assertEqual(store.search("正文", include_disabled=False), [])
+
+    def test_legacy_skill_without_enabled_stays_on(self):
+        root = temp_root()
+        store = SkillStore(root / "skills", root / ".trash")
+        folder = root / "skills" / "legacy"
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(
+            '---\nname: "旧技能"\ndescription: "没有 enabled 字段"\n---\n\n# 旧技能\n内容\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(store.get("legacy")["enabled"])
+        self.assertIn("legacy", store.index_text())
+
+    def test_seed_bundled_adds_missing_without_overwriting(self):
+        root = temp_root()
+        store = SkillStore(root / "skills", root / ".trash")
+        store.save("keep-me", "用户版本", "不要覆盖", "# 用户\n内容\n", enabled=True)
+        created = store.seed_bundled(
+            [
+                {"id": "keep-me", "name": "自带版本", "body": "# 自带\n内容\n", "enabled": False},
+                {"id": "new-skill", "name": "新增", "body": "# 新增\n内容\n", "enabled": False},
+            ]
+        )
+        self.assertEqual(created, 1)
+        self.assertEqual(store.get("keep-me")["name"], "用户版本")
+        self.assertTrue(store.get("keep-me")["enabled"])
+        self.assertFalse(store.get("new-skill")["enabled"])
 
 
 class KnowledgeBaseTests(unittest.TestCase):
@@ -269,6 +314,63 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn("demo.api", message)
         self.assertEqual(store.list(), [])
         self.assertTrue(list(store.path.parent.glob("connectors.json.*.bak")))
+
+    def test_enabled_toggle_and_index_filter(self):
+        store, _root = self._store()
+        store.save({"id": "demo.api", "type": "http", "base_url": "https://api.example.com"})
+        self.assertIn("demo.api", store.index_text())
+
+        off = store.set_enabled("demo.api", False)
+        self.assertFalse(off["enabled"])
+        self.assertNotIn("demo.api", store.index_text())
+        self.assertIn("关闭", store.index_text())
+
+        on = store.set_enabled("demo.api", True)
+        self.assertTrue(on["enabled"])
+        self.assertIn("demo.api", store.index_text())
+
+    def test_base_url_can_be_env_placeholder(self):
+        store, _root = self._store()
+        store.save({"id": "env.api", "type": "http", "base_url": "${SELFDEV_BASE_URL}"})
+        body = json.dumps({"ok": True}).encode("utf-8")
+        opener = _FakeOpener(_FakeResponse("https://api.example.com/v1", body))
+        with mock.patch.dict(
+            os.environ, {"SELFDEV_BASE_URL": "https://api.example.com/v1"}, clear=False
+        ):
+            with mock.patch("urllib.request.build_opener", return_value=opener):
+                result = store.http_call("env.api")
+        self.assertEqual(result["url"], "https://api.example.com/v1")
+
+    def test_seed_bundled_connectors_adds_missing_only(self):
+        store, _root = self._store()
+        store.save(
+            {
+                "id": "keep.api",
+                "type": "http",
+                "base_url": "https://api.example.com",
+                "enabled": True,
+            }
+        )
+        created = store.seed_bundled(
+            [
+                {
+                    "id": "keep.api",
+                    "type": "http",
+                    "base_url": "https://other.example.com",
+                    "enabled": False,
+                },
+                {
+                    "id": "new.api",
+                    "type": "http",
+                    "base_url": "https://new.example.com",
+                    "enabled": False,
+                },
+            ]
+        )
+        self.assertEqual(created, 1)
+        self.assertEqual(store.get("keep.api")["base_url"], "https://api.example.com")
+        self.assertTrue(store.get("keep.api")["enabled"])
+        self.assertFalse(store.get("new.api")["enabled"])
 
     def test_mcp_stdio_client(self):
         store, root = self._store()
@@ -492,12 +594,14 @@ class ToolBoxResourceTests(unittest.TestCase):
             "search_skills",
             "save_skill",
             "delete_skill",
+            "set_skill_enabled",
             "list_connectors",
             "call_connector",
             "mcp_tools",
             "call_mcp_tool",
             "save_connector",
             "delete_connector",
+            "set_connector_enabled",
             "search_knowledge",
             "import_knowledge",
             "import_knowledge_file",
@@ -510,6 +614,41 @@ class ToolBoxResourceTests(unittest.TestCase):
             "search_pypi",
         ):
             self.assertIn(name, TOOL_SPECS)
+
+    def test_disabled_skill_and_connector_are_refused(self):
+        box, _root = make_box()
+        box.run(
+            "save_skill",
+            {
+                "skill_id": "switchable",
+                "name": "可开关技能",
+                "description": "测试开关",
+                "body": "# 内容\n测试正文\n",
+            },
+        )
+        self.assertIn("[开]", box.run("list_skills", {}))
+        self.assertIn("已关闭", box.run("set_skill_enabled", {"skill_id": "switchable", "enabled": False}))
+        refused = box.run("read_skill", {"skill_id": "switchable"})
+        self.assertIn("处于关闭状态", refused)
+        self.assertNotIn("switchable", box.run("search_skills", {"query": "开关"}))
+        self.assertIn("[关]", box.run("list_skills", {}))
+
+        box.run(
+            "save_connector",
+            {
+                "id": "switch.api",
+                "type": "http",
+                "base_url": "https://api.example.com",
+            },
+        )
+        self.assertIn("[开]", box.run("list_connectors", {}))
+        self.assertIn(
+            "已关闭",
+            box.run("set_connector_enabled", {"connector_id": "switch.api", "enabled": False}),
+        )
+        refused_call = box.run("call_connector", {"connector_id": "switch.api"})
+        self.assertIn("处于关闭状态", refused_call)
+        self.assertIn("[关]", box.run("list_connectors", {}))
 
     def test_skill_and_knowledge_tools(self):
         box, _root = make_box()
@@ -570,6 +709,45 @@ class ToolBoxResourceTests(unittest.TestCase):
         self.assertIn("主人拒绝", result)
         self.assertIn("to-delete", box.run("list_skills", {}))
         self.assertEqual(calls, ["delete_skill"])
+
+
+class BundledCatalogTests(unittest.TestCase):
+    def test_catalog_entries_are_unique_and_default_off(self):
+        skill_ids = [item["id"] for item in BUNDLED_SKILLS]
+        connector_ids = [item["id"] for item in BUNDLED_CONNECTORS]
+        self.assertEqual(len(skill_ids), len(set(skill_ids)))
+        self.assertEqual(len(connector_ids), len(set(connector_ids)))
+        self.assertGreaterEqual(len(skill_ids), 20)
+        self.assertGreaterEqual(len(connector_ids), 20)
+        self.assertTrue(all(item["enabled"] is False for item in BUNDLED_SKILLS))
+        self.assertTrue(all(item["enabled"] is False for item in BUNDLED_CONNECTORS))
+        self.assertIn("github", connector_ids)
+        self.assertIn("feishu", connector_ids)
+        self.assertIn("notion", connector_ids)
+        self.assertIn("searxng", connector_ids)
+        self.assertIn("sql-gateway", connector_ids)
+        self.assertIn("mcp-blender", connector_ids)
+
+    def test_catalog_connectors_normalize(self):
+        root = temp_root()
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True)
+        store = ConnectorStore(root / "connectors.json", workspace, root / ".trash")
+        self.assertEqual(store.seed_bundled(BUNDLED_CONNECTORS), len(BUNDLED_CONNECTORS))
+        self.assertEqual(store.seed_bundled(BUNDLED_CONNECTORS), 0)
+        items = store.list()
+        self.assertEqual(len(items), len(BUNDLED_CONNECTORS))
+        self.assertTrue(all(not item["enabled"] for item in items))
+
+    def test_catalog_skills_are_written(self):
+        root = temp_root()
+        store = SkillStore(root / "skills", root / ".trash")
+        self.assertEqual(store.seed_bundled(BUNDLED_SKILLS), len(BUNDLED_SKILLS))
+        self.assertEqual(store.seed_bundled(BUNDLED_SKILLS), 0)
+        items = store.list()
+        self.assertEqual(len(items), len(BUNDLED_SKILLS))
+        self.assertTrue(all(not item["enabled"] for item in items))
+        self.assertIn("关", store.index_text())
 
 
 class SettingsTests(unittest.TestCase):

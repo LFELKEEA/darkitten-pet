@@ -138,6 +138,13 @@ class SkillStore:
                 result.append(item.relative_to(folder).as_posix())
         return result
 
+    @staticmethod
+    def _enabled(meta: dict[str, str]) -> bool:
+        """没有 enabled 字段的旧技能默认保持启用，内置目录显式写 false。"""
+        if "enabled" not in meta:
+            return True
+        return str(meta.get("enabled") or "").strip().lower() not in ("0", "false", "no", "off", "")
+
     def list(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         try:
@@ -161,6 +168,7 @@ class SkillStore:
                     "description": str(meta.get("description") or "").strip(),
                     "chars": len(body),
                     "files": files,
+                    "enabled": self._enabled(meta),
                     "updated": self._updated(manifest),
                 }
             )
@@ -179,6 +187,7 @@ class SkillStore:
             "description": str(meta.get("description") or "").strip(),
             "body": body.strip(),
             "files": self._files(folder),
+            "enabled": self._enabled(meta),
             "updated": self._updated(manifest),
         }
 
@@ -199,8 +208,12 @@ class SkillStore:
         return f"技能 {folder.name} 的资源 {relative.as_posix()}：\n\n{text}"
 
     def index_text(self, limit: int = 40) -> str:
-        items = self.list()
+        all_items = self.list()
+        items = [item for item in all_items if item.get("enabled")]
         if not items:
+            hidden = len(all_items)
+            if hidden:
+                return f"（还没有启用的技能；资源界面有 {hidden} 个技能处于关闭状态，需要时打开。）"
             return "（还没有技能。可以新建技能，把重复出现的做法沉淀下来。）"
         lines: list[str] = []
         for item in items[:limit]:
@@ -214,12 +227,14 @@ class SkillStore:
             lines.append(f"…还有 {len(items) - limit} 个技能，用 list_skills 查看。")
         return "\n".join(lines)
 
-    def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+    def search(self, query: str, limit: int = 10, *, include_disabled: bool = True) -> list[dict[str, Any]]:
         needle = str(query or "").strip().lower()
         if not needle:
             raise ResourceError("query 不能为空。")
         hits: list[dict[str, Any]] = []
         for item in self.list():
+            if not include_disabled and not item.get("enabled"):
+                continue
             try:
                 detail = self.get(item["id"])
             except ResourceError:
@@ -235,10 +250,11 @@ class SkillStore:
                     "id": item["id"],
                     "name": item["name"],
                     "description": item["description"],
+                    "enabled": item.get("enabled", True),
                     "snippet": snippet,
                 }
             )
-            if len(hits) >= max(1, min(50, int(limit))):
+            if len(hits) >= max(1, min(500, int(limit))):
                 break
         return hits
 
@@ -251,8 +267,20 @@ class SkillStore:
         description: str = "",
         body: str = "",
         resources: Any = None,
+        *,
+        enabled: bool | None = None,
     ) -> dict[str, Any]:
         folder = self._folder(skill_id)
+        manifest_path = folder / "SKILL.md"
+        if enabled is None:
+            if manifest_path.is_file():
+                try:
+                    meta, _body = parse_front_matter(read_text(manifest_path))
+                    enabled = self._enabled(meta)
+                except OSError:
+                    enabled = False
+            else:
+                enabled = False
         text = str(body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if not text:
             raise ResourceError("技能正文不能为空。")
@@ -267,7 +295,7 @@ class SkillStore:
             raise ResourceError("description 最多 1024 字。")
         folder.mkdir(parents=True, exist_ok=True)
         manifest = compose_front_matter(
-            {"name": title, "description": desc}, text
+            {"name": title, "description": desc, "enabled": bool(enabled)}, text
         )
         atomic_write(folder / "SKILL.md", manifest)
 
@@ -294,6 +322,39 @@ class SkillStore:
                 written.append(relative.as_posix())
         return self.get(folder.name) | {"written": written}
 
+    def set_enabled(self, skill_id: str, enabled: bool) -> dict[str, Any]:
+        folder = self._folder(skill_id)
+        manifest = folder / "SKILL.md"
+        if not manifest.is_file():
+            raise ResourceError(f"技能不存在：{skill_id}")
+        meta, body = parse_front_matter(read_text(manifest))
+        atomic_write(manifest, compose_front_matter({**meta, "enabled": bool(enabled)}, body))
+        return self.get(folder.name)
+
+    def seed_bundled(self, items: list[dict[str, Any]]) -> int:
+        """把插件自带技能补进技能库；已存在的同名技能不覆盖。"""
+        created = 0
+        for item in items:
+            skill_id = str(item.get("id") or "").strip()
+            if not skill_id:
+                continue
+            folder = self._folder(skill_id)
+            if (folder / "SKILL.md").is_file():
+                continue
+            try:
+                self.save(
+                    skill_id,
+                    str(item.get("name") or ""),
+                    str(item.get("description") or ""),
+                    str(item.get("body") or ""),
+                    item.get("resources"),
+                    enabled=bool(item.get("enabled", False)),
+                )
+                created += 1
+            except ResourceError:
+                continue
+        return created
+
     def delete(self, skill_id: str) -> str:
         folder = self._folder(skill_id)
         if not folder.is_dir():
@@ -313,7 +374,13 @@ class SkillStore:
             if (folder / "SKILL.md").is_file():
                 continue
             try:
-                self.save(item["id"], item["name"], item["description"], item["body"])
+                self.save(
+                    item["id"],
+                    item["name"],
+                    item["description"],
+                    item["body"],
+                    enabled=False,
+                )
                 created += 1
             except ResourceError:
                 continue

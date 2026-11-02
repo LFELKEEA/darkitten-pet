@@ -1003,6 +1003,9 @@ class SkillEditorDialog(QDialog):
         self.desc_edit = QLineEdit()
         self.desc_edit.setPlaceholderText("一句话说明什么时候该用这个技能")
         form.addWidget(self._row("触发描述", self.desc_edit))
+        self.enabled_check = QCheckBox("启用这个技能（关闭时不会进入系统提示，也不能读取）")
+        self.enabled_check.setChecked(False)
+        form.addWidget(self.enabled_check)
         self.body_edit = QPlainTextEdit()
         self.body_edit.setPlaceholderText(
             "# 适用场景\n\n# 步骤\n1. …\n\n# 检查点\n- …"
@@ -1042,6 +1045,7 @@ class SkillEditorDialog(QDialog):
         self.name_edit.setText(str(self.skill.get("name", "")))
         self.desc_edit.setText(str(self.skill.get("description", "")))
         self.body_edit.setPlainText(str(self.skill.get("body", "")))
+        self.enabled_check.setChecked(bool(self.skill.get("enabled", False)))
 
     def _save(self) -> None:
         try:
@@ -1050,6 +1054,7 @@ class SkillEditorDialog(QDialog):
                 self.name_edit.text().strip(),
                 self.desc_edit.text().strip(),
                 self.body_edit.toPlainText(),
+                enabled=self.enabled_check.isChecked(),
             )
         except (ResourceError, OSError) as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
@@ -1121,6 +1126,9 @@ class ConnectorEditorDialog(QDialog):
         self.desc_edit = QLineEdit()
         self.desc_edit.setPlaceholderText("给代理看的一句话说明：这个连接器能查什么")
         form.addWidget(self._labelled("说明", self.desc_edit))
+        self.enabled_check = QCheckBox("启用这个连接器（关闭时不会进入系统提示，也不能调用）")
+        self.enabled_check.setChecked(False)
+        form.addWidget(self.enabled_check)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._http_page())
@@ -1210,6 +1218,7 @@ class ConnectorEditorDialog(QDialog):
         self.name_edit.setText(str(self.connector.get("name", "")))
         self.desc_edit.setText(str(self.connector.get("description", "")))
         self.timeout_spin.setValue(float(self.connector.get("timeout") or 45))
+        self.enabled_check.setChecked(bool(self.connector.get("enabled", False)))
         index = self.type_combo.findData(kind)
         self.type_combo.setCurrentIndex(max(0, index))
         if kind == "http":
@@ -1246,6 +1255,7 @@ class ConnectorEditorDialog(QDialog):
             "type": self.type_combo.currentData(),
             "description": self.desc_edit.text().strip(),
             "timeout": int(self.timeout_spin.value()),
+            "enabled": bool(self.enabled_check.isChecked()),
         }
         try:
             if payload["type"] == "http":
@@ -1321,6 +1331,7 @@ class ResourceDialog(QDialog):
         self._current_skills: dict[str, dict[str, Any]] = {}
         self._current_connectors: dict[str, dict[str, Any]] = {}
         self._current_documents: dict[int, dict[str, Any]] = {}
+        self._syncing = False
         self.setWindowTitle("资源 · 技能 / 连接器 / 知识库")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
         self.resize(1100, 780)
@@ -1342,7 +1353,7 @@ class ResourceDialog(QDialog):
         layout.addWidget(title)
         note = QLabel(
             "技能教代理怎么做；连接器把外部 API / MCP 带进来；知识库保存需要反复查的资料。"
-            "这些内容会出现在每一轮任务的系统提示里，代理也可以自己调用工具维护。"
+            "技能和连接器默认关闭：勾选左侧复选框即可启用，取消勾选即可关闭，不需要删除。"
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -1390,6 +1401,7 @@ class ResourceDialog(QDialog):
         split = QSplitter(Qt.Orientation.Horizontal)
         self.skill_list = QListWidget()
         self.skill_list.currentItemChanged.connect(self._show_skill)
+        self.skill_list.itemChanged.connect(self._toggle_skill)
         self.skill_list.itemDoubleClicked.connect(lambda _item: self._edit_skill())
         split.addWidget(self.skill_list)
         self.skill_detail = QTextBrowser()
@@ -1418,9 +1430,13 @@ class ResourceDialog(QDialog):
         layout.setSpacing(8)
         bar = QHBoxLayout()
         bar.setSpacing(8)
-        hint = QLabel("HTTP 连接器直接调用 API；MCP 连接器按需启动本地服务器进程。")
-        hint.setObjectName("muted")
-        bar.addWidget(hint, 1)
+        self.connector_search = QLineEdit()
+        self.connector_search.setPlaceholderText("搜索连接器名称、id 或说明")
+        self.connector_search.returnPressed.connect(self._search_connectors)
+        bar.addWidget(self.connector_search, 1)
+        find = QPushButton("搜索")
+        find.clicked.connect(self._search_connectors)
+        bar.addWidget(find)
         refresh = QPushButton("刷新")
         refresh.setObjectName("ghost")
         refresh.clicked.connect(lambda: self._refresh_connectors())
@@ -1431,9 +1447,15 @@ class ResourceDialog(QDialog):
         bar.addWidget(create)
         layout.addLayout(bar)
 
+        hint = QLabel("HTTP 连接器直接调用 API；MCP 连接器按需启动本地服务器进程。勾选复选框启用。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
         split = QSplitter(Qt.Orientation.Horizontal)
         self.connector_list = QListWidget()
         self.connector_list.currentItemChanged.connect(self._show_connector)
+        self.connector_list.itemChanged.connect(self._toggle_connector)
         self.connector_list.itemDoubleClicked.connect(lambda _item: self._edit_connector())
         split.addWidget(self.connector_list)
         self.connector_detail = QTextBrowser()
@@ -1535,25 +1557,75 @@ class ResourceDialog(QDialog):
     # ------------------------------------------------------------ 技能
 
     def _refresh_skills(self, query: str = "") -> None:
-        self.skill_list.clear()
-        self._current_skills.clear()
+        self._syncing = True
         try:
-            store = self.skill_store
-            items = store.search(query) if query else store.list()
-        except (ResourceError, OSError) as exc:
-            self.skill_detail.setHtml(f'<div style="color:{ERROR};">{html.escape(str(exc))}</div>')
+            self.skill_list.clear()
+            self._current_skills.clear()
+            try:
+                store = self.skill_store
+                items = (
+                    store.search(query, limit=500, include_disabled=True)
+                    if query
+                    else store.list()
+                )
+            except (ResourceError, OSError) as exc:
+                self.skill_detail.setHtml(
+                    f'<div style="color:{ERROR};">{html.escape(str(exc))}</div>'
+                )
+                return
+            for item in items:
+                label = f"{item['name']}\n{item['id']}"
+                row = QListWidgetItem(label)
+                row.setData(Qt.ItemDataRole.UserRole, item["id"])
+                row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                row.setCheckState(
+                    Qt.CheckState.Checked
+                    if item.get("enabled")
+                    else Qt.CheckState.Unchecked
+                )
+                self.skill_list.addItem(row)
+            self._update_skill_count(query)
+            if items:
+                self.skill_list.setCurrentRow(0)
+            else:
+                message = "没有匹配的技能。" if query else "还没有技能，点「新建技能」写一个。"
+                self.skill_detail.setHtml(
+                    f'<div style="color:{MUTED};">{html.escape(message)}</div>'
+                )
+        finally:
+            self._syncing = False
+
+    def _update_skill_count(self, query: str = "") -> None:
+        total = self.skill_list.count()
+        enabled = sum(
+            1
+            for index in range(total)
+            if self.skill_list.item(index).checkState() == Qt.CheckState.Checked
+        )
+        text = f"共 {total} 个技能 · 已启用 {enabled} · 已关闭 {total - enabled}"
+        if query:
+            text += f" · 匹配「{query}」"
+        self.skill_count.setText(text)
+
+    def _toggle_skill(self, item: QListWidgetItem) -> None:
+        if self._syncing:
             return
-        for item in items:
-            label = f"{item['name']}\n{item['id']}"
-            row = QListWidgetItem(label)
-            row.setData(Qt.ItemDataRole.UserRole, item["id"])
-            self.skill_list.addItem(row)
-        self.skill_count.setText(f"共 {len(items)} 个技能" + (f" · 匹配「{query}」" if query else ""))
-        if items:
-            self.skill_list.setCurrentRow(0)
-        else:
-            message = "没有匹配的技能。" if query else "还没有技能，点「新建技能」写一个。"
-            self.skill_detail.setHtml(f'<div style="color:{MUTED};">{html.escape(message)}</div>')
+        skill_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not skill_id:
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        try:
+            detail = self.skill_store.set_enabled(skill_id, enabled)
+        except (ResourceError, OSError) as exc:
+            QMessageBox.warning(self, "切换失败", str(exc))
+            self._refresh_skills(self.skill_search.text().strip())
+            return
+        self._update_skill_count(self.skill_search.text().strip())
+        self.footer.setText(
+            f"技能 {skill_id}「{detail['name']}」{'已启用' if enabled else '已关闭'}"
+        )
+        if self.skill_list.currentItem() is item:
+            self._show_skill(item)
 
     def _show_skill(self, current: Any, _previous: Any = None) -> None:
         if current is None:
@@ -1566,7 +1638,11 @@ class ResourceDialog(QDialog):
             return
         self._current_skills[skill_id] = detail
         files = [name for name in detail.get("files", []) if name != "SKILL.md"]
-        meta = f"id: {detail['id']} · 更新于 {detail['updated']} · 正文 {len(detail['body'])} 字"
+        state = "已启用" if detail.get("enabled") else "已关闭（不会进入系统提示）"
+        meta = (
+            f"id: {detail['id']} · {state} · 更新于 {detail['updated']}"
+            f" · 正文 {len(detail['body'])} 字"
+        )
         if files:
             meta += "\n资源：" + "、".join(files)
         body = f"{detail['description']}\n\n{detail['body']}"
@@ -1618,26 +1694,87 @@ class ResourceDialog(QDialog):
 
     # ------------------------------------------------------------ 连接器
 
-    def _refresh_connectors(self) -> None:
-        self.connector_list.clear()
-        self._current_connectors.clear()
+    def _refresh_connectors(self, query: str = "") -> None:
+        self._syncing = True
         try:
-            items = self.connector_store.list()
-        except (ResourceError, OSError) as exc:
-            self.connector_detail.setHtml(f'<div style="color:{ERROR};">{html.escape(str(exc))}</div>')
+            self.connector_list.clear()
+            self._current_connectors.clear()
+            try:
+                items = self.connector_store.list()
+            except (ResourceError, OSError) as exc:
+                self.connector_detail.setHtml(
+                    f'<div style="color:{ERROR};">{html.escape(str(exc))}</div>'
+                )
+                return
+            needle = query.strip().lower()
+            if needle:
+                items = [
+                    item
+                    for item in items
+                    if needle
+                    in " ".join(
+                        str(item.get(key) or "")
+                        for key in ("id", "name", "description", "type")
+                    ).lower()
+                ]
+            for item in items:
+                kind = "HTTP" if item.get("type") == "http" else "MCP"
+                row = QListWidgetItem(f"{item.get('name') or item['id']}\n{kind} · {item['id']}")
+                row.setData(Qt.ItemDataRole.UserRole, item["id"])
+                row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                row.setCheckState(
+                    Qt.CheckState.Checked
+                    if item.get("enabled")
+                    else Qt.CheckState.Unchecked
+                )
+                self.connector_list.addItem(row)
+            self._update_connector_count(query)
+            if items:
+                self.connector_list.setCurrentRow(0)
+            else:
+                message = (
+                    "没有匹配的连接器。" if query else "还没有连接器。可以接一个 HTTP API，或挂载 MCP 服务器。"
+                )
+                self.connector_detail.setHtml(
+                    f'<div style="color:{MUTED};">{html.escape(message)}</div>'
+                )
+        finally:
+            self._syncing = False
+
+    def _update_connector_count(self, query: str = "") -> None:
+        total = self.connector_list.count()
+        enabled = sum(
+            1
+            for index in range(total)
+            if self.connector_list.item(index).checkState() == Qt.CheckState.Checked
+        )
+        text = f"共 {total} 个连接器 · 已启用 {enabled} · 已关闭 {total - enabled}"
+        if query:
+            text += f" · 匹配「{query}」"
+        self.connector_count.setText(text)
+
+    def _toggle_connector(self, item: QListWidgetItem) -> None:
+        if self._syncing:
             return
-        for item in items:
-            kind = "HTTP" if item.get("type") == "http" else "MCP"
-            row = QListWidgetItem(f"{item.get('name') or item['id']}\n{kind} · {item['id']}")
-            row.setData(Qt.ItemDataRole.UserRole, item["id"])
-            self.connector_list.addItem(row)
-        self.connector_count.setText(f"共 {len(items)} 个连接器")
-        if items:
-            self.connector_list.setCurrentRow(0)
-        else:
-            self.connector_detail.setHtml(
-                f'<div style="color:{MUTED};">还没有连接器。可以接一个 HTTP API，或挂载 MCP 服务器。</div>'
-            )
+        connector_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not connector_id:
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        try:
+            detail = self.connector_store.set_enabled(connector_id, enabled)
+        except (ResourceError, OSError) as exc:
+            QMessageBox.warning(self, "切换失败", str(exc))
+            self._refresh_connectors(self.connector_search.text().strip())
+            return
+        self._update_connector_count(self.connector_search.text().strip())
+        self.footer.setText(
+            f"连接器 {connector_id}「{detail['name']}」{'已启用' if enabled else '已关闭'}"
+        )
+        if self.connector_list.currentItem() is item:
+            self._show_connector(item)
+
+    def _search_connectors(self) -> None:
+        self._refresh_connectors(self.connector_search.text().strip())
 
     def _show_connector(self, current: Any, _previous: Any = None) -> None:
         if current is None:
@@ -1650,7 +1787,11 @@ class ResourceDialog(QDialog):
             return
         self._current_connectors[connector_id] = detail
         public = ConnectorStore.public(detail)
-        meta = f"{detail.get('type', '').upper()} · 超时 {detail.get('timeout')} 秒"
+        state = "已启用" if detail.get("enabled") else "已关闭（不会进入系统提示，也不能调用）"
+        meta = (
+            f"{detail.get('type', '').upper()} · {state}"
+            f" · 超时 {detail.get('timeout')} 秒"
+        )
         body = json.dumps(public, ensure_ascii=False, indent=2)
         self.connector_detail.setHtml(
             _block(detail.get("name") or connector_id, body, meta + "\n密钥只显示引用或 ***")

@@ -139,6 +139,16 @@ def compose_front_matter(metadata: dict[str, Any], body: str) -> str:
         if value:
             escaped = value.replace('"', '\\"')
             lines.append(f'{key}: "{escaped}"')
+    if "enabled" in metadata:
+        value = metadata.get("enabled")
+        flag = value if isinstance(value, bool) else str(value).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        )
+        lines.append(f"enabled: {'true' if flag else 'false'}")
     lines.append("---")
     return "\n".join(lines) + "\n\n" + str(body or "").lstrip("\n").rstrip() + "\n"
 

@@ -91,8 +91,12 @@ class ConnectorStore:
         return data
 
     def index_text(self) -> str:
-        items = self.list()
+        all_items = self.list()
+        items = [item for item in all_items if item.get("enabled")]
         if not items:
+            hidden = len(all_items)
+            if hidden:
+                return f"（还没有启用的连接器；资源界面有 {hidden} 个连接器处于关闭状态，需要时打开。）"
             return "（还没有连接器。连接器可以接 HTTP API 或 MCP 服务器，把外部能力带进来。）"
         lines: list[str] = []
         for item in items:
@@ -107,16 +111,59 @@ class ConnectorStore:
                 payload = json.loads(payload)
             except ValueError as exc:
                 raise ResourceError(f"连接器不是合法 JSON：{exc}") from exc
-        item = self._normalize(payload)
+        if not isinstance(payload, dict):
+            raise ResourceError("连接器必须是 JSON 对象。")
         items = self._load()
-        for index, existing in enumerate(items):
-            if existing["id"] == item["id"]:
+        existing = next(
+            (item for item in items if item["id"] == str(payload.get("id") or "").strip()),
+            None,
+        )
+        data = dict(payload)
+        if "enabled" not in data and existing is not None:
+            data["enabled"] = existing.get("enabled", True)
+        item = self._normalize(data)
+        for index, current in enumerate(items):
+            if current["id"] == item["id"]:
                 items[index] = item
                 break
         else:
             items.append(item)
         self._save_all(items)
         return item
+
+    def set_enabled(self, connector_id: str, enabled: bool) -> dict[str, Any]:
+        value = str(connector_id or "").strip()
+        items = self._load()
+        for item in items:
+            if item["id"] == value:
+                item["enabled"] = bool(enabled)
+                self._save_all(items)
+                return item
+        raise ResourceError(f"连接器不存在：{value}")
+
+    def seed_bundled(self, items: list[dict[str, Any]]) -> int:
+        """把插件自带连接器补进 connectors.json；同 id 不覆盖。"""
+        current = self._load()
+        known = {item["id"] for item in current}
+        created = 0
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            connector_id = str(raw.get("id") or "").strip()
+            if not connector_id or connector_id in known:
+                continue
+            payload = dict(raw)
+            payload.setdefault("enabled", False)
+            try:
+                item = self._normalize(payload)
+            except ResourceError:
+                continue
+            current.append(item)
+            known.add(item["id"])
+            created += 1
+        if created:
+            self._save_all(current)
+        return created
 
     def delete(self, connector_id: str) -> str:
         value = str(connector_id or "").strip()
@@ -147,12 +194,17 @@ class ConnectorStore:
             "name": str(raw.get("name") or connector_id).strip()[:80],
             "type": kind,
             "description": str(raw.get("description") or "").strip()[:500],
+            "enabled": bool(raw.get("enabled", True)),
             "timeout": _as_timeout(raw.get("timeout")),
         }
         if kind == "http":
             base_url = str(raw.get("base_url") or "").strip()
-            if not re.match(r"^https?://", base_url, re.IGNORECASE):
-                raise ResourceError("HTTP 连接器需要 http/https 开头的 base_url。")
+            if not re.match(r"^https?://", base_url, re.IGNORECASE) and not re.fullmatch(
+                r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", base_url
+            ):
+                raise ResourceError(
+                    "HTTP 连接器需要 http/https 开头的 base_url，或整段用 ${ENV_NAME} 引用环境变量。"
+                )
             headers = raw.get("headers") or {}
             if not isinstance(headers, dict):
                 raise ResourceError("headers 必须是对象。")
@@ -205,7 +257,8 @@ class ConnectorStore:
         suffix = str(path or "").strip()
         if suffix.startswith(("http://", "https://")):
             raise ResourceError("path 只能是相对路径；完整地址请写进 base_url。")
-        url = connector["base_url"] + ("/" + suffix.lstrip("/") if suffix else "")
+        base_url, base_secrets = resolve_env(connector["base_url"], strict=True)
+        url = base_url.rstrip("/") + ("/" + suffix.lstrip("/") if suffix else "")
         if query:
             if isinstance(query, dict):
                 from urllib.parse import urlencode
@@ -233,7 +286,7 @@ class ConnectorStore:
                 text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
             except ValueError:
                 pass
-        text = redact(text, response.secrets)
+        text = redact(text, [*base_secrets, *response.secrets])
         limit = 16000
         if len(text) > limit:
             text = text[:limit] + "\n…（响应超过 16000 字，已截断）"
@@ -280,8 +333,9 @@ class ConnectorStore:
     def test(self, connector_id: str) -> str:
         connector = self.get(connector_id)
         if connector["type"] == "http":
+            base_url, _secrets = resolve_env(connector["base_url"], strict=True)
             response = http_request(
-                connector["base_url"],
+                base_url,
                 timeout=min(30, connector.get("timeout", 45)),
                 headers=connector.get("headers") or {},
                 allow_private=bool(connector.get("allow_private")),
