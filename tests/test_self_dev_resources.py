@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -353,6 +354,77 @@ class WebTests(unittest.TestCase):
         self.assertIn("示例标题", text)
         self.assertIn("https://example.com/a", text)
         self.assertIn("这是摘要", text)
+
+    def test_web_search_falls_back_to_bing_rss(self):
+        empty = Response(
+            url="https://html.duckduckgo.com/html/",
+            status=200,
+            content_type="text/html",
+            text="<html><body>没有结果</body></html>",
+        )
+        rss = Response(
+            url="https://www.bing.com/search",
+            status=200,
+            content_type="application/rss+xml",
+            text="""
+            <rss><channel>
+              <item>
+                <title><![CDATA[官方文档]]></title>
+                <link>https://example.com/docs</link>
+                <description>&lt;p&gt;安装与&lt;b&gt;配置&lt;/b&gt;说明&lt;/p&gt;</description>
+              </item>
+            </channel></rss>
+            """,
+        )
+        with mock.patch.object(
+            web_module, "http_request", side_effect=[empty, rss]
+        ):
+            text = web_module.web_search("文档")
+        self.assertIn("Bing", text)
+        self.assertIn("官方文档", text)
+        self.assertIn("https://example.com/docs", text)
+        self.assertIn("安装与", text)
+        self.assertIn("配置", text)
+        self.assertIn("说明", text)
+
+    def test_plugin_loads_without_sqlite_or_xml(self):
+        """打包版桌宠没有 sqlite3 / xml.etree，插件必须照常加载。"""
+        code = f"""
+import builtins
+import sys
+
+real_import = builtins.__import__
+
+def guard(name, *args, **kwargs):
+    if name == "sqlite3" or name == "xml" or name.startswith("xml."):
+        raise ImportError("blocked " + name)
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guard
+sys.path.insert(0, {str(PLUGIN)!r})
+
+from lfelkeea_self_dev.service import DevService  # noqa: F401
+from lfelkeea_self_dev.knowledge import KnowledgeBase
+from lfelkeea_self_dev import web
+
+import tempfile
+from pathlib import Path
+
+kb = KnowledgeBase(Path(tempfile.mkdtemp()) / "knowledge")
+kb.add_document("标题", "正文里有连接器和知识库")
+hits = kb.search("知识库")
+assert hits and hits[0]["citation"].startswith("[K"), hits
+assert "标题" in web.strip_html("<h1>标题</h1>")
+print("ok")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
 
     def test_search_github_parses_json(self):
         payload = {

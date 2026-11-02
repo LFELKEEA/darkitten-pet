@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-"""本地知识库：SQLite + FTS5，支持中英文片段检索和带引用的召回。
+"""本地知识库：纯 Python 存储，支持中英文片段检索和带引用的召回。
 
 设计取舍：
-- 单文件数据库，零外部依赖，复制 ``data/dev/knowledge`` 就能带走；
+- 只用一个 JSON 文件，零外部依赖。打包版桌宠没有带 sqlite3，插件不能假设它存在；
 - 文档按段落切块，每块保留标题、来源和序号，检索结果能指回原文；
-- FTS5 不可用或中文短词查不到时自动退回 LIKE，不让功能整体失效。
+- 检索用词频打分，标题和来源命中加权，规模到几千个片段都够用；
+- 写入走临时文件替换，进程中断不会留下半个知识库。
 """
 
 import hashlib
+import json
 import re
-import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -21,81 +22,66 @@ from .resource_util import ResourceError, atomic_write, read_text, stamp
 MAX_DOCUMENT_CHARS = 2_000_000
 CHUNK_CHARS = 900
 CHUNK_OVERLAP = 120
+STORE_VERSION = 1
 
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _as_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
 class KnowledgeBase:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.root / "knowledge.db"
+        self.db_path = self.root / "knowledge.json"
         self._lock = threading.Lock()
-        self._fts_ready = True
 
-    # ------------------------------------------------------------ 数据库
+    # ------------------------------------------------------------ 存储
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=15)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
+    def _load(self) -> dict[str, Any]:
+        if not self.db_path.is_file():
+            return {"version": STORE_VERSION, "next_id": 1, "documents": []}
         try:
-            conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass
-        self._ensure_schema(conn)
-        return conn
-
-    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT '',
-                kind TEXT NOT NULL DEFAULT 'note',
-                content_hash TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                char_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                ordinal INTEGER NOT NULL,
-                text TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_chunks_document
-                ON chunks(document_id, ordinal);
-            CREATE INDEX IF NOT EXISTS idx_documents_source
-                ON documents(source, content_hash);
-            """
-        )
-        if not self._fts_ready:
-            return
-        try:
-            conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts "
-                "USING fts5(text, title, source, tokenize='trigram')"
-            )
-        except sqlite3.OperationalError:
+            data = json.loads(read_text(self.db_path) or "{}")
+        except Exception as exc:
+            raise ResourceError(f"知识库文件读取失败：{exc}") from exc
+        if not isinstance(data, dict):
+            raise ResourceError("知识库文件格式不正确。")
+        documents = data.get("documents")
+        if not isinstance(documents, list):
+            documents = []
+        cleaned: list[dict[str, Any]] = []
+        used: list[int] = []
+        for document in documents:
+            if not isinstance(document, dict):
+                continue
             try:
-                conn.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts "
-                    "USING fts5(text, title, source, tokenize='unicode61')"
-                )
-            except sqlite3.OperationalError:
-                self._fts_ready = False
-        conn.commit()
-
-    @staticmethod
-    def _close(conn: sqlite3.Connection) -> None:
+                document_id = int(document.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if document_id <= 0:
+                continue
+            document["id"] = document_id
+            used.append(document_id)
+            cleaned.append(document)
+        data["documents"] = cleaned
+        data["version"] = STORE_VERSION
         try:
-            conn.close()
-        except sqlite3.Error:
-            pass
+            next_id = int(data.get("next_id") or 1)
+        except (TypeError, ValueError):
+            next_id = 1
+        data["next_id"] = max(next_id, max(used, default=0) + 1, 1)
+        return data
+
+    def _save(self, data: dict[str, Any]) -> None:
+        atomic_write(
+            self.db_path,
+            json.dumps(data, ensure_ascii=False, indent=1) + "\n",
+        )
 
     # ------------------------------------------------------------ 写入
 
@@ -119,54 +105,41 @@ class KnowledgeBase:
         chunks = self._chunk(body)
 
         with self._lock:
-            conn = self._connect()
-            try:
-                existing = conn.execute(
-                    "SELECT id FROM documents WHERE source = ? AND content_hash = ?",
-                    (source_text, digest),
-                ).fetchone()
-                if existing is not None:
-                    doc_id = int(existing["id"])
-                    count = conn.execute(
-                        "SELECT COUNT(*) AS n FROM chunks WHERE document_id = ?",
-                        (doc_id,),
-                    ).fetchone()["n"]
+            data = self._load()
+            for document in data["documents"]:
+                if (
+                    _as_text(document.get("source")) == source_text
+                    and _as_text(document.get("content_hash")) == digest
+                ):
                     return {
-                        "id": doc_id,
-                        "title": clean_title,
-                        "chunks": int(count),
+                        "id": int(document.get("id") or 0),
+                        "title": _as_text(document.get("title")) or clean_title,
+                        "chunks": len(document.get("chunks") or []),
                         "existing": True,
                     }
-                now = _now()
-                cursor = conn.execute(
-                    "INSERT INTO documents "
-                    "(title, source, kind, content_hash, created_at, updated_at, char_count) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (clean_title, source_text, kind_text, digest, now, now, len(body)),
-                )
-                doc_id = int(cursor.lastrowid)
-                for ordinal, piece in enumerate(chunks, 1):
-                    row = conn.execute(
-                        "INSERT INTO chunks (document_id, ordinal, text) VALUES (?, ?, ?)",
-                        (doc_id, ordinal, piece),
-                    )
-                    if self._fts_ready:
-                        try:
-                            conn.execute(
-                                "INSERT INTO chunks_fts (rowid, text, title, source) VALUES (?, ?, ?, ?)",
-                                (int(row.lastrowid), piece, clean_title, source_text),
-                            )
-                        except sqlite3.OperationalError:
-                            self._fts_ready = False
-                conn.commit()
-                return {
+            doc_id = int(data["next_id"])
+            data["next_id"] = doc_id + 1
+            now = _now()
+            data["documents"].append(
+                {
                     "id": doc_id,
                     "title": clean_title,
-                    "chunks": len(chunks),
-                    "existing": False,
+                    "source": source_text,
+                    "kind": kind_text,
+                    "content_hash": digest,
+                    "created_at": now,
+                    "updated_at": now,
+                    "char_count": len(body),
+                    "chunks": chunks,
                 }
-            finally:
-                self._close(conn)
+            )
+            self._save(data)
+        return {
+            "id": doc_id,
+            "title": clean_title,
+            "chunks": len(chunks),
+            "existing": False,
+        }
 
     def import_file(self, path: Path, *, title: str = "", source: str = "") -> dict[str, Any]:
         target = Path(path)
@@ -213,22 +186,25 @@ class KnowledgeBase:
     def list_documents(self, limit: int = 100) -> list[dict[str, Any]]:
         value = max(1, min(500, int(limit or 100)))
         with self._lock:
-            conn = self._connect()
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT d.id, d.title, d.source, d.kind, d.created_at, d.updated_at,
-                           d.char_count,
-                           (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) AS chunks
-                    FROM documents d
-                    ORDER BY d.id DESC
-                    LIMIT ?
-                    """,
-                    (value,),
-                ).fetchall()
-                return [dict(row) for row in rows]
-            finally:
-                self._close(conn)
+            data = self._load()
+        documents = sorted(
+            data["documents"], key=lambda item: int(item.get("id") or 0), reverse=True
+        )
+        rows: list[dict[str, Any]] = []
+        for document in documents[:value]:
+            rows.append(
+                {
+                    "id": int(document.get("id") or 0),
+                    "title": _as_text(document.get("title")),
+                    "source": _as_text(document.get("source")),
+                    "kind": _as_text(document.get("kind")),
+                    "created_at": _as_text(document.get("created_at")),
+                    "updated_at": _as_text(document.get("updated_at")),
+                    "char_count": int(document.get("char_count") or 0),
+                    "chunks": len(document.get("chunks") or []),
+                }
+            )
+        return rows
 
     def get_document(self, document_id: int) -> dict[str, Any]:
         try:
@@ -236,41 +212,33 @@ class KnowledgeBase:
         except (TypeError, ValueError) as exc:
             raise ResourceError("document_id 必须是整数。") from exc
         with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT id, title, source, kind, created_at, updated_at, char_count "
-                    "FROM documents WHERE id = ?",
-                    (doc_id,),
-                ).fetchone()
-                if row is None:
-                    raise ResourceError(f"知识库文档不存在：{doc_id}")
-                chunks = conn.execute(
-                    "SELECT ordinal, text FROM chunks WHERE document_id = ? ORDER BY ordinal",
-                    (doc_id,),
-                ).fetchall()
-                data = dict(row)
-                data["text"] = "\n\n".join(str(item["text"]) for item in chunks)
-                return data
-            finally:
-                self._close(conn)
+            data = self._load()
+        for document in data["documents"]:
+            if int(document.get("id") or 0) != doc_id:
+                continue
+            chunks = [str(item) for item in (document.get("chunks") or [])]
+            result = {
+                "id": doc_id,
+                "title": _as_text(document.get("title")),
+                "source": _as_text(document.get("source")),
+                "kind": _as_text(document.get("kind")),
+                "created_at": _as_text(document.get("created_at")),
+                "updated_at": _as_text(document.get("updated_at")),
+                "char_count": int(document.get("char_count") or 0),
+            }
+            result["text"] = "\n\n".join(chunks)
+            return result
+        raise ResourceError(f"知识库文档不存在：{doc_id}")
 
     def stats(self) -> dict[str, int]:
         with self._lock:
-            conn = self._connect()
-            try:
-                docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
-                chunks = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
-                chars = conn.execute(
-                    "SELECT COALESCE(SUM(char_count), 0) AS n FROM documents"
-                ).fetchone()["n"]
-                return {
-                    "documents": int(docs),
-                    "chunks": int(chunks),
-                    "chars": int(chars),
-                }
-            finally:
-                self._close(conn)
+            data = self._load()
+        documents = data["documents"]
+        return {
+            "documents": len(documents),
+            "chunks": sum(len(item.get("chunks") or []) for item in documents),
+            "chars": sum(int(item.get("char_count") or 0) for item in documents),
+        }
 
     def search(self, query: str, limit: int = 6) -> list[dict[str, Any]]:
         text = " ".join(str(query or "").split())
@@ -282,84 +250,56 @@ class KnowledgeBase:
         if not tokens:
             tokens = [text]
 
-        rows: list[sqlite3.Row] = []
         with self._lock:
-            conn = self._connect()
-            try:
-                if self._fts_ready:
-                    rows = self._fts_search(conn, tokens, count)
-                if not rows:
-                    rows = self._like_search(conn, tokens, count)
-            finally:
-                self._close(conn)
+            data = self._load()
+
+        scored: list[tuple[int, int, int, dict[str, Any], str]] = []
+        lowered = [token.lower() for token in tokens]
+        for document in data["documents"]:
+            doc_id = int(document.get("id") or 0)
+            title = _as_text(document.get("title"))
+            source = _as_text(document.get("source"))
+            kind = _as_text(document.get("kind"))
+            title_text = title.lower()
+            source_text = source.lower()
+            title_hits = sum(1 for token in lowered if token in title_text)
+            source_hits = sum(1 for token in lowered if token in source_text)
+            for ordinal, chunk in enumerate(document.get("chunks") or [], 1):
+                body = str(chunk or "")
+                body_text = body.lower()
+                body_hits = sum(body_text.count(token) for token in lowered)
+                if not body_hits and not title_hits and not source_hits:
+                    continue
+                score = body_hits + title_hits * 5 + source_hits * 3
+                scored.append(
+                    (
+                        score,
+                        doc_id,
+                        ordinal,
+                        {
+                            "title": title,
+                            "source": source,
+                            "kind": kind,
+                        },
+                        body,
+                    )
+                )
+        scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
 
         results: list[dict[str, Any]] = []
-        for row in rows:
-            body = str(row["text"] or "")
+        for _, doc_id, ordinal, meta, body in scored[:count]:
             results.append(
                 {
-                    "citation": f"[K{int(row['document_id'])}#{int(row['ordinal'])}]",
-                    "document_id": int(row["document_id"]),
-                    "ordinal": int(row["ordinal"]),
-                    "title": str(row["title"] or ""),
-                    "source": str(row["source"] or ""),
-                    "kind": str(row["kind"] or ""),
+                    "citation": f"[K{doc_id}#{ordinal}]",
+                    "document_id": doc_id,
+                    "ordinal": ordinal,
+                    "title": meta["title"],
+                    "source": meta["source"],
+                    "kind": meta["kind"],
                     "snippet": self._snippet(body, tokens),
                 }
             )
         return results
-
-    def _fts_search(
-        self, conn: sqlite3.Connection, tokens: list[str], limit: int
-    ) -> list[sqlite3.Row]:
-        usable = [token for token in tokens if len(token) >= 3]
-        if not usable:
-            return []
-        expression = " AND ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in usable)
-        try:
-            return conn.execute(
-                """
-                SELECT c.document_id, c.ordinal, c.text,
-                       d.title, d.source, d.kind, bm25(chunks_fts) AS score
-                FROM chunks_fts
-                JOIN chunks c ON c.id = chunks_fts.rowid
-                JOIN documents d ON d.id = c.document_id
-                WHERE chunks_fts MATCH ?
-                ORDER BY score ASC, c.document_id DESC
-                LIMIT ?
-                """,
-                (expression, limit),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return []
-
-    def _like_search(
-        self, conn: sqlite3.Connection, tokens: list[str], limit: int
-    ) -> list[sqlite3.Row]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        for token in tokens[:5]:
-            like = f"%{token}%"
-            clauses.append("(c.text LIKE ? OR d.title LIKE ? OR d.source LIKE ?)")
-            params.extend([like, like, like])
-        if not clauses:
-            return []
-        params.append(limit)
-        try:
-            return conn.execute(
-                f"""
-                SELECT c.document_id, c.ordinal, c.text,
-                       d.title, d.source, d.kind, 0.0 AS score
-                FROM chunks c
-                JOIN documents d ON d.id = c.document_id
-                WHERE {' AND '.join(clauses)}
-                ORDER BY c.document_id DESC, c.ordinal ASC
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return []
 
     @staticmethod
     def _snippet(text: str, tokens: list[str], limit: int = 420) -> str:
@@ -385,28 +325,15 @@ class KnowledgeBase:
         except (TypeError, ValueError) as exc:
             raise ResourceError("document_id 必须是整数。") from exc
         with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT title FROM documents WHERE id = ?", (doc_id,)
-                ).fetchone()
-                if row is None:
-                    raise ResourceError(f"知识库文档不存在：{doc_id}")
-                title = str(row["title"] or "")
-                if self._fts_ready:
-                    try:
-                        conn.execute(
-                            "DELETE FROM chunks_fts WHERE rowid IN "
-                            "(SELECT id FROM chunks WHERE document_id = ?)",
-                            (doc_id,),
-                        )
-                    except sqlite3.OperationalError:
-                        self._fts_ready = False
-                conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
-                conn.commit()
+            data = self._load()
+            for index, document in enumerate(data["documents"]):
+                if int(document.get("id") or 0) != doc_id:
+                    continue
+                title = _as_text(document.get("title"))
+                data["documents"].pop(index)
+                self._save(data)
                 return title
-            finally:
-                self._close(conn)
+        raise ResourceError(f"知识库文档不存在：{doc_id}")
 
     def archive_and_delete(self, document_id: int, trash_root: Path) -> tuple[str, Path]:
         document = self.get_document(document_id)

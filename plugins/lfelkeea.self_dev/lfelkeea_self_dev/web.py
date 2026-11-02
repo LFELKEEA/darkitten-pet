@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import re
 import urllib.parse
-import xml.etree.ElementTree as ET
 from html import unescape
 from typing import Any
 
@@ -20,6 +19,8 @@ from .net import NetworkError, http_request
 TAG_RE = re.compile(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>")
 BLOCK_RE = re.compile(r"(?is)</(p|div|li|h[1-6]|tr|section|article)>|<br\s*/?>")
 ANY_TAG_RE = re.compile(r"(?s)<[^>]+>")
+ITEM_RE = re.compile(r"(?is)<item\b[^>]*>(.*?)</item>")
+CDATA_RE = re.compile(r"(?is)<!\[CDATA\[(.*?)\]\]>")
 
 
 def strip_html(value: str) -> str:
@@ -91,6 +92,23 @@ def _ddg_results(html: str, limit: int) -> list[dict[str, str]]:
     return results
 
 
+def _xml_field(block: str, tag: str) -> str:
+    """从 RSS 的 item 里取一个字段，兼容 CDATA 和转义实体。
+
+    打包版桌宠没有带 xml.etree，这里用正则解析固定结构的 RSS，够用且零依赖。
+    """
+    match = re.search(rf"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", block)
+    if not match:
+        return ""
+    value = match.group(1)
+    cdata = CDATA_RE.search(value)
+    if cdata:
+        value = cdata.group(1)
+    else:
+        value = ANY_TAG_RE.sub("", value)
+    return unescape(value).strip()
+
+
 def _bing_rss(query: str, limit: int) -> list[dict[str, str]]:
     url = "https://www.bing.com/search?" + urllib.parse.urlencode(
         {"q": query, "format": "rss"}
@@ -98,15 +116,14 @@ def _bing_rss(query: str, limit: int) -> list[dict[str, str]]:
     response = http_request(url, timeout=25)
     if not response.ok:
         raise NetworkError(f"Bing 返回 {response.status}")
-    try:
-        root = ET.fromstring(response.text.encode("utf-8"))
-    except ET.ParseError as exc:
-        raise NetworkError(f"Bing 返回的内容无法解析：{exc}") from exc
+    items = ITEM_RE.findall(response.text or "")
+    if not items:
+        raise NetworkError("Bing 返回的内容不是可识别的 RSS")
     results: list[dict[str, str]] = []
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        description = strip_html(item.findtext("description") or "")
+    for block in items:
+        title = _xml_field(block, "title")
+        link = _xml_field(block, "link")
+        description = strip_html(_xml_field(block, "description"))
         if not title or not link:
             continue
         results.append({"title": title, "url": link, "snippet": description})
