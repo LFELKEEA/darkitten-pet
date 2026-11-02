@@ -17,8 +17,29 @@ from dataclasses import dataclass, field
 from typing import Any
 
 MAX_BYTES = 2 * 1024 * 1024
-USER_AGENT = "Mozilla/5.0 (LFELKEEA-SelfDev/1.2; +https://github.com/LFELKEEA)"
+USER_AGENT = "Mozilla/5.0 (LFELKEEA-SelfDev/1.5; +https://github.com/LFELKEEA)"
 ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+_ENV_PROVIDER: Any = None
+
+
+def set_env_provider(provider: Any) -> None:
+    """注册本地环境变量仓库；传 None 恢复只读系统环境。"""
+    global _ENV_PROVIDER
+    _ENV_PROVIDER = provider
+
+
+def lookup_env(name: str) -> str:
+    """本地仓库优先，其次进程环境。仓库异常时退回系统变量。"""
+    key = str(name or "")
+    if _ENV_PROVIDER is not None:
+        try:
+            value = _ENV_PROVIDER(key)
+        except Exception:
+            value = ""
+        if value:
+            return str(value)
+    return os.environ.get(key, "")
 
 
 class NetworkError(Exception):
@@ -33,6 +54,18 @@ class Response:
     content_type: str = ""
     text: str = ""
     secrets: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
+
+
+@dataclass
+class Blob:
+    url: str
+    status: int
+    content_type: str = ""
+    data: bytes = b""
 
     @property
     def ok(self) -> bool:
@@ -98,7 +131,7 @@ def resolve_env(value: Any, *, strict: bool = True) -> tuple[str, list[str]]:
 
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
-        secret = os.environ.get(name, "")
+        secret = lookup_env(name)
         if not secret:
             missing.append(name)
             return match.group(0)
@@ -197,6 +230,41 @@ def http_request(
         text=text,
         secrets=secrets,
     )
+
+
+def download_bytes(
+    url: str,
+    *,
+    max_bytes: int = 8 * 1024 * 1024,
+    timeout: int = 45,
+    allow_private: bool = False,
+) -> Blob:
+    """下载二进制资源；用于技能附件。拒绝本机和内网地址，并检查重定向。"""
+    target = str(url or "").strip()
+    check_public_url(target, allow_private=allow_private)
+    request = urllib.request.Request(
+        target, headers={"User-Agent": USER_AGENT}, method="GET"
+    )
+    opener = urllib.request.build_opener(_SafeRedirect(allow_private))
+    seconds = max(5, min(180, int(timeout or 45)))
+    try:
+        with opener.open(request, timeout=seconds) as response:
+            final_url = response.geturl()
+            check_public_url(final_url, allow_private=allow_private)
+            content_type = str(response.headers.get("Content-Type", ""))
+            data = response.read(max_bytes + 1)
+            status = int(getattr(response, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        raise NetworkError(f"下载失败：HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise NetworkError(f"下载失败：{exc.reason}") from exc
+    except TimeoutError as exc:
+        raise NetworkError("下载超时。") from exc
+    except Exception as exc:
+        raise NetworkError(f"下载失败：{exc}") from exc
+    if len(data) > max_bytes:
+        raise NetworkError(f"文件超过上限（{max_bytes} B），已停止下载。")
+    return Blob(url=final_url, status=status, content_type=content_type, data=data)
 
 
 def resolve_address(host: str) -> list[str]:

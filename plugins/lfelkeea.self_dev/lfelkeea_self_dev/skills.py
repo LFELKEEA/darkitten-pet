@@ -7,6 +7,7 @@ templates/、scripts/ 等资源。系统提示里只放名字和描述，真正�
 代理调用 read_skill 加载正文，避免一上来就把上下文塞满。
 """
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from .resource_util import (
     SKILL_ID_RE,
     ResourceError,
     atomic_write,
+    atomic_write_bytes,
     compose_front_matter,
     inside,
     parse_front_matter,
@@ -145,6 +147,31 @@ class SkillStore:
             return True
         return str(meta.get("enabled") or "").strip().lower() not in ("0", "false", "no", "off", "")
 
+    @staticmethod
+    def _list_value(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            parts = [str(item) for item in value]
+        else:
+            parts = re.split(r"[\s,，;；]+", str(value or ""))
+        return sorted({part.strip() for part in parts if part.strip()})
+
+    @staticmethod
+    def _requirements(folder: Path) -> tuple[dict[str, Any], str]:
+        """读取可选的 requirements.json；解析失败时只提示，不影响技能本身。"""
+        path = folder / "requirements.json"
+        if not path.is_file():
+            return {}, ""
+        try:
+            data = json.loads(read_text(path))
+        except (OSError, ValueError) as exc:
+            return {}, f"requirements.json 无法解析：{exc}"
+        if not isinstance(data, dict):
+            return {}, "requirements.json 必须是 JSON 对象。"
+        return data, ""
+
+    def folder_for(self, skill_id: str) -> Path:
+        return self._folder(skill_id)
+
     def list(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         try:
@@ -161,6 +188,7 @@ class SkillStore:
             except OSError:
                 continue
             files = self._files(folder)
+            requirements, requirements_error = self._requirements(folder)
             items.append(
                 {
                     "id": folder.name,
@@ -169,6 +197,10 @@ class SkillStore:
                     "chars": len(body),
                     "files": files,
                     "enabled": self._enabled(meta),
+                    "requires_env": self._list_value(meta.get("requires_env")),
+                    "requires_commands": self._list_value(meta.get("requires_commands")),
+                    "requirements": requirements,
+                    "requirements_error": requirements_error,
                     "updated": self._updated(manifest),
                 }
             )
@@ -181,6 +213,7 @@ class SkillStore:
             raise ResourceError(f"技能不存在：{skill_id}")
         text = read_text(manifest)
         meta, body = parse_front_matter(text)
+        requirements, requirements_error = self._requirements(folder)
         return {
             "id": folder.name,
             "name": str(meta.get("name") or self._first_heading(body) or folder.name),
@@ -188,6 +221,10 @@ class SkillStore:
             "body": body.strip(),
             "files": self._files(folder),
             "enabled": self._enabled(meta),
+            "requires_env": self._list_value(meta.get("requires_env")),
+            "requires_commands": self._list_value(meta.get("requires_commands")),
+            "requirements": requirements,
+            "requirements_error": requirements_error,
             "updated": self._updated(manifest),
         }
 
@@ -206,6 +243,20 @@ class SkillStore:
         if len(text) > 60_000:
             text = text[:60_000] + "\n…（内容超过 60000 字，已截断）"
         return f"技能 {folder.name} 的资源 {relative.as_posix()}：\n\n{text}"
+
+    def write_attachment(self, skill_id: str, path: str, data: bytes) -> str:
+        """写入下载来的附件；只允许技能目录内的相对路径。"""
+        folder = self._folder(skill_id)
+        relative = safe_relative(path)
+        if relative.as_posix().lower() == "skill.md":
+            raise ResourceError("不能覆盖 SKILL.md。")
+        target = (folder / relative).resolve()
+        if not inside(folder, target):
+            raise ResourceError("附件路径越界。")
+        if len(data) > 4 * 1024 * 1024:
+            raise ResourceError("单个附件不能超过 4 MB。")
+        atomic_write_bytes(target, data)
+        return relative.as_posix()
 
     def index_text(self, limit: int = 40) -> str:
         all_items = self.list()
@@ -269,18 +320,23 @@ class SkillStore:
         resources: Any = None,
         *,
         enabled: bool | None = None,
+        requires_env: Any = None,
+        requires_commands: Any = None,
     ) -> dict[str, Any]:
         folder = self._folder(skill_id)
         manifest_path = folder / "SKILL.md"
+        existing: dict[str, str] = {}
+        if manifest_path.is_file():
+            try:
+                existing, _body = parse_front_matter(read_text(manifest_path))
+            except OSError:
+                existing = {}
         if enabled is None:
-            if manifest_path.is_file():
-                try:
-                    meta, _body = parse_front_matter(read_text(manifest_path))
-                    enabled = self._enabled(meta)
-                except OSError:
-                    enabled = False
-            else:
-                enabled = False
+            enabled = self._enabled(existing) if existing else False
+        if requires_env is None:
+            requires_env = self._list_value(existing.get("requires_env"))
+        if requires_commands is None:
+            requires_commands = self._list_value(existing.get("requires_commands"))
         text = str(body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if not text:
             raise ResourceError("技能正文不能为空。")
@@ -294,9 +350,14 @@ class SkillStore:
         if len(desc) > 1024:
             raise ResourceError("description 最多 1024 字。")
         folder.mkdir(parents=True, exist_ok=True)
-        manifest = compose_front_matter(
-            {"name": title, "description": desc, "enabled": bool(enabled)}, text
-        )
+        metadata: dict[str, Any] = {"name": title, "description": desc, "enabled": bool(enabled)}
+        env_list = self._list_value(requires_env)
+        command_list = self._list_value(requires_commands)
+        if env_list:
+            metadata["requires_env"] = env_list
+        if command_list:
+            metadata["requires_commands"] = command_list
+        manifest = compose_front_matter(metadata, text)
         atomic_write(folder / "SKILL.md", manifest)
 
         written = ["SKILL.md"]
@@ -349,6 +410,8 @@ class SkillStore:
                     str(item.get("body") or ""),
                     item.get("resources"),
                     enabled=bool(item.get("enabled", False)),
+                    requires_env=item.get("requires_env"),
+                    requires_commands=item.get("requires_commands"),
                 )
                 created += 1
             except ResourceError:

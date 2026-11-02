@@ -17,6 +17,7 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal
 
 from .agent import Agent
+from .envstore import EnvStore
 from .exporter import ExportError, export_plugin, list_plugins
 from .history import ChangeJournal
 from .llm import LLMError, chat, describe_config, load_llm_config
@@ -44,6 +45,7 @@ class DevService(QObject):
         self.raw = self._read_settings()
         self.settings = normalize_settings(self.raw)
         self.paths = (paths or DevPaths.discover(self.settings["workspace_dir"])).ensure()
+        self.env_store = EnvStore(self.paths.env_file).activate()
         self.catalog_seeded = self._seed_catalog()
         self.ui: Any = None
         self._thread: threading.Thread | None = None
@@ -83,6 +85,7 @@ class DevService(QObject):
         previous_workspace = self.paths.workspace
         self.settings = normalize_settings(self.raw)
         self.paths = DevPaths.discover(self.settings["workspace_dir"]).ensure()
+        self.env_store = EnvStore(self.paths.env_file).activate()
         self.catalog_seeded = self._seed_catalog()
         if previous_workspace != self.paths.workspace:
             self._emit(
@@ -224,6 +227,7 @@ class DevService(QObject):
                 enable_plugin=self._enable_plugin,
                 stop_event=stop,
                 logger=self._log,
+                env_store=self.env_store,
             )
             seeded = toolbox.skills.seed_defaults()
             if seeded:

@@ -38,10 +38,14 @@ def read_text(path: Path) -> str:
 
 
 def atomic_write(path: Path, content: str) -> None:
+    atomic_write_bytes(path, content.encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".tmp-resource")
-    tmp.write_bytes(content.encode("utf-8"))
+    tmp.write_bytes(content)
     os.replace(tmp, target)
 
 
@@ -149,6 +153,14 @@ def compose_front_matter(metadata: dict[str, Any], body: str) -> str:
             "",
         )
         lines.append(f"enabled: {'true' if flag else 'false'}")
+    for key in ("requires_env", "requires_commands"):
+        value = metadata.get(key)
+        if isinstance(value, (list, tuple, set)):
+            value = ", ".join(str(part).strip() for part in value if str(part).strip())
+        text = str(value or "").replace("\n", " ").strip()
+        if text:
+            escaped = text.replace('"', '\\"')
+            lines.append(f'{key}: "{escaped}"')
     lines.append("---")
     return "\n".join(lines) + "\n\n" + str(body or "").lstrip("\n").rstrip() + "\n"
 

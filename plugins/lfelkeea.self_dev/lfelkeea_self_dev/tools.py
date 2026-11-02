@@ -25,8 +25,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import hub as hub_tools
+from . import requirements as req_tools
 from . import web as web_tools
 from .connectors import ConnectorStore
+from .envstore import EnvStore
 from .history import ChangeJournal, JournalError
 from .knowledge import KnowledgeBase
 from .net import NetworkError
@@ -83,6 +85,9 @@ DANGEROUS_TOOLS = {
     "call_mcp_tool",
     "install_skill",
     "install_mcp_server",
+    "prepare_requirement",
+    "enable_skill",
+    "enable_connector",
 }
 # 删除属于不可逆操作：即使审批模式是 auto，也必须弹窗确认。
 ALWAYS_CONFIRM = {"delete_skill", "delete_connector", "delete_knowledge"}
@@ -150,7 +155,7 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
         "desc": "按关键词搜索技能正文，找到该用哪个技能。",
     },
     "save_skill": {
-        "usage": 'save_skill(skill_id, name, description, body, resources={}, enabled=null)',
+        "usage": 'save_skill(skill_id, name, description, body, resources={}, enabled=null, requires_env="", requires_commands="")',
         "desc": "新建或更新技能；新建默认启用，更新时省略 enabled 会保持原状态。",
     },
     "delete_skill": {
@@ -159,11 +164,31 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
     },
     "set_skill_enabled": {
         "usage": "set_skill_enabled(skill_id, enabled)",
-        "desc": "打开或关闭一个技能；关闭的技能不会进入系统提示，也不会被读取。",
+        "desc": (
+            "打开或关闭一个技能；关闭的技能不会进入系统提示，也不会被读取。"
+            "需要打开关闭项时先说明理由，启用会弹窗向主人申请确认。"
+        ),
     },
     "set_connector_enabled": {
         "usage": "set_connector_enabled(connector_id, enabled)",
-        "desc": "打开或关闭一个连接器；关闭的连接器不能调用。",
+        "desc": (
+            "打开或关闭一个连接器；关闭的连接器不能调用。"
+            "需要打开关闭项时先说明理由，启用会弹窗向主人申请确认。"
+        ),
+    },
+    "check_requirements": {
+        "usage": 'check_requirements(item="")',
+        "desc": (
+            "检查已启用的技能和连接器缺哪些环境变量、命令或下载资源；"
+            "只返回名称和状态，不返回任何密钥值。item 可填技能或连接器 id。"
+        ),
+    },
+    "prepare_requirement": {
+        "usage": 'prepare_requirement(kind, item_id)',
+        "desc": (
+            "为技能下载声明的资源，或为 MCP 连接器预装 npm/PyPI 包和 Playwright 浏览器；"
+            "会联网并修改本机缓存，必须先得到主人确认。"
+        ),
     },
     "search_skills_online": {
         "usage": 'search_skills_online(query="", limit=8)',
@@ -295,6 +320,7 @@ class ToolBox:
         skills: SkillStore | None = None,
         connectors: ConnectorStore | None = None,
         knowledge: KnowledgeBase | None = None,
+        env_store: EnvStore | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.dev_dir = Path(dev_dir).resolve()
@@ -320,6 +346,7 @@ class ToolBox:
             self.dev_dir / "connectors.json", self.workspace, self.trash
         )
         self.knowledge = knowledge or KnowledgeBase(self.dev_dir / "knowledge")
+        self.env_store = (env_store or EnvStore(self.dev_dir / "env.json")).activate()
 
     # ------------------------------------------------------------------ 入口
 
@@ -896,13 +923,42 @@ class ToolBox:
         lines = [f"技能（共 {len(items)} 个，已启用 {active} 个）："]
         for item in items:
             state = "开" if item.get("enabled") else "关"
+            status = req_tools.item_requirements("skill", item, self.env_store)
+            suffix = (
+                f"（缺 {status['missing']} 项依赖）"
+                if item.get("enabled") and status["missing"]
+                else ""
+            )
             lines.append(
-                f"- [{state}] `{item['id']}` — {item['name']}：{item['description']}"
+                f"- [{state}] `{item['id']}` — {item['name']}：{item['description']}{suffix}"
             )
         lines.append("关闭的技能不会进入系统提示；用 set_skill_enabled(skill_id, true) 打开。")
         return "\n".join(lines)
 
     def tool_set_skill_enabled(self, skill_id: str, enabled: bool = True) -> str:
+        try:
+            current = self.skills.get(skill_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if enabled and not current.get("enabled"):
+            status = req_tools.item_requirements("skill", current, self.env_store)
+            missing = [
+                requirement["name"]
+                for requirement in status["requirements"]
+                if not requirement["configured"]
+            ]
+            if not self._approve(
+                "enable_skill",
+                "启用技能",
+                f"打开技能「{current['name']}」（{skill_id}）",
+                "启用后这个技能会进入系统提示，代理可以读取和使用它。\n"
+                + (
+                    "启用前还缺：" + "、".join(missing)
+                    if missing
+                    else "依赖检查：没有发现缺失项。"
+                ),
+            ):
+                return f"主人拒绝了启用技能 {skill_id}。"
         try:
             skill = self.skills.set_enabled(skill_id, bool(enabled))
         except ResourceError as exc:
@@ -930,6 +986,21 @@ class ToolBox:
         ]
         if extras:
             lines.extend(["", "附件（用 read_skill(skill_id, resource) 读取）：" + "、".join(extras)])
+        status = req_tools.item_requirements("skill", skill, self.env_store)
+        if status["missing"]:
+            missing = [
+                f"{item['kind']}:{item['name']}"
+                for item in status["requirements"]
+                if not item["configured"]
+            ]
+            lines.extend(
+                [
+                    "",
+                    "依赖提醒：缺 " + "、".join(missing) + "。",
+                    "环境变量由主人在资源界面「环境与依赖」里填写；"
+                    "不要向主人索要密钥明文，也不要把值写进回答或文件。",
+                ]
+            )
         return "\n".join(lines)
 
     def tool_search_skills(self, query: str, limit: int = 10) -> str:
@@ -955,6 +1026,8 @@ class ToolBox:
         body: str = "",
         resources: Any = None,
         enabled: bool | None = None,
+        requires_env: Any = None,
+        requires_commands: Any = None,
     ) -> str:
         if enabled is None:
             try:
@@ -963,7 +1036,14 @@ class ToolBox:
                 enabled = True
         try:
             skill = self.skills.save(
-                skill_id, name, description, body, resources, enabled=bool(enabled)
+                skill_id,
+                name,
+                description,
+                body,
+                resources,
+                enabled=bool(enabled),
+                requires_env=requires_env,
+                requires_commands=requires_commands,
             )
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
@@ -1147,8 +1227,15 @@ class ToolBox:
         for item in items:
             kind = "HTTP" if item["type"] == "http" else "MCP"
             state = "开" if item.get("enabled") else "关"
+            status = req_tools.item_requirements("connector", item, self.env_store)
+            suffix = (
+                f"（缺 {status['missing']} 项依赖）"
+                if item.get("enabled") and status["missing"]
+                else ""
+            )
             lines.append(
-                f"- [{state}] `{item['id']}`（{kind}）{item['name']}：{item.get('description', '')}"
+                f"- [{state}] `{item['id']}`（{kind}）{item['name']}："
+                f"{item.get('description', '')}{suffix}"
             )
             lines.append(json.dumps(self._public_connector(item), ensure_ascii=False, indent=2))
         if len(enabled) < len(items):
@@ -1160,12 +1247,163 @@ class ToolBox:
 
     def tool_set_connector_enabled(self, connector_id: str, enabled: bool = True) -> str:
         try:
+            current = self.connectors.get(connector_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if enabled and not current.get("enabled"):
+            status = req_tools.item_requirements("connector", current, self.env_store)
+            missing = [
+                requirement["name"]
+                for requirement in status["requirements"]
+                if not requirement["configured"]
+            ]
+            if not self._approve(
+                "enable_connector",
+                "启用连接器",
+                f"打开连接器「{current['name']}」（{connector_id}）",
+                "启用后这个连接器会进入系统提示，代理可以调用它访问外部服务或启动 MCP 进程。\n"
+                + (
+                    "启用前还缺：" + "、".join(missing)
+                    if missing
+                    else "依赖检查：没有发现缺失项。"
+                ),
+            ):
+                return f"主人拒绝了启用连接器 {connector_id}。"
+        try:
             item = self.connectors.set_enabled(connector_id, bool(enabled))
         except ResourceError as exc:
             raise ToolError(str(exc)) from exc
         self.changed_files.append("data/dev/connectors.json")
         state = "已启用" if item.get("enabled") else "已关闭"
         return f"连接器 {item['id']}「{item['name']}」{state}。"
+
+    def tool_check_requirements(self, item: str = "") -> str:
+        statuses = req_tools.check_items(self.skills, self.connectors, self.env_store)
+        needle = str(item or "").strip()
+        if needle:
+            statuses = [status for status in statuses if status["id"] == needle]
+            if not statuses:
+                raise ToolError(f"找不到技能或连接器 {needle}。")
+        else:
+            statuses = [status for status in statuses if status["enabled"]]
+            if not statuses:
+                return "还没有启用的技能或连接器。先在资源界面勾选要用的条目。"
+        missing = [status for status in statuses if status["missing"]]
+        lines = [
+            f"检查 {len(statuses)} 个已启用项："
+            f"{len(statuses) - len(missing)} 个就绪，{len(missing)} 个缺依赖。"
+        ]
+        if not missing:
+            lines.append("环境变量和启动命令都齐全。")
+        for status in missing:
+            label = "连接器" if status["kind"] == "connector" else "技能"
+            lines.append(
+                f"- [{label}] `{status['id']}` {status['name']}：缺 {status['missing']} 项"
+            )
+            for requirement in status["requirements"]:
+                if requirement["configured"]:
+                    continue
+                kind = "环境变量" if requirement["kind"] == "env" else "命令"
+                detail = f"  - {kind} `{requirement['name']}`：{requirement['label']}"
+                if requirement.get("help_url"):
+                    detail += f"（获取：{requirement['help_url']}）"
+                if requirement.get("note"):
+                    detail += f"；{requirement['note']}"
+                lines.append(detail)
+        downloadable = [status for status in statuses if status.get("downloads")]
+        if downloadable:
+            for status in downloadable:
+                count = len(status["downloads"])
+                lines.append(
+                    f"- 技能 `{status['id']}` 声明了 {count} 个可下载资源，"
+                    "可用 prepare_requirement('skill', id) 下载。"
+                )
+        lines.append(
+            "环境变量由主人在资源界面「环境与依赖」里填写；"
+            "不要向主人索要密钥明文，也不要把值写进回答、日志或文件。"
+        )
+        return "\n".join(lines)
+
+    def tool_prepare_requirement(self, kind: str, item_id: str) -> str:
+        name = str(kind or "").strip().lower()
+        if name in ("连接器", "connector", "connectors"):
+            name = "connector"
+        elif name in ("技能", "skill", "skills"):
+            name = "skill"
+        else:
+            raise ToolError("kind 只能是 connector 或 skill。")
+        identifier = str(item_id or "").strip()
+        if not identifier:
+            raise ToolError("item_id 不能为空。")
+        try:
+            item = (
+                self.connectors.get(identifier)
+                if name == "connector"
+                else self.skills.get(identifier)
+            )
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        plan = req_tools.prepare_plan(name, item, self.env_store)
+        lines = [f"{plan['name']}（{plan['id']}）的准备清单："]
+        for command in plan["commands"]:
+            lines.append(f"- 运行：{' '.join(command['argv'])}")
+            if command.get("note"):
+                lines.append(f"  {command['note']}")
+        for download in plan["downloads"]:
+            lines.append(f"- 下载：{download['url']} → {download['path']}")
+        for link in plan["links"]:
+            lines.append(f"- 手动下载：{link['label']} {link['url']}")
+        for note in plan["notes"]:
+            lines.append(f"- 提醒：{note}")
+        for blocked in plan["blocked"]:
+            lines.append(f"- 受阻：{blocked}")
+        if not plan["has_actions"]:
+            lines.append("没有可以自动下载或安装的内容。")
+            return "\n".join(lines)
+        if plan["commands"] or plan["downloads"]:
+            self._require_network()
+        if not self._approve(
+            "prepare_requirement",
+            "准备技能/连接器资源",
+            f"{plan['name']}（{plan['id']}）",
+            "会联网下载并修改本机缓存或技能目录：\n"
+            + "\n".join(
+                [f"$ {' '.join(command['argv'])}" for command in plan["commands"]]
+                + [f"GET {download['url']} -> {download['path']}" for download in plan["downloads"]]
+            ),
+        ):
+            return f"主人拒绝了准备 {plan['id']} 的资源。"
+        results: list[str] = []
+        for command in plan["commands"]:
+            outcome = req_tools.run_command(
+                command["argv"],
+                cwd=self.workspace,
+                timeout=int(item.get("timeout", 600) or 600),
+            )
+            state = "成功" if outcome["ok"] else f"失败（退出码 {outcome['code']}）"
+            results.append(
+                f"$ {' '.join(command['argv'])}\n{state}\n{outcome['output']}"
+            )
+            if not outcome["ok"]:
+                results.append("后面的准备命令已跳过；先处理上面的错误。")
+                break
+        else:
+            if plan["downloads"]:
+                downloaded = req_tools.download_skill_resources(
+                    self.skills,
+                    identifier,
+                    plan["downloads"],
+                    allow_private=bool(self.settings.get("allow_private_network", False)),
+                )
+                for result in downloaded:
+                    state = "成功" if result["ok"] else "失败"
+                    results.append(
+                        f"下载 {result['path']}：{state}（{result.get('message', '')}）"
+                    )
+                if any(result["ok"] for result in downloaded):
+                    self.changed_files.append(f"data/dev/skills/{identifier}")
+        body = "\n\n".join(results) if results else "没有实际执行内容。"
+        return "\n".join(lines) + "\n\n执行结果：\n" + body
 
     def tool_save_connector(self, payload: Any = None, **fields: Any) -> str:
         if isinstance(payload, str):

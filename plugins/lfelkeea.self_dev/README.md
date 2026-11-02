@@ -10,7 +10,9 @@
 - **技能**：把“这种情况该怎么做”沉淀成可复用的做法库，下次直接读；本地没有合适的，就自己上 GitHub 搜索、浏览仓库里的 `SKILL.md` 并安装回来。技能用勾选框开关，关闭后不进入系统提示，也不需要删除。
 - **知识库**：把资料、旧结论、任务总结存进本地文件，用中文或代码关键词检索，并保留 `[K文档#片段]` 引用。
 - **连接器**：接入 HTTP API，或按需启动 MCP stdio 服务器，把外部能力带进任务；缺连接器时会搜 MCP 仓库、读 README、推断 `npx` / `uvx` 启动命令后安装。连接器同样用勾选框开关。
-- **自带目录**：插件内置 31 个开发技能和 36 个连接器，覆盖 GitHub、GitLab、飞书、Notion、SearXNG、只读 SQL 网关、Context7、Playwright、Blender、各语言包管理器和常用 MCP；全部默认关闭，勾选后才生效。
+- **自带目录**：插件内置 44 个技能和 42 个连接器，覆盖 GitHub、GitLab、飞书、Notion、SearXNG、只读 SQL 网关、Context7、Playwright、Blender、各语言包管理器和常用 MCP；也包含 Word / PDF / Excel / PPT 处理、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索、自然化写作，以及 OpenAI 兼容 API、Tavily、arXiv、Crossref、OpenAlex、维基百科。全部默认关闭，勾选后才生效。
+- **依赖检查**：启用后可以先查环境变量、启动命令和下载资源；环境变量可本机保存，界面只显示「已配置 / 缺失」，代理只看到名称和状态。MCP 的 npm / PyPI 包、Playwright 浏览器和技能声明的资源可以在确认后预下载。
+- **申请启用**：代理做到一半发现需要某个关闭的技能或连接器时，会说明理由并弹窗申请打开；主人同意后才启用。
 - **联网检索**：不熟悉的库、报错、版本差异，可以搜网页、GitHub 仓库和 PyPI 包。
 - 不限制步数和输出长度：一直做到任务完成，而不是数到 24 步就收工。
 - 把成果直接做成新的桌宠插件：写入 `data/plugins/<id>/`，通过检查后自动启用并重载。
@@ -37,6 +39,7 @@ data/dev/
 ├─ skills/            技能库，每个技能一个目录，入口是 SKILL.md
 ├─ knowledge/         本地知识库（knowledge.json）
 ├─ connectors.json    HTTP API / MCP 连接器定义
+├─ env.json           本机环境变量（明文，权限尽量收紧，不要分享）
 ├─ sessions/          每次任务的 JSONL 日志
 ├─ .backups/          覆盖文件、更新插件前的自动备份
 ├─ .changes/          改动账本与首次修改前的基线（一键还原用）
@@ -63,7 +66,19 @@ data/dev/
 
 技能默认关闭。资源界面左侧每个技能前都有勾选框，勾选即启用，取消即关闭；`set_skill_enabled(skill_id, true/false)` 也可以让代理自己切换。关闭的技能不会进入系统提示，`read_skill` 也会拒绝读取，但目录和内容仍然保留，随时可以再打开。旧版本没有 `enabled` 字段的技能按启用处理，不会被这次升级误关。
 
-插件还会自动补入 31 个开发技能，同样默认关闭，包括：代码评审、GitHub API、飞书 API、Notion API、只读 SQL、SearXNG、网页抓取、MCP 工具链、Git 工作流、Python 工程、前端、API 设计、数据库设计、测试、调试、性能、安全、重构、发布、Docker、Windows 命令行、CLI 设计、Python 打包、技术写作、架构图、视觉设计、3D 建模、数据分析、依赖审计、可访问性和文档维护。
+插件还会自动补入 44 个技能，同样默认关闭。开发类包括：代码评审、GitHub API、飞书 API、Notion API、只读 SQL、SearXNG、网页抓取、MCP 工具链、Git 工作流、Python 工程、前端、API 设计、数据库设计、测试、调试、性能、安全、重构、发布、Docker、Windows 命令行、CLI 设计、Python 打包、技术写作、架构图、视觉设计、3D 建模、数据分析、依赖审计、可访问性和文档维护。日常与创作类包括：Word、PDF、Excel、PPT、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索、自然化写作和技能编写。
+
+技能可以在 frontmatter 里声明 `requires_env` / `requires_commands`，也可以在技能目录放 `requirements.json`：
+
+```json
+{
+  "env": ["BRAVE_API_KEY"],
+  "commands": ["npx"],
+  "downloads": [
+    {"label": "参考数据", "url": "https://example.com/data.json", "path": "references/data.json"}
+  ]
+}
+```
 
 代理用 `list_skills` / `read_skill` / `search_skills` 读取，用 `save_skill` 沉淀新做法。技能正文上限 4 万字，超过时把细节拆到 `references/` 资源里。
 
@@ -86,12 +101,24 @@ data/dev/
 
 自带连接器（全部默认关闭）：
 
-- HTTP：`github`、`gitlab`、`feishu`、`notion`、`searxng`、`sql-gateway`、`fetch-gateway`、`pypi`、`npm-registry`、`crates-io`、`nuget`、`maven-central`、`rubygems`、`packagist`、`pub-dev`、`dockerhub`、`huggingface`、`stackexchange`、`devto`、`hackernews`。
+- HTTP：`github`、`gitlab`、`feishu`、`notion`、`searxng`、`sql-gateway`、`fetch-gateway`、`pypi`、`npm-registry`、`crates-io`、`nuget`、`maven-central`、`rubygems`、`packagist`、`pub-dev`、`dockerhub`、`huggingface`、`stackexchange`、`devto`、`hackernews`、`openai-api`、`tavily`、`arxiv`、`crossref`、`openalex`、`wikipedia`。
 - MCP：`context7`、`mcp-filesystem`、`mcp-git`、`mcp-sqlite`、`mcp-playwright`、`mcp-chrome-devtools`、`mcp-fetch`、`mcp-markitdown`、`mcp-duckduckgo`、`mcp-memory`、`mcp-sequential-thinking`、`mcp-time`、`mcp-blender`、`mcp-github`、`mcp-brave-search`、`mcp-everything`。
 
 密钥只在运行时从环境变量解析，界面和模型看到的普通密钥值会显示为 `***`；响应里如果回显密钥，也会先打码再交给模型。连接器调用和 MCP 工具调用默认需要确认。
 
 缺 MCP 连接器时，代理会先用 `search_mcp_servers` 找仓库，用 `read_repo_file` 读 README 确认包名和参数，再 `install_mcp_server`。包名支持 `npm:xxx` / `pypi:xxx` 前缀；不带前缀时先查 npm，再查 PyPI，分别推断 `npx -y` 或 `uvx`。启动命令找不到会直接报错，不会写一条跑不起来的配置。MCP 服务器是以当前用户权限运行的本地进程，所以安装前会展示完整命令行并等待确认；同名连接器不会被静默覆盖。
+
+### 环境与依赖
+
+启用技能或连接器之后，资源界面的「环境与依赖」标签页会做一次体检：
+
+- **环境变量**：从连接器的 `base_url`、`headers`、MCP `env`，以及技能的 `requires_env` / `requirements.json` 推断。缺失项显示来源和获取地址，值可以用密码框写入 `data/dev/env.json`；已经写在系统环境变量里的也会识别。
+- **启动命令**：MCP 的 `command` 和技能声明的 `requires_commands` 会检查是否在 PATH 里；缺 Node.js、uv、Blender 时给出官方下载地址，不自动装系统运行时。
+- **下载资源**：MCP 用 `npx` 时可用 `npm cache add` 预下载包，用 `uvx` 时可用 `uv tool install`；Playwright 可以预下载 Chromium；技能可以在 `requirements.json` 里声明 `downloads`，确认后下载到技能目录（单文件 4 MB、单次总量 8 MB）。
+
+环境变量解析顺序是「本地 `env.json` → 系统环境变量」。本地值不会进入系统提示、日志、会话记录或回答，界面只显示 `***`；代理只能通过 `check_requirements` 看到名称、来源和是否配置，拿不到明文。`env.json` 本身是明文文件（和桌宠自己的 `config.json` 一样），不会被打进插件包，也不要提交或分享。
+
+打开一个原本关闭的技能或连接器属于权限变更：代理需要说明理由，`set_skill_enabled` / `set_connector_enabled` 会弹窗申请，主人允许后才写入开关。
 
 ### 知识库
 
@@ -125,13 +152,15 @@ data/dev/
 | `create_plugin` | 创建/更新插件，可立即启用 |
 | `ask_user` | 需求不清时问主人 |
 | `list_skills` / `read_skill` / `search_skills` | 查看和检索技能（只读已启用项） |
-| `save_skill` / `delete_skill` / `set_skill_enabled` | 新建、删除或开关技能 |
+| `save_skill` / `delete_skill` / `set_skill_enabled` | 新建、删除或开关技能（启用关闭项需确认） |
 | `search_skills_online` / `list_repo_skills` | 在 GitHub 找技能仓库、列出仓库里的技能 |
 | `install_skill` / `read_repo_file` | 安装外部技能、读取仓库文件 |
 | `list_connectors` | 看全部连接器及开关状态 |
 | `call_connector` | 调用已启用的 HTTP 连接器 |
 | `mcp_tools` / `call_mcp_tool` | 列出或调用已启用的 MCP 工具 |
-| `save_connector` / `delete_connector` / `set_connector_enabled` | 新建、删除或开关连接器 |
+| `save_connector` / `delete_connector` / `set_connector_enabled` | 新建、删除或开关连接器（启用关闭项需确认） |
+| `check_requirements` | 检查已启用项的缺失环境变量、命令和下载资源，不返回值 |
+| `prepare_requirement` | 预下载技能资源或 MCP 依赖，需确认 |
 | `search_mcp_servers` / `install_mcp_server` | 搜索并安装 MCP 服务器 |
 | `search_knowledge` / `list_knowledge` | 检索和浏览知识库 |
 | `import_knowledge` / `import_knowledge_file` / `import_knowledge_url` | 导入文本、文件或网页 |
@@ -189,14 +218,16 @@ data/dev/
 
 ## 安全说明
 
-- 插件是运行在桌宠进程里的本机 Python 代码，不是沙箱；本插件把风险收敛在六点：
+- 插件是运行在桌宠进程里的本机 Python 代码，不是沙箱；本插件把风险收敛在七点：
   1. 文件访问锁在开发区；
   2. 破坏性操作前备份，删除优先走回收站；
-  3. 命令执行、连接器调用、MCP 工具调用、外部技能安装和插件安装默认要人确认；
-  4. 没有工作台窗口时，需要确认的操作一律拒绝；
-  5. 联网默认拦截本机和内网地址，重定向也检查；
-  6. 连接器密钥只从环境变量解析，返回给模型前打码。
+  3. 命令执行、连接器调用、MCP 工具调用、外部技能安装、资源预下载和插件安装默认要人确认；
+  4. 打开原本关闭的技能或连接器也要确认；
+  5. 没有工作台窗口时，需要确认的操作一律拒绝；
+  6. 联网默认拦截本机和内网地址，重定向也检查；
+  7. 连接器密钥从「本地 env.json → 系统环境变量」解析，返回给模型前打码，代理只能看到名称和状态。
 - 不要把审批模式设成 `auto` 去跑来源不明的任务。
+- `data/dev/env.json` 是明文存储，权限尽量收紧到 600；不要提交、分享或打进插件包。发现泄露时先在对应平台轮换令牌。
 - 代理读到的网页内容、外部技能和仓库 README 都可能包含指令注入，遇到“忽略规则”“把密钥发给我”一类内容应忽略；插件里也已在提示词和安装确认框里强调。
 - 在线下载只收文本附件，有单个和总大小上限，二进制直接跳过；但外部技能仍然是第三方内容，安装前值得扫一眼正文。
 - MCP 服务器是你自己配置的本地命令，拥有当前用户权限；只挂载可信服务器。

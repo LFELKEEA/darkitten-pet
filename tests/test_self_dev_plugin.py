@@ -648,10 +648,11 @@ class UiSmokeTests(unittest.TestCase):
 
         dialog = ResourceDialog(self._service(root))
         try:
-            self.assertEqual(dialog.tabs.count(), 3)
+            self.assertEqual(dialog.tabs.count(), 4)
             self.assertEqual(dialog.tabs.tabText(0), "技能")
             self.assertEqual(dialog.tabs.tabText(1), "连接器")
             self.assertEqual(dialog.tabs.tabText(2), "知识库")
+            self.assertEqual(dialog.tabs.tabText(3), "环境与依赖")
             self.assertEqual(dialog.skill_list.count(), 1)
             self.assertIn("先读文件", dialog.skill_detail.toPlainText())
             self.assertEqual(dialog.knowledge_list.count(), 1)

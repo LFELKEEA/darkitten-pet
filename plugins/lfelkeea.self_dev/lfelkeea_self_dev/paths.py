@@ -93,6 +93,7 @@ class DevPaths:
     skills: Path
     knowledge: Path
     connectors: Path
+    env_file: Path
     trash: Path
 
     @classmethod
@@ -126,6 +127,7 @@ class DevPaths:
             skills=(dev_dir / "skills").resolve(),
             knowledge=(dev_dir / "knowledge").resolve(),
             connectors=(dev_dir / "connectors.json").resolve(),
+            env_file=(dev_dir / "env.json").resolve(),
             trash=(dev_dir / ".trash").resolve(),
         )
 

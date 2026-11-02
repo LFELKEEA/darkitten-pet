@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QTabWidget,
@@ -38,8 +39,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import requirements as req_tools
 from . import web as web_tools
 from .connectors import ConnectorStore
+from .envstore import EnvStore
 from .knowledge import KnowledgeBase
 from .resource_util import ResourceError
 from .skills import SkillStore
@@ -1006,6 +1009,12 @@ class SkillEditorDialog(QDialog):
         self.enabled_check = QCheckBox("启用这个技能（关闭时不会进入系统提示，也不能读取）")
         self.enabled_check.setChecked(False)
         form.addWidget(self.enabled_check)
+        self.req_env_edit = QLineEdit()
+        self.req_env_edit.setPlaceholderText("需要主人配置的环境变量，例如 GITHUB_PAT, NOTION_TOKEN")
+        form.addWidget(self._row("环境变量", self.req_env_edit))
+        self.req_cmd_edit = QLineEdit()
+        self.req_cmd_edit.setPlaceholderText("需要本机已有的命令，例如 npx, uvx, blender")
+        form.addWidget(self._row("依赖命令", self.req_cmd_edit))
         self.body_edit = QPlainTextEdit()
         self.body_edit.setPlaceholderText(
             "# 适用场景\n\n# 步骤\n1. …\n\n# 检查点\n- …"
@@ -1046,6 +1055,8 @@ class SkillEditorDialog(QDialog):
         self.desc_edit.setText(str(self.skill.get("description", "")))
         self.body_edit.setPlainText(str(self.skill.get("body", "")))
         self.enabled_check.setChecked(bool(self.skill.get("enabled", False)))
+        self.req_env_edit.setText(", ".join(self.skill.get("requires_env") or []))
+        self.req_cmd_edit.setText(", ".join(self.skill.get("requires_commands") or []))
 
     def _save(self) -> None:
         try:
@@ -1055,6 +1066,8 @@ class SkillEditorDialog(QDialog):
                 self.desc_edit.text().strip(),
                 self.body_edit.toPlainText(),
                 enabled=self.enabled_check.isChecked(),
+                requires_env=self.req_env_edit.text(),
+                requires_commands=self.req_cmd_edit.text(),
             )
         except (ResourceError, OSError) as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
@@ -1320,6 +1333,158 @@ class TextImportDialog(QDialog):
         self.accept()
 
 
+class EnvVarsDialog(QDialog):
+    """填写技能/连接器需要的环境变量；不回显已保存的值。"""
+
+    def __init__(self, store: EnvStore, names: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.store = store
+        self.names = sorted({name for name in names if store.valid_name(name)})
+        self.edits: dict[str, QLineEdit] = {}
+        self.status_labels: dict[str, QLabel] = {}
+        self.clear_buttons: dict[str, QPushButton] = {}
+        self.secret_names = {
+            name for name in self.names if req_tools.ENV_DOCS.get(name, {}).get("secret", True)
+        }
+        self.setWindowTitle("环境变量")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+        self.resize(640, 560)
+        self.setStyleSheet(STYLE)
+        self._build()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+        title = QLabel("环境变量")
+        title.setObjectName("title")
+        layout.addWidget(title)
+        note = QLabel(
+            "只保存在本机 data/dev/env.json，不进入模型上下文、会话日志或插件包。"
+            "已保存的值不会回显；留空表示保持原值。系统环境变量已经配置的，也可以直接留空。"
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        if not self.names:
+            empty = QLabel("这个条目没有声明需要环境变量。")
+            empty.setObjectName("muted")
+            layout.addWidget(empty)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        rows = QVBoxLayout(container)
+        rows.setContentsMargins(0, 0, 6, 0)
+        rows.setSpacing(12)
+        for name in self.names:
+            doc = req_tools.ENV_DOCS.get(name, {})
+            label = str(doc.get("label") or name)
+            header = QLabel(f"{label}  ·  {name}")
+            header.setObjectName("section")
+            header.setWordWrap(True)
+            rows.addWidget(header)
+            edit = QLineEdit()
+            source = self.store.source(name)
+            edit.setPlaceholderText(
+                "输入新值覆盖当前设置；留空保持"
+                if source != "missing"
+                else "还没有配置，在这里填写"
+            )
+            if name in self.secret_names:
+                edit.setEchoMode(QLineEdit.EchoMode.Password)
+            self.edits[name] = edit
+            rows.addWidget(edit)
+            line = QHBoxLayout()
+            status = QLabel(self._status_text(name))
+            status.setObjectName("ok" if source != "missing" else "warn")
+            self.status_labels[name] = status
+            line.addWidget(status, 1)
+            if doc.get("help_url"):
+                link = QLabel(f'<a href="{html.escape(str(doc["help_url"]))}">获取方式</a>')
+                link.setOpenExternalLinks(True)
+                link.setObjectName("muted")
+                line.addWidget(link)
+            clear = QPushButton("清除本地值")
+            clear.setObjectName("ghost")
+            clear.clicked.connect(lambda _checked=False, key=name: self._clear(key))
+            self.clear_buttons[name] = clear
+            clear.setVisible(source == "local")
+            line.addWidget(clear)
+            rows.addLayout(line)
+            if doc.get("note"):
+                hint = QLabel(str(doc["note"]))
+                hint.setObjectName("muted")
+                hint.setWordWrap(True)
+                rows.addWidget(hint)
+        rows.addStretch(1)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+        buttons = QHBoxLayout()
+        show = QCheckBox("显示输入内容")
+        show.toggled.connect(self._toggle_echo)
+        buttons.addWidget(show)
+        buttons.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("保存")
+        save.setObjectName("primary")
+        save.clicked.connect(self._save)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def _status_text(self, name: str) -> str:
+        source = self.store.source(name)
+        if source == "local":
+            return "已保存到本机 env.json"
+        if source == "system":
+            return "已从系统环境变量读取"
+        return "未配置"
+
+    def _refresh_status(self, name: str) -> None:
+        label = self.status_labels.get(name)
+        if label is not None:
+            source = self.store.source(name)
+            label.setText(self._status_text(name))
+            label.setObjectName("ok" if source != "missing" else "warn")
+            label.style().unpolish(label)
+            label.style().polish(label)
+        button = self.clear_buttons.get(name)
+        if button is not None:
+            button.setVisible(self.store.source(name) == "local")
+
+    def _clear(self, name: str) -> None:
+        try:
+            self.store.clear(name)
+        except ResourceError as exc:
+            QMessageBox.warning(self, "清除失败", str(exc))
+            return
+        edit = self.edits.get(name)
+        if edit is not None:
+            edit.clear()
+        self._refresh_status(name)
+
+    def _toggle_echo(self, visible: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        for name, edit in self.edits.items():
+            if name in self.secret_names:
+                edit.setEchoMode(mode)
+
+    def _save(self) -> None:
+        values = {
+            name: edit.text().strip()
+            for name, edit in self.edits.items()
+            if edit.text().strip()
+        }
+        if values:
+            try:
+                self.store.set_many(values)
+            except ResourceError as exc:
+                QMessageBox.warning(self, "保存失败", str(exc))
+                return
+        self.accept()
+
+
 class ResourceDialog(QDialog):
     """技能、连接器、知识库的统一管理界面。"""
 
@@ -1331,8 +1496,18 @@ class ResourceDialog(QDialog):
         self._current_skills: dict[str, dict[str, Any]] = {}
         self._current_connectors: dict[str, dict[str, Any]] = {}
         self._current_documents: dict[int, dict[str, Any]] = {}
+        self._requirement_statuses: dict[tuple[str, str], dict[str, Any]] = {}
+        self._requirement_plan: dict[str, Any] = {}
         self._syncing = False
-        self.setWindowTitle("资源 · 技能 / 连接器 / 知识库")
+        existing_env = getattr(service, "env_store", None)
+        env_file = getattr(self.paths, "env_file", None)
+        if not env_file:
+            base = getattr(self.paths, "dev_dir", None) or self.paths.workspace
+            env_file = Path(base) / "env.json"
+        self.env_store = (
+            existing_env if isinstance(existing_env, EnvStore) else EnvStore(env_file).activate()
+        )
+        self.setWindowTitle("资源 · 技能 / 连接器 / 知识库 / 环境")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
         self.resize(1100, 780)
         self.setMinimumSize(920, 640)
@@ -1341,6 +1516,7 @@ class ResourceDialog(QDialog):
         self._refresh_skills()
         self._refresh_connectors()
         self._refresh_knowledge()
+        self._refresh_requirements()
 
     # ------------------------------------------------------------ 构建
 
@@ -1354,6 +1530,7 @@ class ResourceDialog(QDialog):
         note = QLabel(
             "技能教代理怎么做；连接器把外部 API / MCP 带进来；知识库保存需要反复查的资料。"
             "技能和连接器默认关闭：勾选左侧复选框即可启用，取消勾选即可关闭，不需要删除。"
+            "启用后先到「环境与依赖」检查缺什么，再填写变量或下载资源。"
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -1363,6 +1540,7 @@ class ResourceDialog(QDialog):
         self.tabs.addTab(self._skill_tab(), "技能")
         self.tabs.addTab(self._connector_tab(), "连接器")
         self.tabs.addTab(self._knowledge_tab(), "知识库")
+        self.tabs.addTab(self._requirements_tab(), "环境与依赖")
         layout.addWidget(self.tabs, 1)
 
         footer = QHBoxLayout()
@@ -1414,6 +1592,9 @@ class ResourceDialog(QDialog):
         self.skill_count = QLabel("")
         self.skill_count.setObjectName("muted")
         bottom.addWidget(self.skill_count, 1)
+        env_btn = QPushButton("环境 / 依赖")
+        env_btn.clicked.connect(lambda: self._open_requirements("skill"))
+        bottom.addWidget(env_btn)
         edit = QPushButton("编辑")
         edit.clicked.connect(self._edit_skill)
         bottom.addWidget(edit)
@@ -1468,6 +1649,9 @@ class ResourceDialog(QDialog):
         self.connector_count = QLabel("")
         self.connector_count.setObjectName("muted")
         bottom.addWidget(self.connector_count, 1)
+        env_btn = QPushButton("环境 / 依赖")
+        env_btn.clicked.connect(lambda: self._open_requirements("connector"))
+        bottom.addWidget(env_btn)
         test = QPushButton("测试")
         test.clicked.connect(self._test_connector)
         bottom.addWidget(test)
@@ -1477,6 +1661,59 @@ class ResourceDialog(QDialog):
         delete = QPushButton("删除")
         delete.clicked.connect(self._delete_connector)
         bottom.addWidget(delete)
+        layout.addLayout(bottom)
+        return page
+
+    def _requirements_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.requirement_summary = QLabel("")
+        self.requirement_summary.setObjectName("muted")
+        bar.addWidget(self.requirement_summary, 1)
+        self.req_show_disabled = QCheckBox("显示已关闭项")
+        self.req_show_disabled.toggled.connect(lambda _checked: self._refresh_requirements())
+        bar.addWidget(self.req_show_disabled)
+        refresh = QPushButton("重新检查")
+        refresh.setObjectName("primary")
+        refresh.clicked.connect(self._refresh_requirements)
+        bar.addWidget(refresh)
+        layout.addLayout(bar)
+
+        hint = QLabel(
+            "检查已启用的技能和连接器：环境变量是否配置、MCP 启动命令是否存在、"
+            "技能是否声明了可下载资源。这里只显示状态，不显示任何密钥值。"
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.requirement_list = QListWidget()
+        self.requirement_list.currentItemChanged.connect(self._show_requirement)
+        split.addWidget(self.requirement_list)
+        self.requirement_detail = QTextBrowser()
+        split.addWidget(self.requirement_detail)
+        split.setSizes([320, 700])
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+        bottom = QHBoxLayout()
+        self.requirement_hint = QLabel("")
+        self.requirement_hint.setObjectName("muted")
+        bottom.addWidget(self.requirement_hint, 1)
+        self.env_button = QPushButton("填写环境变量")
+        self.env_button.clicked.connect(self._edit_environment)
+        bottom.addWidget(self.env_button)
+        self.prepare_button = QPushButton("准备资源")
+        self.prepare_button.clicked.connect(self._prepare_resources)
+        bottom.addWidget(self.prepare_button)
+        self.link_button = QPushButton("打开下载页")
+        self.link_button.clicked.connect(self._open_requirement_link)
+        bottom.addWidget(self.link_button)
         layout.addLayout(bottom)
         return page
 
@@ -1855,6 +2092,335 @@ class ResourceDialog(QDialog):
             QMessageBox.warning(self, "连接器测试失败", message)
 
         _background(self, lambda: store.test(str(connector_id)), done, failed)
+
+    # ------------------------------------------------------------ 环境与依赖
+
+    def _selected_requirement_key(self) -> tuple[str, str] | None:
+        item = self.requirement_list.currentItem()
+        value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        return tuple(value) if isinstance(value, (tuple, list)) and len(value) == 2 else None
+
+    def _open_requirements(self, kind: str) -> None:
+        widget = self.connector_list if kind == "connector" else self.skill_list
+        selected = self._selected_data(widget)
+        if not selected:
+            QMessageBox.information(self, "先选一个条目", "先在左侧选中要检查的技能或连接器。")
+            return
+        self.tabs.setCurrentIndex(3)
+        self._refresh_requirements((kind, str(selected)))
+        key = (kind, str(selected))
+        for index in range(self.requirement_list.count()):
+            item = self.requirement_list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == key:
+                self.requirement_list.setCurrentRow(index)
+                break
+
+    def _refresh_requirements(self, select: tuple[str, str] | None = None) -> None:
+        current = select or self._selected_requirement_key()
+        self._requirement_plan = {}
+        self.requirement_list.blockSignals(True)
+        try:
+            self.requirement_list.clear()
+            self._requirement_statuses.clear()
+            try:
+                statuses = req_tools.check_items(
+                    self.skill_store, self.connector_store, self.env_store
+                )
+            except Exception as exc:
+                self.requirement_summary.setText("检查失败")
+                self.requirement_detail.setHtml(
+                    f'<div style="color:{ERROR};">{html.escape(str(exc))}</div>'
+                )
+                return
+            enabled = [status for status in statuses if status["enabled"]]
+            ready = sum(1 for status in enabled if status["ready"])
+            missing = sum(1 for status in enabled if not status["ready"])
+            self.requirement_summary.setText(
+                f"已启用 {len(enabled)} 项 · 就绪 {ready} · 缺依赖 {missing}"
+            )
+            show_disabled = self.req_show_disabled.isChecked()
+            shown = [
+                status for status in statuses if status["enabled"] or show_disabled
+            ]
+            selected_row = None
+            for status in shown:
+                key = (status["kind"], status["id"])
+                self._requirement_statuses[key] = status
+                kind = "连接器" if status["kind"] == "connector" else "技能"
+                state = req_tools.status_text(status)
+                prefix = "" if status["enabled"] else "[关] "
+                row = QListWidgetItem(f"{prefix}{status['name']}\n{kind} · {state}")
+                row.setData(Qt.ItemDataRole.UserRole, key)
+                self.requirement_list.addItem(row)
+                if key == current:
+                    selected_row = row
+            if selected_row is not None:
+                self.requirement_list.setCurrentItem(selected_row)
+            elif self.requirement_list.count():
+                self.requirement_list.setCurrentRow(0)
+            else:
+                message = (
+                    "没有已启用的技能或连接器。先到「技能」或「连接器」页勾选要用的条目。"
+                    if not show_disabled
+                    else "还没有技能或连接器。"
+                )
+                self.requirement_detail.setHtml(
+                    f'<div style="color:{MUTED};">{html.escape(message)}</div>'
+                )
+        finally:
+            self.requirement_list.blockSignals(False)
+        if self.requirement_list.currentItem() is not None:
+            self._show_requirement(self.requirement_list.currentItem())
+
+    def _fetch_requirement_item(self, kind: str, item_id: str) -> dict[str, Any] | None:
+        try:
+            return (
+                self.connector_store.get(item_id)
+                if kind == "connector"
+                else self.skill_store.get(item_id)
+            )
+        except (ResourceError, OSError):
+            return None
+
+    def _show_requirement(self, current: Any, _previous: Any = None) -> None:
+        if current is None:
+            return
+        raw_key = current.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(raw_key, (tuple, list)) or len(raw_key) != 2:
+            return
+        kind, item_id = str(raw_key[0]), str(raw_key[1])
+        status = self._requirement_statuses.get((kind, item_id))
+        item = self._fetch_requirement_item(kind, item_id)
+        if status is None or item is None:
+            self.requirement_detail.setHtml(
+                f'<div style="color:{MUTED};">这个条目已经不存在，点「重新检查」刷新。</div>'
+            )
+            return
+        plan = req_tools.prepare_plan(kind, item, self.env_store)
+        self._requirement_plan = plan
+        env_names = [
+            requirement["name"]
+            for requirement in status["requirements"]
+            if requirement["kind"] == "env"
+        ]
+        self.env_button.setEnabled(bool(env_names))
+        self.prepare_button.setEnabled(bool(plan["has_actions"]))
+        self.link_button.setEnabled(bool(plan["links"]))
+        kind_label = "连接器" if kind == "connector" else "技能"
+        state = req_tools.status_text(status)
+        parts = [
+            f'<div style="font-size:15px;font-weight:700;color:{TEXT};">'
+            f"{html.escape(status['name'])}</div>",
+            f'<div style="color:{MUTED};font-size:11px;margin:2px 0 10px 0;">'
+            f"{kind_label} · {html.escape(item_id)} · {html.escape(state)}</div>",
+        ]
+        if status["requirements"]:
+            parts.append(
+                f'<div style="color:{MUTED};font-size:11px;letter-spacing:1px;'
+                f'margin-top:8px;">依赖</div>'
+            )
+            for requirement in status["requirements"]:
+                configured = bool(requirement["configured"])
+                color = OK if configured else WARN
+                if requirement["kind"] == "env":
+                    label = "环境变量"
+                    source = {
+                        "local": "本机 env.json",
+                        "system": "系统环境变量",
+                        "missing": "未配置",
+                    }.get(str(requirement.get("source")), "未配置")
+                else:
+                    label = "命令"
+                    source = "已安装" if configured else "未找到"
+                line = (
+                    f'<div style="margin:4px 0;color:{TEXT};font-size:12px;">'
+                    f'<span style="color:{color};">●</span> '
+                    f"{label} <code>{html.escape(requirement['name'])}</code> · "
+                    f"{html.escape(requirement['label'])} "
+                    f'<span style="color:{MUTED};">（{source}）</span></div>'
+                )
+                if requirement.get("note"):
+                    line += (
+                        f'<div style="color:{MUTED};font-size:11px;margin:0 0 4px 16px;">'
+                        f"{html.escape(str(requirement['note']))}</div>"
+                    )
+                parts.append(line)
+        else:
+            parts.append(
+                f'<div style="color:{OK};margin-top:8px;">没有声明额外依赖。</div>'
+            )
+        if plan["downloads"]:
+            parts.append(
+                f'<div style="color:{MUTED};font-size:11px;letter-spacing:1px;'
+                f'margin-top:10px;">可下载资源</div>'
+            )
+            for download in plan["downloads"]:
+                parts.append(
+                    f'<div style="margin:3px 0;color:{TEXT};font-size:12px;">'
+                    f"{html.escape(download['label'])} → "
+                    f"<code>{html.escape(download['path'])}</code></div>"
+                )
+        advice = list(plan["notes"]) + list(plan["blocked"])
+        if advice:
+            parts.append(
+                f'<div style="color:{MUTED};font-size:11px;letter-spacing:1px;'
+                f'margin-top:10px;">接下来</div>'
+            )
+            for line in advice:
+                parts.append(
+                    f'<div style="margin:3px 0;color:{WARN};font-size:11px;">'
+                    f"{html.escape(str(line))}</div>"
+                )
+        if plan["links"]:
+            parts.append(
+                f'<div style="color:{MUTED};font-size:11px;letter-spacing:1px;'
+                f'margin-top:10px;">手动下载</div>'
+            )
+            for link in plan["links"]:
+                parts.append(
+                    f'<div style="margin:3px 0;font-size:11px;">'
+                    f'<a href="{html.escape(link["url"])}" style="color:{TOOL};">'
+                    f"{html.escape(link['label'])}</a></div>"
+                )
+        self.requirement_detail.setHtml("".join(parts))
+        self.requirement_hint.setText(
+            "环境变量只在本机保存；填完点「重新检查」。" if env_names else ""
+        )
+
+    def _edit_environment(self) -> None:
+        key = self._selected_requirement_key()
+        if key is None:
+            return
+        status = self._requirement_statuses.get(key)
+        if status is None:
+            return
+        names = [
+            requirement["name"]
+            for requirement in status["requirements"]
+            if requirement["kind"] == "env"
+        ]
+        if not names:
+            QMessageBox.information(self, "没有环境变量", "这个条目没有声明环境变量。")
+            return
+        dialog = EnvVarsDialog(self.env_store, names, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.footer.setText("环境变量已保存到本机")
+            self._refresh_requirements(key)
+
+    def _prepare_resources(self) -> None:
+        key = self._selected_requirement_key()
+        if key is None:
+            return
+        kind, item_id = key
+        status = self._requirement_statuses.get(key)
+        item = self._fetch_requirement_item(kind, item_id)
+        if status is None or item is None:
+            return
+        plan = req_tools.prepare_plan(kind, item, self.env_store)
+        lines = [f"准备 {status['name']}（{item_id}）："]
+        for command in plan["commands"]:
+            lines.append(f"运行：{' '.join(command['argv'])}")
+        for download in plan["downloads"]:
+            lines.append(f"下载：{download['url']} → {download['path']}")
+        for note in plan["notes"] + plan["blocked"]:
+            lines.append(f"提醒：{note}")
+        if not plan["has_actions"]:
+            for link in plan["links"]:
+                lines.append(f"手动下载：{link['label']} {link['url']}")
+            QMessageBox.information(self, "没有可自动准备的内容", "\n".join(lines))
+            return
+        if QMessageBox.question(
+            self,
+            "准备资源",
+            "\n".join(lines)
+            + "\n\n会联网下载并修改本机缓存或技能目录。继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.prepare_button.setEnabled(False)
+        self.footer.setText("正在准备资源…")
+        workspace = self.paths.workspace
+        timeout = max(120, min(1800, int(item.get("timeout", 600) or 600)))
+
+        def worker() -> str:
+            outputs: list[str] = []
+            for command in plan["commands"]:
+                outcome = req_tools.run_command(
+                    command["argv"], cwd=workspace, timeout=timeout
+                )
+                state = "成功" if outcome["ok"] else f"失败（退出码 {outcome['code']}）"
+                outputs.append(
+                    f"$ {' '.join(command['argv'])}\n{state}\n{outcome['output']}"
+                )
+                if not outcome["ok"]:
+                    outputs.append("后面的准备命令已跳过；先处理上面的错误。")
+                    break
+            else:
+                if plan["downloads"]:
+                    results = req_tools.download_skill_resources(
+                        self.skill_store,
+                        item_id,
+                        plan["downloads"],
+                        allow_private=bool(
+                            getattr(self.service, "settings", {}).get(
+                                "allow_private_network", False
+                            )
+                        ),
+                    )
+                    for result in results:
+                        outputs.append(
+                            f"下载 {result['path']}："
+                            f"{'成功' if result['ok'] else '失败'}（{result.get('message', '')}）"
+                        )
+            return "\n\n".join(outputs) or "没有实际执行内容。"
+
+        def done(text: Any) -> None:
+            self.footer.setText("资源准备完成")
+            self._show_output("资源准备结果", str(text))
+            self._refresh_requirements(key)
+
+        def failed(message: str) -> None:
+            self.footer.setText("资源准备失败")
+            QMessageBox.warning(self, "资源准备失败", message)
+
+        _background(self, worker, done, failed)
+
+    def _open_requirement_link(self) -> None:
+        links = self._requirement_plan.get("links") or []
+        if not links:
+            QMessageBox.information(self, "没有下载页", "这个条目没有额外的下载页。")
+            return
+        target = links[0]
+        if len(links) > 1:
+            labels = [f"{item['label']} · {item['url']}" for item in links]
+            chosen, ok = QInputDialog.getItem(self, "选择下载页", "打开哪个？", labels, 0, False)
+            if not ok:
+                return
+            target = links[labels.index(chosen)]
+        QDesktopServices.openUrl(QUrl(str(target["url"])))
+
+    def _show_output(self, title: str, text: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+        dialog.resize(760, 520)
+        dialog.setStyleSheet(STYLE)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 14, 16, 14)
+        heading = QLabel(title)
+        heading.setObjectName("title")
+        layout.addWidget(heading)
+        view = QTextBrowser()
+        view.setPlainText(text)
+        layout.addWidget(view, 1)
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close)
+        layout.addLayout(row)
+        dialog.exec()
 
     # ------------------------------------------------------------ 知识库
 

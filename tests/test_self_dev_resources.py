@@ -727,6 +727,21 @@ class BundledCatalogTests(unittest.TestCase):
         self.assertIn("searxng", connector_ids)
         self.assertIn("sql-gateway", connector_ids)
         self.assertIn("mcp-blender", connector_ids)
+        self.assertIn("openai-api", connector_ids)
+        self.assertIn("tavily", connector_ids)
+        for skill_id in (
+            "docx-documents",
+            "pdf-documents",
+            "xlsx-spreadsheets",
+            "pptx-presentations",
+            "knowledge-base",
+            "drawio-diagrams",
+            "technical-diagrams",
+            "image-generation",
+            "web-research",
+            "skill-authoring",
+        ):
+            self.assertIn(skill_id, skill_ids)
 
     def test_catalog_connectors_normalize(self):
         root = temp_root()
