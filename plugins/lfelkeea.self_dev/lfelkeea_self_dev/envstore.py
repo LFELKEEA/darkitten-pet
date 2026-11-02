@@ -107,7 +107,10 @@ class EnvStore:
 
     def public(self, required: Iterable[str] | None = None) -> list[dict[str, Any]]:
         """给界面看的清单：只有名字、来源和状态，绝不带值。"""
-        local = self._load()
+        try:
+            local = self._load()
+        except ResourceError:
+            local = {}
         names = sorted(set(required or []) | set(local))
         result: list[dict[str, Any]] = []
         for name in names:
