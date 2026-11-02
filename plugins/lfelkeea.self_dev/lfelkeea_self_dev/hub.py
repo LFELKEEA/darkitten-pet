@@ -124,15 +124,17 @@ def _search_repos(query: str, limit: int, extra: str = "") -> list[dict[str, Any
 
 def search_skill_repos(query: str = "", limit: int = 8) -> list[dict[str, Any]]:
     text = " ".join(str(query or "").split()).strip() or "agent skills"
-    results = _search_repos(text, limit, "skills")
+    extra = "" if "skill" in text.lower() else "skills"
+    results = _search_repos(text, limit, extra)
     if not results:
         results = _search_repos(text, limit, "SKILL.md")
     return results[: max(1, min(20, int(limit or 8)))]
 
 
 def search_mcp_repos(query: str = "", limit: int = 8) -> list[dict[str, Any]]:
-    text = " ".join(str(query or "").split()).strip() or "mcp"
-    results = _search_repos(text, limit, "mcp server")
+    text = " ".join(str(query or "").split()).strip() or "mcp server"
+    extra = "" if "mcp" in text.lower() else "mcp server"
+    results = _search_repos(text, limit, extra)
     return results[: max(1, min(20, int(limit or 8)))]
 
 
