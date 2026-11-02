@@ -797,6 +797,49 @@ class BundledCatalogTests(unittest.TestCase):
         self.assertTrue(all(not item["enabled"] for item in items))
         self.assertIn("关", store.index_text())
 
+    def test_bundled_mcp_git_uses_working_npx_launcher(self):
+        git = next(item for item in BUNDLED_CONNECTORS if item["id"] == "mcp-git")
+        self.assertEqual(git["command"], "npx")
+        self.assertIn("@selfagency/git-mcp", git["args"])
+        self.assertIn("--repo-path", git["args"])
+        self.assertNotEqual(git["command"], "uvx")
+
+    def test_legacy_uvx_mcp_git_is_migrated(self):
+        root = temp_root()
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True)
+        connectors = ConnectorStore(
+            root / "connectors.json", workspace, root / ".trash"
+        )
+        connectors.save(
+            {
+                "id": "mcp-git",
+                "name": "MCP Git",
+                "type": "mcp",
+                "description": "旧配置",
+                "enabled": True,
+                "command": "uvx",
+                "args": ["mcp-server-git", "--repository", "."],
+                "cwd": ".",
+                "timeout": 60,
+            }
+        )
+
+        seed_catalog(
+            SimpleNamespace(
+                skills=root / "skills",
+                connectors=root / "connectors.json",
+                workspace=workspace,
+                trash=root / ".trash",
+            )
+        )
+
+        git = connectors.get("mcp-git")
+        self.assertEqual(git["command"], "npx")
+        self.assertIn("@selfagency/git-mcp", git["args"])
+        self.assertEqual(git["timeout"], 120)
+        self.assertTrue(git["enabled"])
+
     def test_legacy_github_entries_are_renamed_without_losing_settings(self):
         root = temp_root()
         workspace = root / "workspace"

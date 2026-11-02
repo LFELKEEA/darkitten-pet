@@ -284,6 +284,9 @@ token 只有约 2 小时有效期，优先在平台侧自动刷新，不要手�
         "body": """# 适用场景
 需要查看改动、整理提交、处理分支或解决冲突。
 
+# 连接器
+需要结构化 Git 工具时启用 `mcp-git`；它默认操作当前工作区，状态、diff、历史等读取工具可以直接用，提交、重置、推送等写操作仍会先弹窗确认。
+
 # 常用检查
 - `git status --short`
 - `git diff` / `git diff --staged`
@@ -1618,13 +1621,13 @@ BUNDLED_CONNECTORS: list[dict[str, Any]] = [
         "id": "mcp-git",
         "name": "MCP Git",
         "type": "mcp",
-        "description": "查看当前工作区 Git 状态、diff、历史和提交。需要 uvx。",
+        "description": "查看和操作当前工作区的 Git：status、diff、history、branch、commit、stash 等。通过 npx 启动 @selfagency/git-mcp，需要 Node.js；写操作、重置和推送每次调用前都要确认。",
         "enabled": False,
-        "command": "uvx",
-        "args": ["mcp-server-git", "--repository", "."],
+        "command": "npx",
+        "args": ["-y", "@selfagency/git-mcp", "--repo-path", "."],
         "env": {},
         "cwd": ".",
-        "timeout": 60,
+        "timeout": 120,
     },
     {
         "id": "mcp-sqlite",
@@ -2067,6 +2070,36 @@ def _migrate_legacy_github_split(skills: Any, connectors: Any) -> int:
     return changed
 
 
+def _migrate_legacy_mcp_git(connectors: Any) -> int:
+    """把旧的 uvx + mcp-server-git 换成 npx 启动的可用版本。
+
+    部分环境的 uvx.exe 是缺少 uv.exe 的残缺包装，原配置根本起不来。
+    只替换命令仍是旧默认值的条目，用户自己改过的配置不动。
+    """
+    changed = 0
+    for item in connectors.list():
+        if item.get("id") != "mcp-git" or item.get("type") != "mcp":
+            continue
+        command = str(item.get("command") or "").strip().lower()
+        args = [str(part) for part in item.get("args") or []]
+        if command != "uvx" or "mcp-server-git" not in args:
+            continue
+        payload = dict(item)
+        payload["command"] = "npx"
+        payload["args"] = ["-y", "@selfagency/git-mcp", "--repo-path", "."]
+        payload["env"] = {}
+        payload["cwd"] = "."
+        payload["timeout"] = 120
+        payload["description"] = (
+            "查看和操作当前工作区的 Git：status、diff、history、branch、commit、"
+            "stash 等。通过 npx 启动 @selfagency/git-mcp，需要 Node.js；"
+            "写操作、重置和推送每次调用前都要确认。"
+        )
+        connectors.save(payload)
+        changed += 1
+    return changed
+
+
 def seed_catalog(paths: Any) -> dict[str, int]:
     """把自带目录补进数据目录，返回新增数量；同 id 不覆盖。"""
     from .connectors import ConnectorStore
@@ -2080,6 +2113,10 @@ def seed_catalog(paths: Any) -> dict[str, int]:
     }
     try:
         _migrate_legacy_github_split(skills, connectors)
+    except Exception:
+        pass
+    try:
+        _migrate_legacy_mcp_git(connectors)
     except Exception:
         pass
     return result
