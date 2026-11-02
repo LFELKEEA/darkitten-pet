@@ -41,6 +41,17 @@ from PySide6.QtWidgets import (
 
 from . import requirements as req_tools
 from . import web as web_tools
+from .catalog import (
+    DEV_CONNECTOR_ID_SET,
+    DEV_CONNECTOR_IDS,
+    DEV_GROUPS,
+    DEV_SKILL_ID_SET,
+    DEV_SKILL_IDS,
+    DEV_STARTER_CONNECTOR_ID_SET,
+    DEV_STARTER_CONNECTOR_IDS,
+    DEV_STARTER_SKILL_ID_SET,
+    DEV_STARTER_SKILL_IDS,
+)
 from .connectors import ConnectorStore
 from .envstore import EnvStore
 from .knowledge import KnowledgeBase
@@ -257,6 +268,9 @@ class DevStudioDialog(QDialog):
         self.clear_btn = QPushButton("清空日志")
         self.clear_btn.setObjectName("ghost")
         self.clear_btn.clicked.connect(self._clear_log)
+        self.dev_btn = QPushButton("开发专区")
+        self.dev_btn.setObjectName("primary")
+        self.dev_btn.clicked.connect(self._open_dev_zone)
         self.resources_btn = QPushButton("技能 / 连接器 / 知识库")
         self.resources_btn.clicked.connect(self._open_resources)
         self.settings_btn = QPushButton("设置")
@@ -264,6 +278,7 @@ class DevStudioDialog(QDialog):
         actions.addWidget(self.start_btn)
         actions.addWidget(self.stop_btn)
         actions.addStretch(1)
+        actions.addWidget(self.dev_btn)
         actions.addWidget(self.resources_btn)
         actions.addWidget(self.clear_btn)
         actions.addWidget(self.settings_btn)
@@ -406,6 +421,12 @@ class DevStudioDialog(QDialog):
 
     def _open_resources(self) -> None:
         dialog = ResourceDialog(self.service, self)
+        dialog.exec()
+        self._refresh_header()
+
+    def _open_dev_zone(self) -> None:
+        dialog = ResourceDialog(self.service, self)
+        dialog.tabs.setCurrentWidget(dialog.dev_page)
         dialog.exec()
         self._refresh_header()
 
@@ -1498,6 +1519,8 @@ class ResourceDialog(QDialog):
         self._current_documents: dict[int, dict[str, Any]] = {}
         self._requirement_statuses: dict[tuple[str, str], dict[str, Any]] = {}
         self._requirement_plan: dict[str, Any] = {}
+        self._dev_status: dict[tuple[str, str], dict[str, Any]] = {}
+        self._dev_group_key = DEV_GROUPS[0]["key"] if DEV_GROUPS else ""
         self._syncing = False
         existing_env = getattr(service, "env_store", None)
         env_file = getattr(self.paths, "env_file", None)
@@ -1507,12 +1530,13 @@ class ResourceDialog(QDialog):
         self.env_store = (
             existing_env if isinstance(existing_env, EnvStore) else EnvStore(env_file).activate()
         )
-        self.setWindowTitle("资源 · 技能 / 连接器 / 知识库 / 环境")
+        self.setWindowTitle("资源 · 开发专区 / 技能 / 连接器 / 知识库 / 环境")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
-        self.resize(1100, 780)
-        self.setMinimumSize(920, 640)
+        self.resize(1160, 820)
+        self.setMinimumSize(960, 660)
         self.setStyleSheet(STYLE)
         self._build()
+        self._refresh_dev_zone()
         self._refresh_skills()
         self._refresh_connectors()
         self._refresh_knowledge()
@@ -1528,8 +1552,8 @@ class ResourceDialog(QDialog):
         title.setObjectName("title")
         layout.addWidget(title)
         note = QLabel(
-            "技能教代理怎么做；连接器把外部 API / MCP 带进来；知识库保存需要反复查的资料。"
-            "技能和连接器默认关闭：勾选左侧复选框即可启用，取消勾选即可关闭，不需要删除。"
+            "「开发专区」集中放自开发工坊自带的整套开发技能和连接器，可以一键开启推荐套装或全部开启。"
+            "「技能」「连接器」用于管理你自己创建的条目；知识库保存需要反复查的资料。"
             "启用后先到「环境与依赖」检查缺什么，再填写变量或下载资源。"
         )
         note.setObjectName("muted")
@@ -1537,10 +1561,13 @@ class ResourceDialog(QDialog):
         layout.addWidget(note)
 
         self.tabs = QTabWidget()
+        self.dev_page = self._dev_tab()
+        self.tabs.addTab(self.dev_page, "开发专区")
         self.tabs.addTab(self._skill_tab(), "技能")
         self.tabs.addTab(self._connector_tab(), "连接器")
         self.tabs.addTab(self._knowledge_tab(), "知识库")
-        self.tabs.addTab(self._requirements_tab(), "环境与依赖")
+        self.requirements_page = self._requirements_tab()
+        self.tabs.addTab(self.requirements_page, "环境与依赖")
         layout.addWidget(self.tabs, 1)
 
         footer = QHBoxLayout()
@@ -1551,6 +1578,129 @@ class ResourceDialog(QDialog):
         close.clicked.connect(self.accept)
         footer.addWidget(close)
         layout.addLayout(footer)
+
+    def _dev_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "这里把自开发工坊自带的开发能力分成五组：编程核心、文档与创作、API 专用、HTTP 连接器、MCP 连接器。"
+            "推荐套装覆盖写代码、测试、调试、Git、发布、安全和常用 MCP 工具；"
+            "「全部开启」会打开全部内置技能与连接器。开启只改开关，不会自动申请密钥或安装运行时。"
+        )
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        recommended = QPushButton("一键开启推荐套装")
+        recommended.setObjectName("primary")
+        recommended.clicked.connect(self._enable_recommended_dev)
+        actions.addWidget(recommended)
+        all_on = QPushButton("全部开启")
+        all_on.clicked.connect(self._enable_all_dev)
+        actions.addWidget(all_on)
+        all_off = QPushButton("全部关闭")
+        all_off.setObjectName("ghost")
+        all_off.clicked.connect(self._disable_all_dev)
+        actions.addWidget(all_off)
+        actions.addStretch(1)
+        refresh = QPushButton("刷新")
+        refresh.setObjectName("ghost")
+        refresh.clicked.connect(self._refresh_dev_zone)
+        actions.addWidget(refresh)
+        layout.addLayout(actions)
+
+        self.dev_group_tabs = QTabWidget()
+        self.dev_lists: dict[str, QListWidget] = {}
+        self.dev_count_labels: dict[str, QLabel] = {}
+        self._dev_group_index: dict[str, int] = {}
+        for group in DEV_GROUPS:
+            index = self.dev_group_tabs.addTab(
+                self._dev_group_page(group), group["title"]
+            )
+            self._dev_group_index[group["key"]] = index
+        self.dev_group_tabs.currentChanged.connect(self._dev_group_tab_changed)
+        layout.addWidget(self.dev_group_tabs, 1)
+
+        self.dev_hint = QLabel("")
+        self.dev_hint.setObjectName("muted")
+        self.dev_hint.setWordWrap(True)
+        layout.addWidget(self.dev_hint)
+
+        bottom = QHBoxLayout()
+        self.dev_summary = QLabel("")
+        self.dev_summary.setObjectName("muted")
+        bottom.addWidget(self.dev_summary, 1)
+        deps = QPushButton("查看当前依赖")
+        deps.clicked.connect(self._open_dev_requirements)
+        bottom.addWidget(deps)
+        edit = QPushButton("编辑当前条目")
+        edit.clicked.connect(self._edit_dev_item)
+        bottom.addWidget(edit)
+        layout.addLayout(bottom)
+        return page
+
+    def _dev_group_page(self, group: dict[str, Any]) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        hint = QLabel(group["hint"])
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        widget = QListWidget()
+        widget.itemChanged.connect(
+            lambda item, key=group["key"]: self._toggle_dev_item(key, item)
+        )
+        widget.itemDoubleClicked.connect(
+            lambda item, key=group["key"]: self._edit_dev_group_item(key, item)
+        )
+        widget.currentItemChanged.connect(
+            lambda current, _previous, key=group["key"]: self._dev_focus_group(
+                key, current
+            )
+        )
+        self.dev_lists[group["key"]] = widget
+        layout.addWidget(widget, 1)
+
+        bottom = QHBoxLayout()
+        count = QLabel("")
+        count.setObjectName("muted")
+        self.dev_count_labels[group["key"]] = count
+        bottom.addWidget(count, 1)
+        on = QPushButton("开启本组")
+        on.setObjectName("primary")
+        on.clicked.connect(
+            lambda _checked=False, key=group["key"]: self._enable_dev_group(key)
+        )
+        bottom.addWidget(on)
+        off = QPushButton("关闭本组")
+        off.setObjectName("ghost")
+        off.clicked.connect(
+            lambda _checked=False, key=group["key"]: self._disable_dev_group(key)
+        )
+        bottom.addWidget(off)
+        deps = QPushButton("查看依赖")
+        deps.clicked.connect(
+            lambda _checked=False, key=group["key"]: self._open_dev_group_requirements(
+                key
+            )
+        )
+        bottom.addWidget(deps)
+        edit = QPushButton("编辑")
+        edit.clicked.connect(
+            lambda _checked=False, key=group["key"]: self._edit_dev_group_selected(key)
+        )
+        bottom.addWidget(edit)
+        layout.addLayout(bottom)
+        return page
 
     def _skill_tab(self) -> QWidget:
         page = QWidget()
@@ -1575,6 +1725,11 @@ class ResourceDialog(QDialog):
         create.clicked.connect(self._new_skill)
         bar.addWidget(create)
         layout.addLayout(bar)
+
+        hint = QLabel("这里管理你自己创建的技能；自带开发技能已集中到「开发专区」。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         split = QSplitter(Qt.Orientation.Horizontal)
         self.skill_list = QListWidget()
@@ -1628,7 +1783,10 @@ class ResourceDialog(QDialog):
         bar.addWidget(create)
         layout.addLayout(bar)
 
-        hint = QLabel("HTTP 连接器直接调用 API；MCP 连接器按需启动本地服务器进程。勾选复选框启用。")
+        hint = QLabel(
+            "这里管理你自己创建的连接器；自带开发连接器已集中到「开发专区」。"
+            "HTTP 连接器直接调用 API；MCP 连接器按需启动本地服务器进程。"
+        )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1791,6 +1949,466 @@ class ResourceDialog(QDialog):
         item = widget.currentItem()
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
+    # ------------------------------------------------------------ 开发专区
+
+    def _dev_group(self, key: str) -> dict[str, Any]:
+        for group in DEV_GROUPS:
+            if group["key"] == key:
+                return group
+        return DEV_GROUPS[0]
+
+    def _dev_group_tab_changed(self, index: int) -> None:
+        for key, tab_index in self._dev_group_index.items():
+            if tab_index == index:
+                self._dev_group_key = key
+                break
+
+    def _dev_focus_group(self, key: str, current: Any) -> None:
+        if current is not None:
+            self._dev_group_key = key
+
+    def _dev_group_widget(self, key: str) -> QListWidget | None:
+        return self.dev_lists.get(key)
+
+    def _dev_group_selected(self, key: str) -> tuple[str, str] | None:
+        group = self._dev_group(key)
+        widget = self._dev_group_widget(key)
+        item = widget.currentItem() if widget is not None else None
+        if item is None:
+            return None
+        item_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        return (str(group["kind"]), item_id) if item_id else None
+
+    def _dev_selected(self) -> tuple[str, str] | None:
+        selected = self._dev_group_selected(self._dev_group_key)
+        if selected:
+            return selected
+        for group in DEV_GROUPS:
+            selected = self._dev_group_selected(group["key"])
+            if selected:
+                self._dev_group_key = group["key"]
+                return selected
+        return None
+
+    def _dev_items(self, kind: str) -> list[dict[str, Any]]:
+        store = self.connector_store if kind == "connector" else self.skill_store
+        known = DEV_CONNECTOR_ID_SET if kind == "connector" else DEV_SKILL_ID_SET
+        try:
+            items = [item for item in store.list() if str(item.get("id")) in known]
+        except (ResourceError, OSError):
+            return []
+        order = {
+            item_id: index
+            for index, item_id in enumerate(
+                DEV_CONNECTOR_IDS if kind == "connector" else DEV_SKILL_IDS
+            )
+        }
+        items.sort(key=lambda item: order.get(str(item.get("id")), len(order)))
+        return items
+
+    def _dev_group_items(self, group: dict[str, Any]) -> list[dict[str, Any]]:
+        ids = [str(item_id) for item_id in group["ids"]]
+        order = {item_id: index for index, item_id in enumerate(ids)}
+        items = [
+            item
+            for item in self._dev_items(str(group["kind"]))
+            if str(item.get("id")) in order
+        ]
+        items.sort(key=lambda item: order.get(str(item.get("id")), len(order)))
+        return items
+
+    def _dev_row_label(
+        self, group: dict[str, Any], item: dict[str, Any], status: dict[str, Any]
+    ) -> str:
+        kind = str(group["kind"])
+        starters = (
+            DEV_STARTER_SKILL_ID_SET
+            if kind == "skill"
+            else DEV_STARTER_CONNECTOR_ID_SET
+        )
+        mark = "★ " if str(item["id"]) in starters else ""
+        is_on = bool(item.get("enabled"))
+        state = "已启用" if is_on else "已关闭"
+        deps = "依赖齐全" if status["ready"] else f"缺 {status['missing']} 项依赖"
+        prefix = ""
+        if kind == "connector":
+            prefix = ("HTTP" if item.get("type") == "http" else "MCP") + " · "
+        return f"{mark}{item['name']}\n{prefix}{item['id']} · {state} · {deps}"
+
+    def _refresh_dev_zone(self) -> None:
+        selected = self._dev_selected() if hasattr(self, "dev_lists") else None
+        self._dev_status.clear()
+        self._syncing = True
+        try:
+            for group in DEV_GROUPS:
+                widget = self._dev_group_widget(group["key"])
+                if widget is None:
+                    continue
+                widget.clear()
+                kind = str(group["kind"])
+                for item in self._dev_group_items(group):
+                    status = req_tools.item_requirements(kind, item, self.env_store)
+                    self._dev_status[(kind, str(item["id"]))] = status
+                    row = QListWidgetItem(self._dev_row_label(group, item, status))
+                    row.setData(Qt.ItemDataRole.UserRole, item["id"])
+                    row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    row.setCheckState(
+                        Qt.CheckState.Checked
+                        if item.get("enabled")
+                        else Qt.CheckState.Unchecked
+                    )
+                    widget.addItem(row)
+        finally:
+            self._syncing = False
+        self._refresh_dev_counts()
+
+        target: tuple[str, int] | None = None
+        if selected:
+            kind, item_id = selected
+            for group in DEV_GROUPS:
+                if str(group["kind"]) != kind:
+                    continue
+                widget = self._dev_group_widget(group["key"])
+                if widget is None:
+                    continue
+                for index in range(widget.count()):
+                    if str(widget.item(index).data(Qt.ItemDataRole.UserRole)) == item_id:
+                        target = (group["key"], index)
+                        break
+                if target is not None:
+                    break
+        if target is None:
+            widget = self._dev_group_widget(self._dev_group_key)
+            if widget is not None and widget.count():
+                target = (self._dev_group_key, 0)
+            else:
+                for group in DEV_GROUPS:
+                    widget = self._dev_group_widget(group["key"])
+                    if widget is not None and widget.count():
+                        target = (group["key"], 0)
+                        break
+        if target is not None:
+            self._dev_group_key = target[0]
+            tab_index = self._dev_group_index.get(target[0])
+            if tab_index is not None:
+                self.dev_group_tabs.setCurrentIndex(tab_index)
+            widget = self._dev_group_widget(target[0])
+            if widget is not None:
+                widget.setCurrentRow(target[1])
+
+    def _refresh_dev_counts(self) -> None:
+        enabled_ids: dict[str, set[str]] = {"skill": set(), "connector": set()}
+        totals: dict[str, list[int]] = {"skill": [0, 0], "connector": [0, 0]}
+        missing = 0
+        for group in DEV_GROUPS:
+            widget = self._dev_group_widget(group["key"])
+            if widget is None:
+                continue
+            kind = str(group["kind"])
+            enabled = 0
+            for index in range(widget.count()):
+                row = widget.item(index)
+                if row.checkState() != Qt.CheckState.Checked:
+                    continue
+                enabled += 1
+                item_id = str(row.data(Qt.ItemDataRole.UserRole) or "")
+                enabled_ids[kind].add(item_id)
+                status = self._dev_status.get((kind, item_id))
+                if status is not None and not status["ready"]:
+                    missing += 1
+            totals[kind][0] += enabled
+            totals[kind][1] += widget.count()
+            self.dev_count_labels[group["key"]].setText(
+                f"{widget.count()} 项 · 已启用 {enabled}"
+            )
+            tab_index = self._dev_group_index.get(group["key"])
+            if tab_index is not None:
+                self.dev_group_tabs.setTabText(
+                    tab_index, f"{group['title']} {enabled}/{widget.count()}"
+                )
+        skill_on, skill_total = totals["skill"]
+        connector_on, connector_total = totals["connector"]
+        starter_skill_on = len(enabled_ids["skill"] & DEV_STARTER_SKILL_ID_SET)
+        starter_connector_on = len(
+            enabled_ids["connector"] & DEV_STARTER_CONNECTOR_ID_SET
+        )
+        self.dev_summary.setText(
+            f"推荐套装：技能 {starter_skill_on}/{len(DEV_STARTER_SKILL_IDS)}"
+            f" · 连接器 {starter_connector_on}/{len(DEV_STARTER_CONNECTOR_IDS)}"
+            f"｜全部：技能 {skill_on}/{skill_total}"
+            f" · 连接器 {connector_on}/{connector_total}"
+        )
+        if not skill_total and not connector_total:
+            self.dev_hint.setText(
+                "开发专区还没有内置条目。插件启动时会自动补入自带目录；"
+                "如果目录被清空，重新载入插件即可恢复。"
+            )
+        elif missing:
+            self.dev_hint.setText(
+                f"已启用项里还有 {missing} 个缺依赖；到「环境与依赖」填写变量或准备资源。"
+                "勾选条目可以单独开关，双击可以编辑。"
+            )
+        else:
+            self.dev_hint.setText(
+                "勾选条目可以单独开关，双击可以编辑；带 ★ 的是推荐套装。"
+            )
+
+    def _toggle_dev_item(self, group_key: str, item: QListWidgetItem) -> None:
+        if self._syncing:
+            return
+        group = self._dev_group(group_key)
+        kind = str(group["kind"])
+        item_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not item_id:
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        store = self.connector_store if kind == "connector" else self.skill_store
+        try:
+            detail = store.set_enabled(item_id, enabled)
+        except (ResourceError, OSError) as exc:
+            QMessageBox.warning(self, "切换失败", str(exc))
+            self._syncing = True
+            try:
+                item.setCheckState(
+                    Qt.CheckState.Unchecked
+                    if enabled
+                    else Qt.CheckState.Checked
+                )
+            finally:
+                self._syncing = False
+            return
+        status = req_tools.item_requirements(kind, detail, self.env_store)
+        self._dev_status[(kind, item_id)] = status
+        self._syncing = True
+        try:
+            item.setText(self._dev_row_label(group, detail, status))
+        finally:
+            self._syncing = False
+        label = "连接器" if kind == "connector" else "技能"
+        self.footer.setText(
+            f"{label} {item_id}「{detail['name']}」{'已启用' if enabled else '已关闭'}"
+        )
+        self._refresh_dev_counts()
+        self._refresh_requirements()
+
+    def _existing_dev_ids(self, kind: str, ids: list[str]) -> list[str]:
+        known = {str(item.get("id")) for item in self._dev_items(kind)}
+        return [item_id for item_id in ids if item_id in known]
+
+    def _confirm_dev_enable(
+        self, title: str, skill_count: int, connector_count: int
+    ) -> bool:
+        return (
+            QMessageBox.question(
+                self,
+                title,
+                f"将开启 {skill_count} 个技能和 {connector_count} 个连接器。\n\n"
+                "开启后，技能会进入系统提示，连接器可以被代理调用。"
+                "仍缺的环境变量和命令不会自动补全，需要到「环境与依赖」处理。\n\n"
+                "确定继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            == QMessageBox.StandardButton.Yes
+        )
+
+    def _enable_recommended_dev(self) -> None:
+        self._enable_dev_items(
+            list(DEV_STARTER_SKILL_IDS),
+            list(DEV_STARTER_CONNECTOR_IDS),
+            "开启推荐套装",
+        )
+
+    def _enable_all_dev(self) -> None:
+        self._enable_dev_items(
+            list(DEV_SKILL_IDS), list(DEV_CONNECTOR_IDS), "开启全部开发条目"
+        )
+
+    def _enable_dev_items(
+        self, skill_ids: list[str], connector_ids: list[str], title: str
+    ) -> None:
+        skill_ids = self._existing_dev_ids("skill", skill_ids)
+        connector_ids = self._existing_dev_ids("connector", connector_ids)
+        if not skill_ids and not connector_ids:
+            QMessageBox.information(
+                self,
+                "开发专区",
+                "开发专区还没有内置条目。插件启动时会自动补入自带目录。",
+            )
+            return
+        if not self._confirm_dev_enable(title, len(skill_ids), len(connector_ids)):
+            return
+        result = self._apply_dev_set(skill_ids, connector_ids, True)
+        self._refresh_after_dev_change()
+        self._report_dev_change(result, True)
+
+    def _enable_dev_group(self, key: str) -> None:
+        group = self._dev_group(key)
+        kind = str(group["kind"])
+        ids = self._existing_dev_ids(kind, [str(item) for item in group["ids"]])
+        if not ids:
+            QMessageBox.information(
+                self, "开发专区", "这一组还没有内置条目，重新载入插件会自动补入。"
+            )
+            return
+        skill_ids = ids if kind == "skill" else []
+        connector_ids = ids if kind == "connector" else []
+        if not self._confirm_dev_enable(
+            f"开启「{group['title']}」", len(skill_ids), len(connector_ids)
+        ):
+            return
+        result = self._apply_dev_set(skill_ids, connector_ids, True)
+        self._refresh_after_dev_change()
+        self._report_dev_change(result, True)
+
+    def _disable_all_dev(self) -> None:
+        result = self._apply_dev_set(
+            list(DEV_SKILL_IDS), list(DEV_CONNECTOR_IDS), False
+        )
+        self._refresh_after_dev_change()
+        self._report_dev_change(result, False)
+
+    def _disable_dev_group(self, key: str) -> None:
+        group = self._dev_group(key)
+        kind = str(group["kind"])
+        ids = self._existing_dev_ids(kind, [str(item) for item in group["ids"]])
+        if not ids:
+            return
+        result = self._apply_dev_set(
+            ids if kind == "skill" else [],
+            ids if kind == "connector" else [],
+            False,
+        )
+        self._refresh_after_dev_change()
+        self._report_dev_change(result, False)
+
+    def _apply_dev_set(
+        self, skill_ids: list[str], connector_ids: list[str], enabled: bool
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {"skills": 0, "connectors": 0, "errors": []}
+        groups = (
+            ("skill", self.skill_store, skill_ids, "skills"),
+            ("connector", self.connector_store, connector_ids, "connectors"),
+        )
+        for kind, store, ids, key in groups:
+            for item_id in ids:
+                try:
+                    current = store.get(item_id)
+                except (ResourceError, OSError) as exc:
+                    result["errors"].append(f"{kind} {item_id}: {exc}")
+                    continue
+                if bool(current.get("enabled")) == bool(enabled):
+                    continue
+                try:
+                    store.set_enabled(item_id, bool(enabled))
+                except (ResourceError, OSError) as exc:
+                    result["errors"].append(f"{kind} {item_id}: {exc}")
+                else:
+                    result[key] += 1
+        return result
+
+    def _refresh_after_dev_change(self) -> None:
+        self._refresh_dev_zone()
+        self._refresh_requirements()
+
+    def _missing_dev_items(
+        self, skill_ids: list[str], connector_ids: list[str]
+    ) -> list[str]:
+        lines: list[str] = []
+        groups = (
+            ("skill", self.skill_store, skill_ids),
+            ("connector", self.connector_store, connector_ids),
+        )
+        for kind, store, ids in groups:
+            for item_id in ids:
+                try:
+                    item = store.get(item_id)
+                except (ResourceError, OSError):
+                    continue
+                if not item.get("enabled"):
+                    continue
+                status = req_tools.item_requirements(kind, item, self.env_store)
+                if status["missing"]:
+                    lines.append(
+                        f"{status['name']}（{item_id}）缺 {status['missing']} 项"
+                    )
+        return lines
+
+    def _report_dev_change(self, result: dict[str, Any], enabled: bool) -> None:
+        action = "开启" if enabled else "关闭"
+        lines = [
+            f"已{action} {result['skills']} 个技能、{result['connectors']} 个连接器。"
+        ]
+        if result["skills"] + result["connectors"] == 0:
+            lines.append("这些条目本来就是这个状态，没有改动。")
+        if result["errors"]:
+            lines.append(f"失败 {len(result['errors'])} 项：")
+            lines.extend(f"· {line}" for line in result["errors"][:5])
+        if enabled:
+            missing = self._missing_dev_items(
+                list(DEV_SKILL_IDS), list(DEV_CONNECTOR_IDS)
+            )
+            if missing:
+                lines.append(f"仍有 {len(missing)} 个条目缺依赖：")
+                lines.extend(f"· {line}" for line in missing[:8])
+                if len(missing) > 8:
+                    lines.append(f"· …另有 {len(missing) - 8} 项")
+                lines.append("到「环境与依赖」填写变量或准备资源。")
+        self.footer.setText(lines[0])
+        QMessageBox.information(self, "开发专区", "\n".join(lines))
+
+    def _open_dev_requirements(self) -> None:
+        selected = self._dev_selected()
+        if not selected:
+            QMessageBox.information(self, "先选一个条目", "先在开发专区里选中技能或连接器。")
+            return
+        kind, item_id = selected
+        self._open_requirement_key(kind, item_id)
+
+    def _edit_dev_item(self) -> None:
+        selected = self._dev_selected()
+        if not selected:
+            QMessageBox.information(self, "先选一个条目", "先在开发专区里选中技能或连接器。")
+            return
+        kind, item_id = selected
+        if kind == "connector":
+            self._edit_connector_id(item_id)
+        else:
+            self._edit_skill_id(item_id)
+
+    def _open_dev_group_requirements(self, key: str) -> None:
+        selected = self._dev_group_selected(key)
+        if not selected:
+            QMessageBox.information(
+                self, "先选一个条目", "先在这一组里选中技能或连接器。"
+            )
+            return
+        kind, item_id = selected
+        self._open_requirement_key(kind, item_id)
+
+    def _edit_dev_group_item(self, key: str, item: QListWidgetItem) -> None:
+        group = self._dev_group(key)
+        item_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not item_id:
+            return
+        if str(group["kind"]) == "connector":
+            self._edit_connector_id(item_id)
+        else:
+            self._edit_skill_id(item_id)
+
+    def _edit_dev_group_selected(self, key: str) -> None:
+        selected = self._dev_group_selected(key)
+        if not selected:
+            QMessageBox.information(
+                self, "先选一个条目", "先在这一组里选中技能或连接器。"
+            )
+            return
+        kind, item_id = selected
+        if kind == "connector":
+            self._edit_connector_id(item_id)
+        else:
+            self._edit_skill_id(item_id)
+
     # ------------------------------------------------------------ 技能
 
     def _refresh_skills(self, query: str = "") -> None:
@@ -1810,6 +2428,11 @@ class ResourceDialog(QDialog):
                     f'<div style="color:{ERROR};">{html.escape(str(exc))}</div>'
                 )
                 return
+            items = [
+                item
+                for item in items
+                if str(item.get("id") or "") not in DEV_SKILL_ID_SET
+            ]
             for item in items:
                 label = f"{item['name']}\n{item['id']}"
                 row = QListWidgetItem(label)
@@ -1825,7 +2448,11 @@ class ResourceDialog(QDialog):
             if items:
                 self.skill_list.setCurrentRow(0)
             else:
-                message = "没有匹配的技能。" if query else "还没有技能，点「新建技能」写一个。"
+                message = (
+                    "没有匹配的自建技能；自带开发技能在「开发专区」。"
+                    if query
+                    else "还没有自建技能，点「新建技能」写一个；自带开发技能在「开发专区」。"
+                )
                 self.skill_detail.setHtml(
                     f'<div style="color:{MUTED};">{html.escape(message)}</div>'
                 )
@@ -1899,14 +2526,20 @@ class ResourceDialog(QDialog):
         if not skill_id:
             QMessageBox.information(self, "先选一个技能", "在左侧选中要编辑的技能。")
             return
+        self._edit_skill_id(str(skill_id))
+
+    def _edit_skill_id(self, skill_id: str) -> None:
+        if not skill_id:
+            return
         try:
-            detail = self.skill_store.get(str(skill_id))
+            detail = self.skill_store.get(skill_id)
         except (ResourceError, OSError) as exc:
             QMessageBox.warning(self, "读不到技能", str(exc))
             return
         dialog = SkillEditorDialog(self.skill_store, detail, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.saved:
             self._refresh_skills()
+            self._refresh_dev_zone()
             self.footer.setText(f"已保存技能 {dialog.saved['id']}")
 
     def _delete_skill(self) -> None:
@@ -1943,6 +2576,11 @@ class ResourceDialog(QDialog):
                     f'<div style="color:{ERROR};">{html.escape(str(exc))}</div>'
                 )
                 return
+            items = [
+                item
+                for item in items
+                if str(item.get("id") or "") not in DEV_CONNECTOR_ID_SET
+            ]
             needle = query.strip().lower()
             if needle:
                 items = [
@@ -1970,7 +2608,9 @@ class ResourceDialog(QDialog):
                 self.connector_list.setCurrentRow(0)
             else:
                 message = (
-                    "没有匹配的连接器。" if query else "还没有连接器。可以接一个 HTTP API，或挂载 MCP 服务器。"
+                    "没有匹配的自建连接器；自带开发连接器在「开发专区」。"
+                    if query
+                    else "还没有自建连接器；自带开发连接器在「开发专区」。可以接一个 HTTP API，或挂载 MCP 服务器。"
                 )
                 self.connector_detail.setHtml(
                     f'<div style="color:{MUTED};">{html.escape(message)}</div>'
@@ -2045,14 +2685,20 @@ class ResourceDialog(QDialog):
         if not connector_id:
             QMessageBox.information(self, "先选一个连接器", "在左侧选中要编辑的连接器。")
             return
+        self._edit_connector_id(str(connector_id))
+
+    def _edit_connector_id(self, connector_id: str) -> None:
+        if not connector_id:
+            return
         try:
-            detail = self.connector_store.get(str(connector_id))
+            detail = self.connector_store.get(connector_id)
         except (ResourceError, OSError) as exc:
             QMessageBox.warning(self, "读不到连接器", str(exc))
             return
         dialog = ConnectorEditorDialog(self.connector_store, detail, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.saved:
             self._refresh_connectors()
+            self._refresh_dev_zone()
             self.footer.setText(f"已保存连接器 {dialog.saved['id']}")
 
     def _delete_connector(self) -> None:
@@ -2106,9 +2752,12 @@ class ResourceDialog(QDialog):
         if not selected:
             QMessageBox.information(self, "先选一个条目", "先在左侧选中要检查的技能或连接器。")
             return
-        self.tabs.setCurrentIndex(3)
-        self._refresh_requirements((kind, str(selected)))
-        key = (kind, str(selected))
+        self._open_requirement_key(kind, str(selected))
+
+    def _open_requirement_key(self, kind: str, item_id: str) -> None:
+        self.tabs.setCurrentWidget(self.requirements_page)
+        key = (kind, item_id)
+        self._refresh_requirements(key)
         for index in range(self.requirement_list.count()):
             item = self.requirement_list.item(index)
             if item.data(Qt.ItemDataRole.UserRole) == key:
@@ -2160,7 +2809,8 @@ class ResourceDialog(QDialog):
                 self.requirement_list.setCurrentRow(0)
             else:
                 message = (
-                    "没有已启用的技能或连接器。先到「技能」或「连接器」页勾选要用的条目。"
+                    "没有已启用的技能或连接器。先到「开发专区」一键开启，"
+                    "或在「技能」「连接器」页勾选要用的条目。"
                     if not show_disabled
                     else "还没有技能或连接器。"
                 )

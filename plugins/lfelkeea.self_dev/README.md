@@ -54,7 +54,26 @@ data/dev/
 
 ## 技能、连接器、知识库
 
-工作台顶部的「技能 / 连接器 / 知识库」按钮会打开资源管理界面，也可以让代理自己维护。
+工作台顶部有「开发专区」和「技能 / 连接器 / 知识库」两个入口：前者直接打开内置开发能力分组，后者打开完整资源管理界面，也可以让代理自己维护。
+
+### 开发专区
+
+「开发专区」把插件自带的 44 个技能和 42 个连接器按用途分成五组，每组一个独立界面：
+
+| 分组 | 内容 | 数量 |
+| --- | --- | --- |
+| 编程核心 | 代码评审、测试、调试、Git、发布、安全、工程规范等 | 26 个技能 |
+| 文档与创作 | Word / PDF / Excel / PPT、长文、知识库、draw.io、技术图表、图像、调研、本地搜索、自然化写作 | 12 个技能 |
+| API 专用 | GitHub / 飞书 / Notion / SQL / SearXNG / 网页抓取 | 6 个技能 |
+| HTTP 连接器 | GitHub、包管理器、模型与搜索 API、论文与百科等 | 26 个连接器 |
+| MCP 连接器 | Context7、文件系统、Git、SQLite、Playwright、Blender 等 | 16 个连接器 |
+
+- 「一键开启推荐套装」：打开 10 个常用开发技能和 7 个常用连接器（列表里带 ★ 标记）。
+- 「全部开启」：打开全部 44 个技能和 42 个连接器。
+- 「全部关闭」：把这批内置条目全部关掉。
+- 每组的「开启本组 / 关闭本组」只影响当前分组；列表里的勾选框可以单独开关，双击可以编辑。
+- 开启只改开关，不会自动申请密钥或安装运行时；缺什么到「环境与依赖」里处理。
+- 资源界面的「技能」「连接器」两页只放你自己创建的条目，内置开发条目统一收在开发专区。
 
 ### 技能
 
@@ -66,7 +85,7 @@ data/dev/
 
 技能默认关闭。资源界面左侧每个技能前都有勾选框，勾选即启用，取消即关闭；`set_skill_enabled(skill_id, true/false)` 也可以让代理自己切换。关闭的技能不会进入系统提示，`read_skill` 也会拒绝读取，但目录和内容仍然保留，随时可以再打开。旧版本没有 `enabled` 字段的技能按启用处理，不会被这次升级误关。
 
-插件还会自动补入 44 个技能，同样默认关闭。开发类包括：代码评审、GitHub API、飞书 API、Notion API、只读 SQL、SearXNG、网页抓取、MCP 工具链、Git 工作流、Python 工程、前端、API 设计、数据库设计、测试、调试、性能、安全、重构、发布、Docker、Windows 命令行、CLI 设计、Python 打包、技术写作、架构图、视觉设计、3D 建模、数据分析、依赖审计、可访问性和文档维护。日常与创作类包括：Word、PDF、Excel、PPT、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索、自然化写作和技能编写。
+插件还会自动补入 44 个技能，同样默认关闭，统一显示在「开发专区」的编程核心、文档与创作、API 专用三组里。开发类包括：代码评审、GitHub API、飞书 API、Notion API、只读 SQL、SearXNG、网页抓取、MCP 工具链、Git 工作流、Python 工程、前端、API 设计、数据库设计、测试、调试、性能、安全、重构、发布、Docker、Windows 命令行、CLI 设计、Python 打包、技术写作、架构图、视觉设计、3D 建模、数据分析、依赖审计、可访问性、文档维护和技能编写。日常与创作类包括：Word、PDF、Excel、PPT、长文写作、知识库、draw.io、技术图表、图像生成、联网调研、本地文件搜索和自然化写作。
 
 技能可以在 frontmatter 里声明 `requires_env` / `requires_commands`，也可以在技能目录放 `requirements.json`：
 
@@ -99,7 +118,7 @@ data/dev/
 
 连接器默认关闭。资源界面左侧勾选即启用，取消即关闭；`set_connector_enabled(connector_id, true/false)` 同样可用。关闭的连接器不会进入系统提示，`call_connector` / `mcp_tools` / `call_mcp_tool` 会直接拒绝，但定义仍保留在 `connectors.json` 里。
 
-自带连接器（全部默认关闭）：
+自带连接器全部默认关闭，统一显示在「开发专区」的 HTTP 连接器和 MCP 连接器两组里：
 
 - HTTP：`github`、`gitlab`、`feishu`、`notion`、`searxng`、`sql-gateway`、`fetch-gateway`、`pypi`、`npm-registry`、`crates-io`、`nuget`、`maven-central`、`rubygems`、`packagist`、`pub-dev`、`dockerhub`、`huggingface`、`stackexchange`、`devto`、`hackernews`、`openai-api`、`tavily`、`arxiv`、`crossref`、`openalex`、`wikipedia`。
 - MCP：`context7`、`mcp-filesystem`、`mcp-git`、`mcp-sqlite`、`mcp-playwright`、`mcp-chrome-devtools`、`mcp-fetch`、`mcp-markitdown`、`mcp-duckduckgo`、`mcp-memory`、`mcp-sequential-thinking`、`mcp-time`、`mcp-blender`、`mcp-github`、`mcp-brave-search`、`mcp-everything`。

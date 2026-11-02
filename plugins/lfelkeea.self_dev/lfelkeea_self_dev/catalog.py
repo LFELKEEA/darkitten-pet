@@ -1801,6 +1801,174 @@ BUNDLED_CONNECTORS: list[dict[str, Any]] = [
 ]
 
 
+# 开发专区：把自开发工坊自带的一整套开发能力按用途分组展示。
+# 推荐套装覆盖写代码、测试、调试、Git、发布、安全和常用 MCP 工具。
+DEV_STARTER_SKILL_IDS = [
+    "code-review-agent",
+    "python-project-craft",
+    "testing-strategy",
+    "debugging-playbook",
+    "git-workflow",
+    "release-engineering",
+    "technical-writing",
+    "security-checklist",
+    "mcp-toolkit",
+    "windows-shell",
+]
+
+DEV_STARTER_CONNECTOR_IDS = [
+    "github",
+    "pypi",
+    "npm-registry",
+    "context7",
+    "mcp-filesystem",
+    "mcp-git",
+    "mcp-playwright",
+]
+
+DEV_SKILL_GROUPS: list[dict[str, Any]] = [
+    {
+        "key": "coding",
+        "title": "编程核心",
+        "kind": "skill",
+        "hint": "写代码、测试、调试、性能、安全、发布和工程规范。",
+        "ids": [
+            "code-review-agent",
+            "mcp-toolkit",
+            "git-workflow",
+            "python-project-craft",
+            "frontend-craft",
+            "api-design",
+            "database-design",
+            "testing-strategy",
+            "debugging-playbook",
+            "performance-tuning",
+            "security-checklist",
+            "refactoring-safely",
+            "release-engineering",
+            "docker-deployment",
+            "windows-shell",
+            "cli-tool-craft",
+            "packaging-python",
+            "technical-writing",
+            "diagramming",
+            "ui-visual-design",
+            "three-d-modeling",
+            "data-analysis",
+            "dependency-audit",
+            "accessibility-audit",
+            "docs-maintenance",
+            "skill-authoring",
+        ],
+    },
+    {
+        "key": "writing",
+        "title": "文档与创作",
+        "kind": "skill",
+        "hint": "文档、表格、演示、图示、长文、检索与写作润色。",
+        "ids": [
+            "docx-documents",
+            "pdf-documents",
+            "xlsx-spreadsheets",
+            "pptx-presentations",
+            "longform-writing",
+            "knowledge-base",
+            "drawio-diagrams",
+            "technical-diagrams",
+            "image-generation",
+            "web-research",
+            "local-file-search",
+            "humanize-writing",
+        ],
+    },
+    {
+        "key": "api",
+        "title": "API 专用",
+        "kind": "skill",
+        "hint": "通过具体 API 或网关完成任务；启用前先在「环境与依赖」配置变量。",
+        "ids": [
+            "github-rest-api",
+            "feishu-open-api",
+            "notion-api",
+            "sql-readonly-gateway",
+            "searxng-search",
+            "web-page-fetch",
+        ],
+    },
+]
+
+DEV_CONNECTOR_GROUPS: list[dict[str, Any]] = [
+    {
+        "key": "http",
+        "title": "HTTP 连接器",
+        "kind": "connector",
+        "hint": "直接请求 HTTP API。带密钥的条目需要先在「环境与依赖」填写环境变量。",
+        "ids": [
+            "github",
+            "gitlab",
+            "feishu",
+            "notion",
+            "searxng",
+            "sql-gateway",
+            "fetch-gateway",
+            "pypi",
+            "npm-registry",
+            "crates-io",
+            "nuget",
+            "maven-central",
+            "rubygems",
+            "packagist",
+            "pub-dev",
+            "dockerhub",
+            "huggingface",
+            "stackexchange",
+            "devto",
+            "hackernews",
+            "openai-api",
+            "tavily",
+            "arxiv",
+            "crossref",
+            "openalex",
+            "wikipedia",
+        ],
+    },
+    {
+        "key": "mcp",
+        "title": "MCP 连接器",
+        "kind": "connector",
+        "hint": "按需启动本地 MCP 服务器。需要本机有对应的运行时命令（npx / uvx 等）。",
+        "ids": [
+            "context7",
+            "mcp-filesystem",
+            "mcp-git",
+            "mcp-sqlite",
+            "mcp-playwright",
+            "mcp-chrome-devtools",
+            "mcp-fetch",
+            "mcp-markitdown",
+            "mcp-duckduckgo",
+            "mcp-memory",
+            "mcp-sequential-thinking",
+            "mcp-time",
+            "mcp-blender",
+            "mcp-github",
+            "mcp-brave-search",
+            "mcp-everything",
+        ],
+    },
+]
+
+DEV_GROUPS = DEV_SKILL_GROUPS + DEV_CONNECTOR_GROUPS
+
+DEV_SKILL_IDS = [str(item["id"]) for item in BUNDLED_SKILLS]
+DEV_CONNECTOR_IDS = [str(item["id"]) for item in BUNDLED_CONNECTORS]
+
+DEV_SKILL_ID_SET = frozenset(DEV_SKILL_IDS)
+DEV_CONNECTOR_ID_SET = frozenset(DEV_CONNECTOR_IDS)
+DEV_STARTER_SKILL_ID_SET = frozenset(DEV_STARTER_SKILL_IDS)
+DEV_STARTER_CONNECTOR_ID_SET = frozenset(DEV_STARTER_CONNECTOR_IDS)
+
+
 def seed_catalog(paths: Any) -> dict[str, int]:
     """把自带目录补进数据目录，返回新增数量；同 id 不覆盖。"""
     from .connectors import ConnectorStore

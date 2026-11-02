@@ -218,8 +218,11 @@ class ApplyTests(unittest.TestCase):
             self.assertIn("update applied", updater.read_apply_log(install, limit=10_000))
             self.assertTrue(log_path.is_file())
             self.assertEqual((install / "LFELKEEA.exe").read_bytes(), b"MZnew")
-            # 等占位进程释放句柄，否则 Windows 上临时目录清理会失败。
+            # 等占位进程和更新脚本都退出，否则 Windows 上临时目录清理会失败。
             holder.wait(20)
+            apply_proc = getattr(updater, "_apply_process", None)
+            if apply_proc is not None:
+                apply_proc.wait(20)
             packed = json.loads(
                 (install / "_internal" / "version.json").read_text(encoding="utf-8")
             )

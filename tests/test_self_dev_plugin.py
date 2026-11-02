@@ -628,6 +628,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(dialog.windowTitle(), "LFELKEEA · 自开发工坊")
             self.assertIn("workspace", dialog.subtitle.text())
             self.assertIs(service.ui, dialog)
+            self.assertEqual(dialog.dev_btn.text(), "开发专区")
             self.assertEqual(dialog.model_label.text().splitlines()[0], "ollama / qwen2.5:7b")
         finally:
             dialog.close()
@@ -648,15 +649,139 @@ class UiSmokeTests(unittest.TestCase):
 
         dialog = ResourceDialog(self._service(root))
         try:
-            self.assertEqual(dialog.tabs.count(), 4)
-            self.assertEqual(dialog.tabs.tabText(0), "技能")
-            self.assertEqual(dialog.tabs.tabText(1), "连接器")
-            self.assertEqual(dialog.tabs.tabText(2), "知识库")
-            self.assertEqual(dialog.tabs.tabText(3), "环境与依赖")
+            self.assertEqual(dialog.tabs.count(), 5)
+            self.assertEqual(dialog.tabs.tabText(0), "开发专区")
+            self.assertEqual(dialog.tabs.tabText(1), "技能")
+            self.assertEqual(dialog.tabs.tabText(2), "连接器")
+            self.assertEqual(dialog.tabs.tabText(3), "知识库")
+            self.assertEqual(dialog.tabs.tabText(4), "环境与依赖")
             self.assertEqual(dialog.skill_list.count(), 1)
             self.assertIn("先读文件", dialog.skill_detail.toPlainText())
             self.assertEqual(dialog.knowledge_list.count(), 1)
             self.assertIn("知识库正文内容", dialog.knowledge_detail.toPlainText())
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
+    def test_dev_zone_groups_catalog_and_bulk_toggles(self):
+        from PySide6.QtCore import Qt as QtCore
+
+        from lfelkeea_self_dev.catalog import (
+            BUNDLED_CONNECTORS,
+            DEV_CONNECTOR_GROUPS,
+            DEV_CONNECTOR_IDS,
+            DEV_GROUPS,
+            DEV_SKILL_GROUPS,
+            DEV_SKILL_IDS,
+            DEV_STARTER_CONNECTOR_IDS,
+            DEV_STARTER_SKILL_IDS,
+            seed_catalog,
+        )
+        from lfelkeea_self_dev.ui import ResourceDialog
+
+        grouped_skills = [
+            item_id for group in DEV_SKILL_GROUPS for item_id in group["ids"]
+        ]
+        grouped_connectors = [
+            item_id for group in DEV_CONNECTOR_GROUPS for item_id in group["ids"]
+        ]
+        self.assertEqual(sorted(grouped_skills), sorted(DEV_SKILL_IDS))
+        self.assertEqual(sorted(grouped_connectors), sorted(DEV_CONNECTOR_IDS))
+        self.assertEqual(
+            [len(group["ids"]) for group in DEV_SKILL_GROUPS], [26, 12, 6]
+        )
+        self.assertEqual(
+            [len(group["ids"]) for group in DEV_CONNECTOR_GROUPS], [26, 16]
+        )
+        connector_types = {
+            item["id"]: item["type"] for item in BUNDLED_CONNECTORS
+        }
+        for group in DEV_CONNECTOR_GROUPS:
+            expected = "http" if group["key"] == "http" else "mcp"
+            for item_id in group["ids"]:
+                self.assertEqual(connector_types[item_id], expected, item_id)
+
+        root = Path(tempfile.mkdtemp())
+        for name in ("workspace", "skills", "knowledge", ".trash"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        paths = SimpleNamespace(
+            workspace=root / "workspace",
+            skills=root / "skills",
+            connectors=root / "connectors.json",
+            trash=root / ".trash",
+        )
+        seed_catalog(paths)
+
+        dialog = ResourceDialog(self._service(root))
+        try:
+            self.assertEqual(dialog.dev_group_tabs.count(), len(DEV_GROUPS))
+            for group in DEV_GROUPS:
+                widget = dialog.dev_lists[group["key"]]
+                self.assertEqual(widget.count(), len(group["ids"]), group["key"])
+            self.assertEqual(
+                sum(
+                    dialog.dev_lists[group["key"]].count()
+                    for group in DEV_SKILL_GROUPS
+                ),
+                len(DEV_SKILL_IDS),
+            )
+            self.assertEqual(
+                sum(
+                    dialog.dev_lists[group["key"]].count()
+                    for group in DEV_CONNECTOR_GROUPS
+                ),
+                len(DEV_CONNECTOR_IDS),
+            )
+            self.assertEqual(dialog.skill_list.count(), 0)
+            self.assertEqual(dialog.connector_list.count(), 0)
+
+            result = dialog._apply_dev_set(
+                list(DEV_STARTER_SKILL_IDS), list(DEV_STARTER_CONNECTOR_IDS), True
+            )
+            self.assertEqual(result["skills"], len(DEV_STARTER_SKILL_IDS))
+            self.assertEqual(result["connectors"], len(DEV_STARTER_CONNECTOR_IDS))
+            self.assertEqual(result["errors"], [])
+            dialog._refresh_dev_zone()
+
+            checked = sum(
+                1
+                for group in DEV_SKILL_GROUPS
+                for index in range(dialog.dev_lists[group["key"]].count())
+                if dialog.dev_lists[group["key"]].item(index).checkState()
+                == QtCore.CheckState.Checked
+            )
+            self.assertEqual(checked, len(DEV_STARTER_SKILL_IDS))
+            started = [
+                dialog.dev_lists[group["key"]].item(index).text()
+                for group in DEV_SKILL_GROUPS
+                for index in range(dialog.dev_lists[group["key"]].count())
+                if "★" in dialog.dev_lists[group["key"]].item(index).text()
+            ]
+            self.assertEqual(len(started), len(DEV_STARTER_SKILL_IDS))
+
+            result = dialog._apply_dev_set(
+                list(DEV_SKILL_IDS), list(DEV_CONNECTOR_IDS), False
+            )
+            self.assertEqual(result["skills"], len(DEV_STARTER_SKILL_IDS))
+            self.assertEqual(
+                result["connectors"], len(DEV_STARTER_CONNECTOR_IDS)
+            )
+            dialog._refresh_dev_zone()
+            checked = sum(
+                1
+                for group in DEV_GROUPS
+                for index in range(dialog.dev_lists[group["key"]].count())
+                if dialog.dev_lists[group["key"]].item(index).checkState()
+                == QtCore.CheckState.Checked
+            )
+            self.assertEqual(checked, 0)
+
+            widget = dialog.dev_lists[DEV_SKILL_GROUPS[0]["key"]]
+            row = widget.item(0)
+            row.setCheckState(QtCore.CheckState.Checked)
+            self.assertIn("已启用", row.text())
+            row.setCheckState(QtCore.CheckState.Unchecked)
+            self.assertIn("已关闭", row.text())
         finally:
             dialog.close()
             dialog.deleteLater()
