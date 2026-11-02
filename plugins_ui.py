@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -272,9 +273,10 @@ class PluginDialog(QDialog):
             update_row.addWidget(update_btn)
             row.addLayout(update_row)
 
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addStretch(1)
         if info.enabled and info.status in ("运行中", "运行出错（已隔离）"):
-            actions = QHBoxLayout()
-            actions.addStretch(1)
             if info.status == "运行中" and self.manager.has_ui(info.id):
                 settings_btn = QPushButton("设置")
                 settings_btn.setObjectName("primary")
@@ -290,7 +292,19 @@ class PluginDialog(QDialog):
             reload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             reload_btn.clicked.connect(lambda checked=False, pid=info.id: self.manager.reload_plugin(pid))
             actions.addWidget(reload_btn)
-            row.addLayout(actions)
+        delete_btn = QPushButton("删除")
+        delete_btn.setFixedHeight(24)
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn.setStyleSheet(
+            "QPushButton { color: #e28189; background: transparent; border: 1px solid #5a3038;"
+            " border-radius: 6px; padding: 3px 12px; font-size: 11px; }"
+            "QPushButton:hover { color: #ff9aa3; background: #3a1f25; }"
+        )
+        delete_btn.clicked.connect(
+            lambda checked=False, pid=info.id, name=info.name: self._delete(pid, name)
+        )
+        actions.addWidget(delete_btn)
+        row.addLayout(actions)
 
         return card
 
@@ -310,6 +324,28 @@ class PluginDialog(QDialog):
 
     def _toggle(self, plugin_id: str, enabled: bool) -> None:
         self.manager.set_enabled(plugin_id, enabled)
+
+    def _delete(self, plugin_id: str, name: str) -> None:
+        info = self.manager.get(plugin_id)
+        display = info.name if info is not None else name
+        box = QMessageBox(self)
+        box.setWindowTitle("删除插件")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"删除插件「{display}」？")
+        box.setInformativeText(
+            "会先停止插件，再清理它的启用状态、设置和运行存储。\n"
+            "插件文件夹会移到回收站，之后可以从回收站恢复。"
+        )
+        delete_button = box.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        if box.clickedButton() is not delete_button:
+            return
+        ok, message = self.manager.remove_plugin(plugin_id)
+        self.update_status.setText(message)
+        if not ok:
+            QMessageBox.warning(self, "没有删除", message)
 
     def _reload_all(self) -> None:
         self.manager.reload_all()

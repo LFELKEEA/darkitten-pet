@@ -29,6 +29,7 @@ from plugin_updater import (
     releases_from_registry,
 )
 from screen_watcher import ScreenContext, capture_screen
+from system_utils import move_to_trash
 
 
 API_VERSION = 1
@@ -380,6 +381,7 @@ class PluginManager(QObject):
         self._checking_updates = False
         self._update_queue: list[str] = []
         self._updating = False
+        self._updating_plugin = ""
         self.updates_checked.connect(self._on_updates_checked)
         self._downloaded.connect(self._on_plugin_downloaded)
         self.plugin_updated.connect(self._on_plugin_update_finished)
@@ -393,9 +395,17 @@ class PluginManager(QObject):
         self.state_dir.mkdir(parents=True, exist_ok=True)
         shipped = resource_dir() / "plugins"
         if shipped.is_dir():
+            removed = self._removed_set()
             for child in shipped.iterdir():
                 if not child.is_dir() or not (child / "plugin.json").exists():
                     continue
+                if child.name in removed:
+                    continue
+                try:
+                    if self._read_manifest(child).id in removed:
+                        continue
+                except PluginError:
+                    pass
                 target = self.plugins_dir / child.name
                 if target.exists():
                     continue
@@ -416,6 +426,23 @@ class PluginManager(QObject):
         if not isinstance(plugins, dict):
             plugins = {}
         plugins["enabled"] = dict(values)
+        self.config.set("plugins", plugins, save=True)
+
+    def _removed_set(self) -> set[str]:
+        """已被用户删除的内置插件，避免首次运行逻辑又把它复制回来。"""
+        plugins = self.config.get("plugins", {})
+        if not isinstance(plugins, dict):
+            return set()
+        values = plugins.get("removed", [])
+        if not isinstance(values, list):
+            return set()
+        return {str(item).strip() for item in values if str(item).strip()}
+
+    def _save_removed_set(self, values: set[str]) -> None:
+        plugins = self.config.get("plugins", {})
+        if not isinstance(plugins, dict):
+            plugins = {}
+        plugins["removed"] = sorted(values)
         self.config.set("plugins", plugins, save=True)
 
     def _read_manifest(self, folder: Path) -> PluginInfo:
@@ -495,6 +522,16 @@ class PluginManager(QObject):
             elif info.status == "未启用" and info.enabled:
                 info.status = "等待加载"
             infos[info.id] = info
+        # 插件又出现在磁盘上（手动放回或从市场重装），删除标记就失效了。
+        removed = self._removed_set()
+        present = set()
+        for info in infos.values():
+            present.add(info.folder.name)
+            if not info.id.startswith("invalid."):
+                present.add(info.id)
+        stale = removed & present
+        if stale:
+            self._save_removed_set(removed - stale)
         for info in infos.values():
             release = self._releases.get(info.id)
             info.latest_version = release.version if release is not None else ""
@@ -625,6 +662,91 @@ class PluginManager(QObject):
         self.changed.emit()
         return ok
 
+    # ---------- 删除插件 ----------
+
+    def remove_plugin(self, plugin_id: str) -> tuple[bool, str]:
+        """停止插件，把插件目录移入回收站，并清理启用状态、设置和存储。"""
+        info = self._infos.get(plugin_id)
+        if info is None:
+            return False, "插件不存在，可能已经被移除。"
+        if self._installing == plugin_id:
+            return False, "插件正在安装，等安装完成后再删除。"
+        if self._updating_plugin == plugin_id:
+            return False, "插件正在更新，等更新完成后再删除。"
+
+        if info.folder.is_symlink():
+            return False, "拒绝删除：插件目录是符号链接。"
+        folder = info.folder.resolve()
+        root = self.plugins_dir.resolve()
+        if folder == root or folder.parent != root:
+            return False, "拒绝删除：插件目录必须是插件文件夹的直接子目录。"
+        if not folder.is_dir():
+            return False, "插件目录已经不存在。"
+
+        name = info.name or info.id
+        folder_name = folder.name
+        manifest_id = "" if info.id.startswith("invalid.") else info.id
+        keys = {folder_name}
+        if manifest_id:
+            keys.add(manifest_id)
+
+        was_loaded = plugin_id in self._loaded
+        was_enabled = bool(info.enabled)
+        if was_loaded:
+            self.unload_plugin(plugin_id)
+        else:
+            self._close_ui(plugin_id)
+
+        ok, error = move_to_trash(folder)
+        if not ok:
+            # 删除失败时恢复刚才停掉的插件，避免“点了删除反而把插件停掉”。
+            if was_loaded or was_enabled:
+                self.discover()
+                recovered = self._infos.get(plugin_id)
+                if recovered is not None:
+                    recovered.enabled = was_enabled
+                    self.load_plugin(plugin_id)
+            self.changed.emit()
+            self.log(plugin_id or folder_name, f"删除失败：{error}")
+            return False, f"没有删除：{error}"
+
+        self._forget_plugin_config(keys)
+        for key in keys:
+            state_file = self._state_path(key)
+            if state_file.is_file():
+                moved, _ = move_to_trash(state_file)
+                if not moved:
+                    self.log(plugin_id or folder_name, f"清理状态文件失败：{state_file.name}")
+        self._releases.pop(plugin_id, None)
+        self._infos.pop(plugin_id, None)
+        self.discover()
+        self.changed.emit()
+        self.log(plugin_id or folder_name, "插件已移入回收站")
+        return True, f"已删除「{name}」，插件文件夹在回收站里，可从回收站恢复。"
+
+    def _forget_plugin_config(self, plugin_ids: set[str]) -> None:
+        plugins = self.config.get("plugins", {})
+        if not isinstance(plugins, dict):
+            plugins = {}
+        enabled = plugins.get("enabled", {})
+        enabled = dict(enabled) if isinstance(enabled, dict) else {}
+        settings = plugins.get("settings", {})
+        settings = dict(settings) if isinstance(settings, dict) else {}
+        removed_raw = plugins.get("removed", [])
+        removed = (
+            {str(item).strip() for item in removed_raw if str(item).strip()}
+            if isinstance(removed_raw, list)
+            else set()
+        )
+        for key in plugin_ids:
+            enabled.pop(key, None)
+            settings.pop(key, None)
+            removed.add(key)
+        plugins["enabled"] = enabled
+        plugins["settings"] = settings
+        plugins["removed"] = sorted(removed)
+        self.config.set("plugins", plugins, save=True)
+
     # ---------- 插件更新 ----------
 
     def registry_url(self) -> str:
@@ -698,6 +820,7 @@ class PluginManager(QObject):
             self.plugin_updated.emit(plugin_id, "没有可用的更新")
             return False
         self._updating = True
+        self._updating_plugin = plugin_id
 
         def worker() -> None:
             try:
@@ -760,6 +883,7 @@ class PluginManager(QObject):
 
     def _on_plugin_update_finished(self, plugin_id: str, error: str) -> None:
         self._updating = False
+        self._updating_plugin = ""
         QTimer.singleShot(0, self._start_next_update)
 
     # ---------- 插件市场 ----------
