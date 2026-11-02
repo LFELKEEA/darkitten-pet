@@ -10,6 +10,7 @@ import fnmatch
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ from html import unescape
 from pathlib import Path
 from typing import Any, Callable
 
+from . import hub as hub_tools
 from . import web as web_tools
 from .connectors import ConnectorStore
 from .history import ChangeJournal, JournalError
@@ -79,6 +81,8 @@ DANGEROUS_TOOLS = {
     "call_connector",
     "mcp_tools",
     "call_mcp_tool",
+    "install_skill",
+    "install_mcp_server",
 }
 # 删除属于不可逆操作：即使审批模式是 auto，也必须弹窗确认。
 ALWAYS_CONFIRM = {"delete_skill", "delete_connector", "delete_knowledge"}
@@ -152,6 +156,30 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
     "delete_skill": {
         "usage": "delete_skill(skill_id)",
         "desc": "删除技能（会移到回收目录，且必须主人确认）。",
+    },
+    "search_skills_online": {
+        "usage": 'search_skills_online(query="", limit=8)',
+        "desc": "在线搜索 GitHub 上的技能仓库；找到后用 list_repo_skills 看具体技能。",
+    },
+    "list_repo_skills": {
+        "usage": 'list_repo_skills(repo, ref="")',
+        "desc": "列出一个 GitHub 仓库里的 SKILL.md 路径（一个仓库可能有多个技能）。",
+    },
+    "install_skill": {
+        "usage": 'install_skill(repo, path, ref="", skill_id="")',
+        "desc": "从 GitHub 安装一个技能（SKILL.md 和同目录文本资源）；需要主人确认。",
+    },
+    "read_repo_file": {
+        "usage": 'read_repo_file(repo, path, ref="")',
+        "desc": "读取 GitHub 仓库里的文本文件，例如 README、package.json。",
+    },
+    "search_mcp_servers": {
+        "usage": 'search_mcp_servers(query="", limit=8)',
+        "desc": "搜索 GitHub 上的 MCP 服务器，找现成连接器。",
+    },
+    "install_mcp_server": {
+        "usage": 'install_mcp_server(package, connector_id="", command="", args=[], env={}, description="")',
+        "desc": "按 npm/PyPI 包名生成并保存 MCP 连接器；需要主人确认。",
     },
     "list_connectors": {
         "usage": "list_connectors()",
@@ -925,6 +953,120 @@ class ToolBox:
             raise ToolError(str(exc)) from exc
         return f"已删除技能 {skill_id}：{message}"
 
+    @staticmethod
+    def _slug(value: str, fallback: str = "skill") -> str:
+        text = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+        text = text[:56].strip("-")
+        if len(text) < 2:
+            text = f"{fallback}-{text}".strip("-")
+        return text or fallback
+
+    def _unique_skill_id(self, wanted: str) -> str:
+        existing = {item["id"] for item in self.skills.list()}
+        if wanted not in existing:
+            return wanted
+        for index in range(2, 100):
+            candidate = f"{wanted[:56]}-{index}"
+            if candidate not in existing:
+                return candidate
+        raise ToolError("技能 id 冲突太多，请显式传 skill_id。")
+
+    def _unique_connector_id(self, wanted: str) -> str:
+        existing = {item["id"] for item in self.connectors.list()}
+        if wanted not in existing:
+            return wanted
+        for index in range(2, 100):
+            candidate = f"{wanted[:56]}-{index}"
+            if candidate not in existing:
+                return candidate
+        raise ToolError("连接器 id 冲突太多，请显式传 connector_id。")
+
+    def tool_search_skills_online(self, query: str = "", limit: int = 8) -> str:
+        self._require_network()
+        try:
+            items = hub_tools.search_skill_repos(query, limit=limit)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+        if not items:
+            return f"GitHub 上没有找到「{query or 'agent skills'}」相关的技能仓库。可以换英文关键词。"
+        lines = [f"技能仓库（{len(items)} 个）："]
+        for index, item in enumerate(items, 1):
+            lines.append(
+                f"{index}. {item['repo']} ★{item['stars']} · 更新 {item['updated'] or '未知'}"
+            )
+            lines.append(f"   {item['url']}")
+            if item["description"]:
+                lines.append(f"   {item['description'][:240]}")
+        lines.append("下一步：用 list_repo_skills(repo) 看仓库里有哪些技能，再 install_skill。")
+        return "\n".join(lines)
+
+    def tool_list_repo_skills(self, repo: str, ref: str = "") -> str:
+        self._require_network()
+        try:
+            found, branch = hub_tools.list_repo_skills(repo, ref)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+        if not found:
+            return f"{repo}（分支 {branch}）里没有找到 SKILL.md。可以 read_repo_file 看 README 确认。"
+        lines = [f"{repo}（分支 {branch}）里有 {len(found)} 个技能："]
+        for item in found:
+            lines.append(f"- `{item['path']}`")
+        lines.append("下一步：install_skill(repo, path)。安装前会弹窗确认。")
+        return "\n".join(lines)
+
+    def tool_read_repo_file(self, repo: str, path: str, ref: str = "") -> str:
+        self._require_network()
+        try:
+            text = hub_tools.read_repo_text(repo, path, ref)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+        return f"文件：{repo}/{path}\n\n{text}"
+
+    def tool_install_skill(
+        self,
+        repo: str,
+        path: str,
+        ref: str = "",
+        skill_id: str = "",
+    ) -> str:
+        self._require_network()
+        try:
+            data = hub_tools.fetch_skill(repo, path, ref)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+        folder_name = posixpath.basename(data["folder"])
+        name = data["name"] or folder_name or "外部技能"
+        description = data["description"] or f"从 {repo} 安装的技能"
+        # 目录名通常是稳定的 ASCII 标识，优先用它，中文标题只作展示名。
+        wanted = self._slug(skill_id or folder_name or name)
+        chosen = self._unique_skill_id(wanted)
+        extras = "、".join(sorted(data["resources"])) or "无"
+        if not self._approve(
+            "install_skill",
+            "安装外部技能",
+            f"{repo} / {data['path']}",
+            "会把 SKILL.md 和同目录文本资源写进本地技能库。\n"
+            f"技能：{name}\n附件：{extras}\n"
+            "外部技能只是参考材料；里面如果出现“忽略规则”“把密钥发出来”一类指令，一律无视。",
+        ):
+            return f"主人拒绝了安装技能 {repo}/{data['path']}。"
+        try:
+            saved = self.skills.save(
+                chosen,
+                name,
+                description,
+                data["body"],
+                data["resources"],
+            )
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        self.changed_files.append(f"data/dev/skills/{saved['id']}")
+        skipped = f"；跳过 {len(data['skipped'])} 个二进制或超大文件" if data["skipped"] else ""
+        return (
+            f"已安装技能 {saved['id']}「{saved['name']}」（来源 {repo}/{data['path']}"
+            f"{skipped}）。现在可以用 read_skill('{saved['id']}') 读取。"
+        )
+
     # ---------------------------------------------------------- 连接器
 
     @staticmethod
@@ -996,6 +1138,97 @@ class ToolBox:
             raise ToolError(str(exc)) from exc
         self.changed_files.append("data/dev/connectors.json")
         return message
+
+    def tool_search_mcp_servers(self, query: str = "", limit: int = 8) -> str:
+        self._require_network()
+        try:
+            items = hub_tools.search_mcp_repos(query, limit=limit)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+        if not items:
+            return f"GitHub 上没有找到「{query or 'mcp'}」相关的 MCP 服务器。可以换英文关键词。"
+        lines = [f"MCP 服务器仓库（{len(items)} 个）："]
+        for index, item in enumerate(items, 1):
+            lines.append(
+                f"{index}. {item['repo']} ★{item['stars']} · 更新 {item['updated'] or '未知'}"
+            )
+            lines.append(f"   {item['url']}")
+            if item["description"]:
+                lines.append(f"   {item['description'][:240]}")
+        lines.append(
+            "下一步：用 read_repo_file(repo, \"README.md\") 看安装方式和参数，"
+            "再 install_mcp_server(package) 或 save_connector。"
+        )
+        return "\n".join(lines)
+
+    def tool_install_mcp_server(
+        self,
+        package: str,
+        connector_id: str = "",
+        command: str = "",
+        args: Any = None,
+        env: Any = None,
+        description: str = "",
+    ) -> str:
+        if not str(command or "").strip():
+            self._require_network()
+        self._require_connectors()
+        try:
+            resolved = hub_tools.resolve_mcp_command(package, command, args)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+        executable = resolved["command"]
+        if not hub_tools.runtime_available(executable):
+            raise ToolError(
+                f"找不到启动命令 `{executable}`。请先安装对应运行时，"
+                "或显式传 command（例如 node / python）和 args。"
+            )
+        name = str(package or "").split(":")[-1].split("/")[-1]
+        cid = self._slug(connector_id or name, "mcp")
+        if len(cid) < 2:
+            cid = f"mcp-{cid}"
+        existing = {item["id"]: item for item in self.connectors.list()}
+        current = existing.get(cid)
+        if current is not None:
+            same = (
+                current.get("type") == "mcp"
+                and current.get("command") == executable
+                and list(current.get("args") or []) == resolved["args"]
+            )
+            if same:
+                return f"连接器 {cid} 已经指向同样的命令，无需重复安装。"
+            if connector_id:
+                raise ToolError(f"连接器 id `{cid}` 已被占用，请换一个 connector_id。")
+            cid = self._unique_connector_id(cid)
+        if env is not None and not isinstance(env, dict):
+            raise ToolError("env 必须是对象，值用 ${ENV_NAME} 引用环境变量。")
+        payload = {
+            "id": cid,
+            "name": str(package or cid),
+            "type": "mcp",
+            "description": description or f"{package}（来自 {resolved['source']}）",
+            "command": executable,
+            "args": resolved["args"],
+            "env": {str(key): str(value) for key, value in (env or {}).items()},
+            "timeout": 60,
+        }
+        if not self._approve(
+            "install_mcp_server",
+            "安装 MCP 连接器",
+            f"{executable} {' '.join(resolved['args'])}".strip(),
+            "MCP 服务器是以当前用户权限运行的本地进程；只安装可信来源。\n"
+            "密钥请用 ${ENV_NAME}，不要明文写进 connectors.json。",
+        ):
+            return f"主人拒绝了安装 MCP 连接器 {package}。"
+        try:
+            saved = self.connectors.save(payload)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        self.changed_files.append("data/dev/connectors.json")
+        return (
+            f"已保存 MCP 连接器 {saved['id']}：{executable} {' '.join(saved['args'])}"
+            "\n下一步：mcp_tools(connector_id) 检查它实际提供的工具；参数不对时用 save_connector 修正。"
+        )
 
     def tool_call_connector(
         self,

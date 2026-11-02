@@ -28,6 +28,12 @@ a = Analysis(
         'cffi',
         'sherpa_onnx',
         'sherpa_onnx.lib._sherpa_onnx',
+        # 插件是运行时动态导入的，分析器看不到它们用到的标准库。
+        'sqlite3',
+        '_sqlite3',
+        'xml',
+        'xml.etree',
+        'xml.etree.ElementTree',
     ],
     hookspath=[],
     hooksconfig={},
