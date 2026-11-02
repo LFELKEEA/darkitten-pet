@@ -23,7 +23,13 @@ from html import unescape
 from pathlib import Path
 from typing import Any, Callable
 
+from . import web as web_tools
+from .connectors import ConnectorStore
 from .history import ChangeJournal, JournalError
+from .knowledge import KnowledgeBase
+from .net import NetworkError
+from .resource_util import ResourceError
+from .skills import SkillStore
 
 SELF_PLUGIN_ID = "lfelkeea.self_dev"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,63}$")
@@ -66,7 +72,17 @@ KNOWN_PERMISSIONS = {
     "storage",
 }
 
-DANGEROUS_TOOLS = {"run_shell", "create_plugin"}
+DANGEROUS_TOOLS = {
+    "run_shell",
+    "create_plugin",
+    "save_connector",
+    "call_connector",
+    "mcp_tools",
+    "call_mcp_tool",
+}
+# 删除属于不可逆操作：即使审批模式是 auto，也必须弹窗确认。
+ALWAYS_CONFIRM = {"delete_skill", "delete_connector", "delete_knowledge"}
+MAX_KNOWLEDGE_IMPORT = 500_000
 
 TOOL_SPECS: dict[str, dict[str, str]] = {
     "list_dir": {
@@ -115,7 +131,91 @@ TOOL_SPECS: dict[str, dict[str, str]] = {
     },
     "read_reference": {
         "usage": 'read_reference(name="plugin_api")',
-        "desc": "读取插件开发参考（plugin_api / agent_notes）。",
+        "desc": "读取插件开发参考（plugin_api / agent_notes / resources）。",
+    },
+    "list_skills": {
+        "usage": "list_skills()",
+        "desc": "列出本地技能库（id、名称、适用场景）。",
+    },
+    "read_skill": {
+        "usage": 'read_skill(skill_id, resource="")',
+        "desc": "加载一个技能的完整 SKILL.md；resource 非空时读取技能里的某个附件。",
+    },
+    "search_skills": {
+        "usage": 'search_skills(query, limit=10)',
+        "desc": "按关键词搜索技能正文，找到该用哪个技能。",
+    },
+    "save_skill": {
+        "usage": 'save_skill(skill_id, name, description, body, resources={})',
+        "desc": "新建或更新技能；resources 是 {相对路径: 文本}，可放 references/、templates/。",
+    },
+    "delete_skill": {
+        "usage": "delete_skill(skill_id)",
+        "desc": "删除技能（会移到回收目录，且必须主人确认）。",
+    },
+    "list_connectors": {
+        "usage": "list_connectors()",
+        "desc": "列出 HTTP / MCP 连接器；密钥值会打码。",
+    },
+    "call_connector": {
+        "usage": 'call_connector(connector_id, path="", method="GET", query={}, body=null, headers={})',
+        "desc": "调用 HTTP 连接器；完整地址写在 base_url 里，path 只能是相对路径。",
+    },
+    "mcp_tools": {
+        "usage": "mcp_tools(connector_id)",
+        "desc": "启动 MCP 连接器并列出它提供的工具和参数结构。",
+    },
+    "call_mcp_tool": {
+        "usage": 'call_mcp_tool(connector_id, tool, arguments={})',
+        "desc": "调用 MCP 服务器上的一个工具。",
+    },
+    "save_connector": {
+        "usage": "save_connector(payload)",
+        "desc": "新建或更新连接器定义（HTTP 或 MCP），密钥请用 ${ENV_NAME} 引用环境变量。",
+    },
+    "delete_connector": {
+        "usage": "delete_connector(connector_id)",
+        "desc": "删除连接器（先备份 connectors.json，且必须主人确认）。",
+    },
+    "search_knowledge": {
+        "usage": 'search_knowledge(query, limit=6)',
+        "desc": "检索本地知识库，返回带 [K文档#片段] 引用的片段。",
+    },
+    "import_knowledge": {
+        "usage": 'import_knowledge(title, text, source="", kind="note")',
+        "desc": "把一段文本写进知识库；相同 source 和内容会自动去重。",
+    },
+    "import_knowledge_file": {
+        "usage": 'import_knowledge_file(path, title="")',
+        "desc": "读取工作区里的文本文件并加入知识库。",
+    },
+    "import_knowledge_url": {
+        "usage": 'import_knowledge_url(url, title="")',
+        "desc": "抓取网页正文并加入知识库。",
+    },
+    "list_knowledge": {
+        "usage": "list_knowledge(limit=50)",
+        "desc": "列出知识库文档和片段数量。",
+    },
+    "delete_knowledge": {
+        "usage": "delete_knowledge(document_id)",
+        "desc": "删除知识库文档（先导出到 .trash，且必须主人确认）。",
+    },
+    "web_search": {
+        "usage": 'web_search(query, limit=6)',
+        "desc": "搜索网页，查不熟悉的库、API、报错和开发工具。",
+    },
+    "search_github": {
+        "usage": 'search_github(query, sort="stars", limit=8)',
+        "desc": "搜索 GitHub 仓库，找参考实现和现成工具。",
+    },
+    "pypi_info": {
+        "usage": "pypi_info(package)",
+        "desc": "查询 PyPI 包的最新版本、摘要、Python 要求和主页。",
+    },
+    "search_pypi": {
+        "usage": "search_pypi(query, limit=8)",
+        "desc": "按关键词搜索 PyPI 包。",
     },
     "create_plugin": {
         "usage": 'create_plugin(plugin_id, files, enable=true, merge=true)',
@@ -156,6 +256,9 @@ class ToolBox:
         stop_event: threading.Event | None = None,
         logger: Callable[[str], None] | None = None,
         journal: ChangeJournal | None = None,
+        skills: SkillStore | None = None,
+        connectors: ConnectorStore | None = None,
+        knowledge: KnowledgeBase | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.dev_dir = Path(dev_dir).resolve()
@@ -174,6 +277,13 @@ class ToolBox:
             self.dev_dir, self.plugins_dir, self.workspace, logger=self.log
         )
         self.changed_files: list[str] = []
+        self.trash = (self.dev_dir / ".trash").resolve()
+        self.trash.mkdir(parents=True, exist_ok=True)
+        self.skills = skills or SkillStore(self.dev_dir / "skills", self.trash)
+        self.connectors = connectors or ConnectorStore(
+            self.dev_dir / "connectors.json", self.workspace, self.trash
+        )
+        self.knowledge = knowledge or KnowledgeBase(self.dev_dir / "knowledge")
 
     # ------------------------------------------------------------------ 入口
 
@@ -299,6 +409,8 @@ class ToolBox:
                 pass
 
     def _needs_approval(self, tool: str) -> bool:
+        if tool in ALWAYS_CONFIRM:
+            return True
         mode = str(self.settings.get("approval_mode", "confirm_danger"))
         if mode == "auto":
             return False
@@ -727,6 +839,371 @@ class ToolBox:
             available = ", ".join(sorted(item.stem for item in self.references.glob("*.md")))
             raise ToolError(f"没有这份参考：{stem}。可用：{available or '无'}")
         return self._read_text(path)
+
+    # ------------------------------------------------------------------ 资源
+
+    def _require_network(self) -> None:
+        if not self.settings.get("allow_network", True):
+            raise ToolError("当前设置禁止联网；需要时请主人在设置里打开「允许联网」。")
+
+    def _require_connectors(self) -> None:
+        if not self.settings.get("allow_connectors", True):
+            raise ToolError("当前设置禁止使用连接器；需要时请主人在设置里打开「允许连接器」。")
+
+    # ---------------------------------------------------------- 技能
+
+    def tool_list_skills(self) -> str:
+        return self.skills.index_text()
+
+    def tool_read_skill(self, skill_id: str, resource: str = "") -> str:
+        try:
+            if str(resource or "").strip():
+                return self.skills.read_resource(skill_id, resource)
+            skill = self.skills.get(skill_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        extras = [name for name in skill["files"] if name != "SKILL.md"]
+        lines = [
+            f"技能：{skill['name']}（{skill['id']}）",
+            f"适用：{skill['description']}",
+            "",
+            skill["body"],
+        ]
+        if extras:
+            lines.extend(["", "附件（用 read_skill(skill_id, resource) 读取）：" + "、".join(extras)])
+        return "\n".join(lines)
+
+    def tool_search_skills(self, query: str, limit: int = 10) -> str:
+        try:
+            hits = self.skills.search(query, limit=limit)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if not hits:
+            return f"没有找到和「{query}」相关的技能。可以用 list_skills 看全部。"
+        lines = [f"找到 {len(hits)} 个相关技能："]
+        for item in hits:
+            lines.append(f"- `{item['id']}` — {item['name']}：{item['description']}")
+            lines.append(f"  片段：{item['snippet'][:240]}")
+        return "\n".join(lines)
+
+    def tool_save_skill(
+        self,
+        skill_id: str,
+        name: str = "",
+        description: str = "",
+        body: str = "",
+        resources: Any = None,
+    ) -> str:
+        try:
+            skill = self.skills.save(skill_id, name, description, body, resources)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        self.changed_files.append(f"data/dev/skills/{skill['id']}")
+        extras = [item for item in skill["files"] if item != "SKILL.md"]
+        return (
+            f"已保存技能 {skill['id']}「{skill['name']}」"
+            f"（正文 {len(skill['body'])} 字"
+            + (f"，附件：{'、'.join(extras)}" if extras else "")
+            + "）。系统提示里的技能索引会在下一轮生效。"
+        )
+
+    def tool_delete_skill(self, skill_id: str) -> str:
+        try:
+            skill = self.skills.get(skill_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if not self._approve(
+            "delete_skill",
+            "删除技能",
+            f"删除技能「{skill['name']}」（{skill_id}）",
+            "技能目录会移到回收目录；需要的话可以从那里找回来。",
+        ):
+            return f"主人拒绝了删除技能 {skill_id}。"
+        try:
+            message = self.skills.delete(skill_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        return f"已删除技能 {skill_id}：{message}"
+
+    # ---------------------------------------------------------- 连接器
+
+    @staticmethod
+    def _public_connector(item: dict[str, Any]) -> dict[str, Any]:
+        return ConnectorStore.public(item)
+
+    def tool_list_connectors(self) -> str:
+        items = self.connectors.list()
+        if not items:
+            return (
+                "还没有连接器。\n"
+                "HTTP 连接器示例：{\"id\":\"github\",\"type\":\"http\","
+                "\"base_url\":\"https://api.github.com\",\"headers\":{\"Authorization\":\"Bearer ${GITHUB_TOKEN}\"}}"
+            )
+        lines = [f"连接器（{len(items)} 个）："]
+        for item in items:
+            kind = "HTTP" if item["type"] == "http" else "MCP"
+            lines.append(f"- `{item['id']}`（{kind}）{item['name']}：{item.get('description', '')}")
+            lines.append(json.dumps(self._public_connector(item), ensure_ascii=False, indent=2))
+        return "\n".join(lines)
+
+    def tool_save_connector(self, payload: Any = None, **fields: Any) -> str:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError as exc:
+                raise ToolError(f"payload 不是合法 JSON：{exc}") from exc
+        if payload is None:
+            payload = fields
+        elif isinstance(payload, dict) and fields:
+            payload = {**fields, **payload}
+        if not isinstance(payload, dict):
+            raise ToolError("payload 必须是连接器 JSON 对象。")
+        connector_id = str(payload.get("id") or "").strip() or "新连接器"
+        if not self._approve(
+            "save_connector",
+            "保存连接器",
+            f"写入连接器 {connector_id}",
+            "连接器可以访问外部 API 或启动 MCP 子进程；请确认定义可信。\n"
+            "密钥请用 ${ENV_NAME} 引用环境变量，不要明文写进 connectors.json。",
+        ):
+            return f"主人拒绝了保存连接器 {connector_id}。"
+        try:
+            saved = self.connectors.save(payload)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        self.changed_files.append("data/dev/connectors.json")
+        return (
+            f"已保存连接器 {saved['id']}（{saved['type']}）。\n"
+            + json.dumps(self._public_connector(saved), ensure_ascii=False, indent=2)
+            + "\n下一轮任务会看到这个连接器。"
+        )
+
+    def tool_delete_connector(self, connector_id: str) -> str:
+        try:
+            item = self.connectors.get(connector_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if not self._approve(
+            "delete_connector",
+            "删除连接器",
+            f"删除连接器「{item['name']}」（{connector_id}）",
+            "connectors.json 会先备份成 .bak，再移除这条定义。",
+        ):
+            return f"主人拒绝了删除连接器 {connector_id}。"
+        try:
+            message = self.connectors.delete(connector_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        self.changed_files.append("data/dev/connectors.json")
+        return message
+
+    def tool_call_connector(
+        self,
+        connector_id: str,
+        path: str = "",
+        method: str = "GET",
+        query: Any = None,
+        body: Any = None,
+        headers: Any = None,
+    ) -> str:
+        self._require_network()
+        self._require_connectors()
+        if not self._approve(
+            "call_connector",
+            "调用 HTTP 连接器",
+            f"{method.upper()} {connector_id} {path or '/'}",
+            "请求会带上前一步保存的 header（包括从环境变量解析的密钥）。\n"
+            "返回内容会交给模型，密钥会被打码。",
+        ):
+            return f"主人拒绝了调用连接器 {connector_id}。"
+        try:
+            result = self.connectors.http_call(
+                connector_id,
+                path=path,
+                method=method,
+                query=query,
+                body=body,
+                headers=headers,
+                allow_private_network=bool(self.settings.get("allow_private_network", False)),
+            )
+        except (ResourceError, NetworkError) as exc:
+            raise ToolError(str(exc)) from exc
+        return (
+            f"连接器 {connector_id} · HTTP {result['status']} · {result['content_type'] or '未知类型'}\n"
+            f"URL：{result['url']}\n\n{result['text']}"
+        )
+
+    def tool_mcp_tools(self, connector_id: str) -> str:
+        self._require_connectors()
+        if not self._approve(
+            "mcp_tools",
+            "读取 MCP 工具",
+            f"启动 MCP 连接器 {connector_id} 并列出工具",
+            "会运行连接器配置里的 command；只启动本次需要的子进程，结束后关闭。",
+        ):
+            return f"主人拒绝了启动 MCP 连接器 {connector_id}。"
+        try:
+            payload = self.connectors.mcp_tools(connector_id)
+        except (ResourceError, NetworkError) as exc:
+            raise ToolError(str(exc)) from exc
+        tools = payload.get("tools") or []
+        server = payload.get("server") or {}
+        lines = [
+            f"MCP 连接器 {connector_id}"
+            + (f" · {server.get('name', '')} {server.get('version', '')}".rstrip() if server else "")
+            + f" · {len(tools)} 个工具"
+        ]
+        for item in tools:
+            schema = item.get("inputSchema") or {}
+            lines.append(f"- `{item.get('name', '')}`：{item.get('description', '')}")
+            lines.append("  参数：" + json.dumps(schema, ensure_ascii=False)[:1200])
+        return "\n".join(lines)
+
+    def tool_call_mcp_tool(self, connector_id: str, tool: str, arguments: Any = None) -> str:
+        self._require_connectors()
+        name = str(tool or "").strip()
+        if not name:
+            raise ToolError("tool 不能为空。")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        if not self._approve(
+            "call_mcp_tool",
+            "调用 MCP 工具",
+            f"{connector_id} / {name}",
+            "参数：\n" + json.dumps(arguments, ensure_ascii=False)[:1500],
+        ):
+            return f"主人拒绝了调用 MCP 工具 {name}。"
+        try:
+            result = self.connectors.mcp_call(connector_id, name, arguments)
+        except (ResourceError, NetworkError) as exc:
+            raise ToolError(str(exc)) from exc
+        text = result.get("text", "")
+        stderr = str(result.get("stderr") or "").strip()
+        if stderr:
+            text += f"\n\nMCP 服务器 stderr：\n{stderr[-1200:]}"
+        return text
+
+    # ---------------------------------------------------------- 知识库
+
+    def tool_search_knowledge(self, query: str, limit: int = 6) -> str:
+        try:
+            hits = self.knowledge.search(query, limit=limit)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if not hits:
+            return f"知识库里没有找到「{query}」。可以换关键词，或先用 import_knowledge 存资料。"
+        lines = [f"知识库命中 {len(hits)} 条（引用格式 [K文档#片段]）："]
+        for item in hits:
+            lines.append(
+                f"{item['citation']} {item['title']}"
+                + (f"（{item['source']}）" if item["source"] else "")
+            )
+            lines.append(item["snippet"])
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def tool_import_knowledge(
+        self,
+        title: str,
+        text: str,
+        source: str = "",
+        kind: str = "note",
+    ) -> str:
+        body = str(text or "")
+        if len(body) > MAX_KNOWLEDGE_IMPORT:
+            raise ToolError(f"内容超过 {MAX_KNOWLEDGE_IMPORT} 字，请拆成多次导入。")
+        try:
+            result = self.knowledge.add_document(title, body, source=source, kind=kind)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        state = "已存在，未重复写入" if result["existing"] else "已写入"
+        return f"{state}知识库文档 #{result['id']}「{result['title']}」，共 {result['chunks']} 个片段。"
+
+    def tool_import_knowledge_file(self, path: str, title: str = "") -> str:
+        target = self._resolve(path)
+        if not target.is_file():
+            raise ToolError(f"文件不存在：{path}")
+        if target.stat().st_size > 2 * 1024 * 1024:
+            raise ToolError("文件超过 2 MB，请先提取需要的部分。")
+        text = self._read_text(target)
+        return self.tool_import_knowledge(
+            title or target.stem, text, source=self._rel(target), kind="file"
+        )
+
+    def tool_import_knowledge_url(self, url: str, title: str = "") -> str:
+        self._require_network()
+        try:
+            page_title, text = web_tools.fetch_readable(url, max_chars=MAX_KNOWLEDGE_IMPORT)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+        if not text.strip():
+            raise ToolError("网页没有可读正文。")
+        return self.tool_import_knowledge(
+            title or page_title or url, text, source=url, kind="web"
+        )
+
+    def tool_list_knowledge(self, limit: int = 50) -> str:
+        items = self.knowledge.list_documents(limit=limit)
+        stats = self.knowledge.stats()
+        if not items:
+            return "知识库还是空的。可以用 import_knowledge / import_knowledge_file / import_knowledge_url 添加资料。"
+        lines = [
+            f"知识库：{stats['documents']} 个文档，{stats['chunks']} 个片段，约 {stats['chars']} 字。"
+        ]
+        for item in items:
+            lines.append(
+                f"#{item['id']} {item['title']} · {item['chunks']} 片 · {item['kind']}"
+                + (f" · {item['source']}" if item["source"] else "")
+            )
+        return "\n".join(lines)
+
+    def tool_delete_knowledge(self, document_id: int) -> str:
+        try:
+            document = self.knowledge.get_document(document_id)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        if not self._approve(
+            "delete_knowledge",
+            "删除知识库文档",
+            f"删除 #{document['id']}「{document['title']}」",
+            "删除前会先把正文导出到 data/dev/.trash/knowledge/，需要时可以找回。",
+        ):
+            return f"主人拒绝了删除知识库文档 #{document_id}。"
+        try:
+            title, archive = self.knowledge.archive_and_delete(document_id, self.trash)
+        except ResourceError as exc:
+            raise ToolError(str(exc)) from exc
+        return f"已删除知识库文档 #{document_id}「{title}」，正文已备份到 {archive}。"
+
+    # ---------------------------------------------------------- 联网检索
+
+    def tool_web_search(self, query: str, limit: int = 6) -> str:
+        self._require_network()
+        try:
+            return web_tools.web_search(query, limit=limit)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+
+    def tool_search_github(self, query: str, sort: str = "stars", limit: int = 8) -> str:
+        self._require_network()
+        try:
+            return web_tools.search_github(query, limit=limit, sort=sort)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+
+    def tool_pypi_info(self, package: str) -> str:
+        self._require_network()
+        try:
+            return web_tools.pypi_info(package)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
+
+    def tool_search_pypi(self, query: str, limit: int = 8) -> str:
+        self._require_network()
+        try:
+            return web_tools.search_pypi(query, limit=limit)
+        except NetworkError as exc:
+            raise ToolError(str(exc)) from exc
 
     def tool_create_plugin(
         self,

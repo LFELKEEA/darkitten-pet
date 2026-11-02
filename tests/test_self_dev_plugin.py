@@ -573,13 +573,8 @@ class UiSmokeTests(unittest.TestCase):
             raise unittest.SkipTest("当前进程只有 QGuiApplication，跳过界面冒烟测试")
         cls.app = app or QApplication([])
 
-    def test_dialog_builds(self):
+    def _service(self, root: Path):
         from PySide6.QtCore import QObject, Signal
-
-        from lfelkeea_self_dev.ui import DevStudioDialog
-
-        root = Path(tempfile.mkdtemp())
-        (root / "workspace").mkdir(parents=True)
 
         class FakeService(QObject):
             event = Signal(object)
@@ -589,7 +584,14 @@ class UiSmokeTests(unittest.TestCase):
                 self.ui = None
                 self.running = False
                 self.settings = normalize_settings({})
-                self.paths = SimpleNamespace(workspace=root / "workspace", sessions=root)
+                self.paths = SimpleNamespace(
+                    workspace=root / "workspace",
+                    sessions=root,
+                    skills=root / "skills",
+                    knowledge=root / "knowledge",
+                    connectors=root / "connectors.json",
+                    trash=root / ".trash",
+                )
 
             def describe(self):
                 return {
@@ -611,13 +613,49 @@ class UiSmokeTests(unittest.TestCase):
             def stop_task(self):
                 return False
 
-        service = FakeService()
+        return FakeService()
+
+    def test_dialog_builds(self):
+        from lfelkeea_self_dev.ui import DevStudioDialog
+
+        root = Path(tempfile.mkdtemp())
+        for name in ("workspace", "skills", "knowledge", ".trash"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+
+        service = self._service(root)
         dialog = DevStudioDialog(service)
         try:
             self.assertEqual(dialog.windowTitle(), "LFELKEEA · 自开发工坊")
             self.assertIn("workspace", dialog.subtitle.text())
             self.assertIs(service.ui, dialog)
             self.assertEqual(dialog.model_label.text().splitlines()[0], "ollama / qwen2.5:7b")
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
+    def test_resource_dialog_builds(self):
+        from lfelkeea_self_dev.knowledge import KnowledgeBase
+        from lfelkeea_self_dev.skills import SkillStore
+        from lfelkeea_self_dev.ui import ResourceDialog
+
+        root = Path(tempfile.mkdtemp())
+        for name in ("workspace", "skills", "knowledge", ".trash"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        SkillStore(root / "skills", root / ".trash").save(
+            "demo-skill", "演示技能", "测试用", "# 步骤\n先读文件。\n"
+        )
+        KnowledgeBase(root / "knowledge").add_document("演示文档", "知识库正文内容。")
+
+        dialog = ResourceDialog(self._service(root))
+        try:
+            self.assertEqual(dialog.tabs.count(), 3)
+            self.assertEqual(dialog.tabs.tabText(0), "技能")
+            self.assertEqual(dialog.tabs.tabText(1), "连接器")
+            self.assertEqual(dialog.tabs.tabText(2), "知识库")
+            self.assertEqual(dialog.skill_list.count(), 1)
+            self.assertIn("先读文件", dialog.skill_detail.toPlainText())
+            self.assertEqual(dialog.knowledge_list.count(), 1)
+            self.assertIn("知识库正文内容", dialog.knowledge_detail.toPlainText())
         finally:
             dialog.close()
             dialog.deleteLater()

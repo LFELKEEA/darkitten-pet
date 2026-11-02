@@ -25,10 +25,14 @@ WORKSPACE_README = """# LFELKEEA 自开发区
 - `workspace/`：自由项目区。所有相对路径都以它为根，工具不能跑到它外面。
 - `drafts/`：插件草稿。还没安装到 `data/plugins/` 的代码放这里。
 - `sessions/`：每次自开发任务的步骤日志（JSONL，方便回看）。
+- `skills/`：技能库，每个技能一个目录，入口是 `SKILL.md`。
+- `knowledge/`：本地知识库（SQLite + FTS5），可检索文档片段。
+- `connectors.json`：HTTP API / MCP 连接器定义。
 - `.backups/`：覆盖文件、更新插件之前的自动备份。
+- `.trash/`：删除技能或知识文档时的本地回收目录。
 
 安全边界：
-工具只接受相对路径；写文件前会备份旧版本；执行命令和启用新插件默认需要在工作台里点「允许」。
+工具只接受相对路径；写文件前会备份旧版本；执行命令、调用连接器、启用新插件默认需要在工作台里点「允许」。
 """
 
 
@@ -86,6 +90,10 @@ class DevPaths:
     plugins_dir: Path
     config_path: Path
     references: Path
+    skills: Path
+    knowledge: Path
+    connectors: Path
+    trash: Path
 
     @classmethod
     def discover(
@@ -115,10 +123,23 @@ class DevPaths:
             plugins_dir=(data_dir / "plugins").resolve(),
             config_path=(data_dir / "config.json").resolve(),
             references=(folder / "references").resolve(),
+            skills=(dev_dir / "skills").resolve(),
+            knowledge=(dev_dir / "knowledge").resolve(),
+            connectors=(dev_dir / "connectors.json").resolve(),
+            trash=(dev_dir / ".trash").resolve(),
         )
 
     def ensure(self) -> "DevPaths":
-        for path in (self.dev_dir, self.workspace, self.drafts, self.sessions, self.backups):
+        for path in (
+            self.dev_dir,
+            self.workspace,
+            self.drafts,
+            self.sessions,
+            self.backups,
+            self.skills,
+            self.knowledge,
+            self.trash,
+        ):
             path.mkdir(parents=True, exist_ok=True)
         readme = self.dev_dir / "README.md"
         if not readme.exists():

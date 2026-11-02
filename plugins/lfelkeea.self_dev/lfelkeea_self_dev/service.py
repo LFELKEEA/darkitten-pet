@@ -178,6 +178,7 @@ class DevService(QObject):
         started = time.time()
         settings = dict(self.settings)
         paths = self.paths
+        toolbox: ToolBox | None = None
         try:
             config = load_llm_config(
                 paths.config_path,
@@ -213,7 +214,18 @@ class DevService(QObject):
                 stop_event=stop,
                 logger=self._log,
             )
+            seeded = toolbox.skills.seed_defaults()
+            if seeded:
+                self._emit({"type": "info", "text": f"已初始化 {seeded} 个默认技能。"})
+            knowledge_seeded = toolbox.knowledge.seed_defaults(
+                paths.references, paths.plugin_folder / "README.md"
+            )
+            if knowledge_seeded:
+                self._emit(
+                    {"type": "info", "text": f"知识库已收录 {knowledge_seeded} 份插件参考资料。"}
+                )
             tree = self._workspace_tree()
+            knowledge = toolbox.knowledge.stats()
             system_prompt = build_system_prompt(
                 str(paths.workspace),
                 TOOL_SPECS,
@@ -221,6 +233,12 @@ class DevService(QObject):
                 data_dir=str(paths.data_dir),
                 model=config.model,
                 workspace_note=f"当前工作区顶层文件：{tree}",
+                skills_index=toolbox.skills.index_text(),
+                connectors_index=toolbox.connectors.index_text(),
+                knowledge_stats=(
+                    f"{knowledge['documents']} 个文档，{knowledge['chunks']} 个片段，"
+                    f"约 {knowledge['chars']} 字。需要旧结论时先用 search_knowledge。"
+                ),
             )
             user_prompt = build_user_prompt(task, tree)
 
@@ -251,6 +269,34 @@ class DevService(QObject):
             }
         finally:
             elapsed = time.time() - started
+            if settings.get("auto_learn", True) and toolbox is not None:
+                try:
+                    summary = str(result.get("summary", "")).strip()
+                    if summary and summary != "已被主人停止。":
+                        first_line = next(
+                            (line.strip() for line in task.splitlines() if line.strip()), task
+                        )
+                        note = (
+                            f"任务：{task.strip()}\n\n"
+                            f"结果：{'成功' if result.get('ok') else '未完成'}\n\n"
+                            f"{summary}\n\n"
+                            f"会话日志：{session.path.name}"
+                        )
+                        learned = toolbox.knowledge.add_document(
+                            f"任务：{first_line[:80]}",
+                            note,
+                            source=f"session:{session.path.name}",
+                            kind="session",
+                        )
+                        if not learned.get("existing"):
+                            self._emit(
+                                {
+                                    "type": "info",
+                                    "text": f"已把这次任务总结存入知识库（#{learned['id']}）。",
+                                }
+                            )
+                except Exception as exc:
+                    self._log(f"写入知识库失败：{exc}")
             self._running = False
             self._thread = None
             self._last_result = dict(result)
