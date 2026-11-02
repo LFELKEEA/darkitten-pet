@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-"""节律与主动预算：有信号才醒，额度用完就停，夜间默认静默。
+"""节律与预算：有信号才醒，额度用完就停，夜间默认静默。
 
-主动不等于刷屏。这里只记录“今天还能主动几次”“同类信号多久内不重复”，
+主动不等于刷屏。这里记录“今天还能主动几次”“同类信号多久内不重复”，
+以及有界探索的预算：一次一个问题、每天最多几次、同主题 24 小时内不重复。
 是否真的有话可说由调用方决定；允许一整天都没有输出。
 """
 
@@ -22,6 +23,10 @@ class Rhythm:
             "last_at": 0.0,
             "signals": {},
             "topics": {},
+            "explore_day": "",
+            "explore_count": 0,
+            "explore_topics": {},
+            "explore_sources": [],
         }
         self.load()
 
@@ -29,13 +34,21 @@ class Rhythm:
         raw = model.read_json(self.path, {})
         if not isinstance(raw, dict):
             raw = {}
+        topics = raw.get("topics")
+        signals = raw.get("signals")
+        explore_topics = raw.get("explore_topics")
+        sources = raw.get("explore_sources")
         self.state = {
             "day": str(raw.get("day") or ""),
             "count": model.as_int(raw.get("count")),
             "total": model.as_int(raw.get("total")),
             "last_at": model.as_float(raw.get("last_at")),
-            "signals": raw.get("signals") if isinstance(raw.get("signals"), dict) else {},
-            "topics": raw.get("topics") if isinstance(raw.get("topics"), dict) else {},
+            "signals": signals if isinstance(signals, dict) else {},
+            "topics": topics if isinstance(topics, dict) else {},
+            "explore_day": str(raw.get("explore_day") or ""),
+            "explore_count": model.as_int(raw.get("explore_count")),
+            "explore_topics": explore_topics if isinstance(explore_topics, dict) else {},
+            "explore_sources": sources if isinstance(sources, list) else [],
         }
 
     def save(self) -> None:
@@ -46,6 +59,11 @@ class Rhythm:
         if self.state.get("day") != key:
             self.state["day"] = key
             self.state["count"] = 0
+        if self.state.get("explore_day") != key:
+            self.state["explore_day"] = key
+            self.state["explore_count"] = 0
+            self.state["explore_topics"] = {}
+            self.state["explore_sources"] = []
 
     def quiet(self, start: str, end: str, reference: float | None = None) -> bool:
         return model.in_quiet_hours(reference if reference is not None else model.now(), start, end)
@@ -110,6 +128,49 @@ class Rhythm:
             self.state["topics"] = dict(keep)
         self.save()
 
+    # ---------- 有界探索 ----------
+
+    def can_explore(
+        self,
+        topic: str,
+        *,
+        limit: int = 3,
+        reference: float | None = None,
+    ) -> bool:
+        base = reference if reference is not None else model.now()
+        self._roll(base)
+        if model.as_int(self.state.get("explore_count")) >= max(0, int(limit)):
+            return False
+        key = model.clean_text(topic, 40).lower()
+        if not key:
+            return True
+        last = model.as_float((self.state.get("explore_topics") or {}).get(key))
+        return base - last >= 24 * 3600
+
+    def mark_explore(
+        self,
+        topic: str,
+        *,
+        sources: int = 0,
+        reference: float | None = None,
+    ) -> None:
+        base = reference if reference is not None else model.now()
+        self._roll(base)
+        self.state["explore_count"] = model.as_int(self.state.get("explore_count")) + 1
+        key = model.clean_text(topic, 40).lower()
+        if key:
+            topics = self.state.setdefault("explore_topics", {})
+            topics[key] = base
+            if len(topics) > 60:
+                keep = sorted(topics.items(), key=lambda row: model.as_float(row[1]), reverse=True)[:40]
+                self.state["explore_topics"] = dict(keep)
+        stamps = self.state.setdefault("explore_sources", [])
+        if isinstance(stamps, list):
+            for _ in range(max(0, min(3, int(sources)))):
+                stamps.append(base)
+            del stamps[:-30]
+        self.save()
+
     def snapshot(self, limit: int, reference: float | None = None) -> dict[str, Any]:
         base = reference if reference is not None else model.now()
         self._roll(base)
@@ -120,4 +181,5 @@ class Rhythm:
             "left": self.budget_left(limit, base),
             "last_at": model.as_float(self.state.get("last_at")),
             "total": model.as_int(self.state.get("total")),
+            "explore_count": model.as_int(self.state.get("explore_count")),
         }

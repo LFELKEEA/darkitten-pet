@@ -11,7 +11,7 @@ import time
 import wave
 from array import array
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -341,17 +341,22 @@ class SpeechToTextRequest:
 class VoiceChatController(QObject):
     """长按录音、松开识别，并通过桌宠气泡完成一轮对话。"""
 
+    user_said = Signal(str)
+    reply_said = Signal(str)
+
     def __init__(
         self,
         config: Config,
         pet: PetWindow,
         parent: QObject | None = None,
         conversation: Conversation | None = None,
+        context_provider: Callable[..., str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.config = config
         self.pet = pet
         self.conversation = conversation or Conversation(12, self)
+        self.context_provider = context_provider
         self._state = "idle"
         self._token = 0
         self._recorder: VoiceRecorder | None = None
@@ -549,17 +554,34 @@ class VoiceChatController(QObject):
 
         self._state = "thinking"
         self._append_history("user", text)
+        self.user_said.emit(text)
         shown = text if len(text) <= 110 else text[:110].rstrip() + "……"
         self.pet.say(f"你说：「{shown}」", 2600)
         self._transcript_at = time.monotonic()
         QTimer.singleShot(2750, lambda t=token: self._show_thinking(t))
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.conversation.messages(12)
+        messages = [
+            {"role": "system", "content": self._system_prompt(text)}
+        ] + self.conversation.messages(12)
         request = AIRequest(dict(self.config.ai), messages)
         self._ai = request
         request.signals.ok.connect(lambda reply, t=token: self._on_ai_ok(reply, t))
         request.signals.fail.connect(lambda error, t=token: self._on_ai_fail(error, t))
         request.start()
+
+    def _system_prompt(self, query: str) -> str:
+        if self.context_provider is None:
+            return SYSTEM_PROMPT
+        try:
+            block = self.context_provider(
+                query=query, viewer="owner", source="pet", channel="private"
+            )
+        except Exception:
+            return SYSTEM_PROMPT
+        block = str(block or "").strip()
+        if not block:
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT.rstrip() + "\n\n" + block
 
     def _on_speech_fail(self, error: str, token: int) -> None:
         if token != self._token or self._state != "transcribing":
@@ -601,6 +623,7 @@ class VoiceChatController(QObject):
         if reply:
             self.pet.say(reply, 7000)
             self.pet._trigger_bounce()
+            self.reply_said.emit(reply)
         self.pet._last_interaction = time.monotonic()
 
     def _append_history(self, role: str, content: str) -> None:

@@ -369,6 +369,102 @@ class ServiceTests(unittest.TestCase):
             self.service._on_pet("pat")
         self.assertLessEqual(len(self.api.said), 1)
 
+    def test_prompt_context_carries_identity_and_boundaries(self) -> None:
+        block = self.service.prompt_context("今天想喝点什么", viewer="owner")
+        self.assertIn("【活人感上下文】", block)
+        self.assertIn("【你是谁】", block)
+        self.assertIn("【此刻的状态】", block)
+        self.assertIn("【你能做和不能做的】", block)
+        self.assertIn("【隐私边界】", block)
+        self.assertIn("【怎么说】", block)
+        self.assertLessEqual(len(block), self.service.settings["max_context_chars"])
+
+    def test_private_memory_not_recalled_into_group(self) -> None:
+        self.service.memory.add_item("主人喜欢喝冰美式", kind="preference", visibility="private")
+        owner = self.service.prompt_context("冰美式", viewer="owner", channel="private")
+        group = self.service.prompt_context("冰美式", viewer="group:9", channel="group")
+        self.assertIn("冰美式", owner)
+        self.assertNotIn("冰美式", group)
+        self.service.settings["group_private_recall"] = True
+        # 即使打开开关，群友视角也不能看到私聊。
+        self.service.memory.data["meta"]["recent_recall"] = {}
+        still_hidden = self.service.prompt_context("冰美式", viewer="group:9", channel="group")
+        self.assertNotIn("冰美式", still_hidden)
+        # 只有所有者本人在群里，且明确打开开关时才会召回。
+        self.service.memory.data["meta"]["recent_recall"] = {}
+        forced = self.service.prompt_context("冰美式", viewer="owner", channel="group")
+        self.assertIn("冰美式", forced)
+
+    def test_candidate_is_not_active_until_reviewed(self) -> None:
+        queued = self.service.memory.queue_candidates(
+            [{"text": "主人周末常去爬山", "kind": "impression", "why": "聊到过两次"}]
+        )
+        self.assertEqual(len(queued), 1)
+        active = [item for item in self.service.memory.items() if item.get("status") == "active"]
+        self.assertFalse(any("爬山" in item.get("text", "") for item in active))
+        item, message = self.service.memory.review_candidate(queued[0]["id"], approve=True)
+        self.assertIn("采纳", message)
+        self.assertTrue(item)
+        active = [row for row in self.service.memory.items() if row.get("status") == "active"]
+        self.assertTrue(any("爬山" in row.get("text", "") for row in active))
+
+    def test_forget_candidate_and_memory(self) -> None:
+        item = self.service.memory.add_item("主人的旧密码是1234", kind="fact", visibility="private")
+        self.service.memory.forget(item["id"], reason="测试", purge=True)
+        self.service._pending_recall.clear()
+        hits = self.service.memory.recall("旧密码", viewer="owner")
+        self.assertEqual(hits, [])
+        self.assertTrue(
+            any(row.get("event") == "memory.delete" for row in self.service.memory.audit_tail())
+        )
+
+    def test_working_memory_respects_channel(self) -> None:
+        self.service.working.record("user", "我今晚要加班", source="qq", visibility="private")
+        owner = self.service.working.prompt_block(viewer="owner", channel="private")
+        group = self.service.working.prompt_block(viewer="group:1", channel="group")
+        self.assertIn("加班", owner)
+        self.assertNotIn("加班", group)
+
+    def test_screen_context_does_not_expose_private_memory(self) -> None:
+        self.service.memory.add_item("主人的银行卡密码是1234", kind="fact", visibility="private")
+        self.service.working.record("user", "我今晚要去见一个很重要的人", visibility="private")
+        block = self.service.prompt_context("屏幕", viewer="owner", source="screen")
+        self.assertNotIn("1234", block)
+        self.assertNotIn("很重要的人", block)
+
+    def test_conversation_capture_feeds_memory(self) -> None:
+        self.service._on_conversation_message("user", "我最近在学做菜")
+        self.service._on_conversation_message("assistant", "那你最拿手的是什么？")
+        self.assertTrue(
+            any("学做菜" in row.get("text", "") for row in self.service.memory_rows())
+        )
+        self.assertTrue(self.service.memory.stats()["episodes"] >= 2)
+
+    def test_request_enhancement_only_once(self) -> None:
+        messages = [
+            {"role": "system", "content": "BASE PROMPT"},
+            {"role": "user", "content": "今天吃什么"},
+        ]
+        self.service._enhance_request(messages, "BASE PROMPT")
+        self.assertIn("【活人感上下文】", messages[0]["content"])
+        first = messages[0]["content"]
+        self.service._enhance_request(messages, "BASE PROMPT")
+        self.assertEqual(messages[0]["content"], first)
+
+    def test_request_enhancement_skips_other_plugins(self) -> None:
+        messages = [
+            {"role": "system", "content": "QQ 桥接自己的提示词"},
+            {"role": "user", "content": "今天吃什么"},
+        ]
+        self.service._enhance_request(messages, "BASE PROMPT")
+        self.assertEqual(messages[0]["content"], "QQ 桥接自己的提示词")
+
+    def test_context_payload_schema(self) -> None:
+        payload = self.service.context_payload()
+        self.assertEqual(payload["schema"], 2)
+        for key in ("core", "state", "growth", "working", "rules", "capabilities", "boundaries"):
+            self.assertIn(key, payload)
+
     def test_settings_normalized(self) -> None:
         values = normalize_settings(
             {

@@ -1,43 +1,47 @@
 {
   "id": "lfelkeea.alive_core",
   "name": "活人感内核（姐妹人格与记忆）",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "api_version": 1,
   "entry": "main.py",
-  "description": "把身份、记忆、状态和节律串起来：长期记住主人的偏好和约定，按遗忘曲线变淡、被用过的才加固，更正保留历史；有自己的昼夜节律和主动额度，没有真实信号就允许沉默；把状态和可召回的记忆导出给 QQ 桥接，让私聊和群聊也能接上连续的生活。",
+  "description": "按《姐妹人格与记忆系统》实现的活人感内核：身份、长期记忆 v2、工作记忆、功能状态、节律与有界探索。桌宠聊天、语音、屏幕观察和 QQ 桥接共用同一份身份、记忆和边界；巩固只产出候选，更正和删除保留墓碑与审计，群聊默认不召回私聊内容。",
   "author": "LFELKEEA",
   "highlights": [
     {
       "label": "身份层",
-      "value": "core + 可成长段"
+      "value": "core 不可自改 + 可成长段"
     },
     {
-      "label": "记忆",
-      "value": "情节 / 印象 / 偏好"
+      "label": "长期记忆",
+      "value": "证据 / 来源等级 / 派生链"
+    },
+    {
+      "label": "工作记忆",
+      "value": "刚才聊到哪、还没弄明白什么"
     },
     {
       "label": "遗忘",
       "value": "曲线衰减 + 复述加固"
     },
     {
-      "label": "更正",
-      "value": "旧版保留可回滚"
+      "label": "更正与删除",
+      "value": "旧版保留、墓碑、可审计"
     },
     {
-      "label": "状态",
-      "value": "节律慢变，只管语气"
+      "label": "候选审核",
+      "value": "巩固不直接改记忆"
     },
     {
-      "label": "主动",
-      "value": "有信号才醒，有每日额度"
+      "label": "桌宠接入",
+      "value": "聊天 / 语音 / 屏幕统一注入"
+    },
+    {
+      "label": "QQ 接入",
+      "value": "私聊与群聊共用身份和记忆"
     },
     {
       "label": "边界",
-      "value": "不碰权限与外发"
-    },
-    {
-      "label": "协作",
-      "value": "向 QQ 桥接导出上下文"
+      "value": "情绪和记忆不产生权限"
     }
   ],
   "permissions": [
@@ -46,7 +50,8 @@
     "ai.chat",
     "timer",
     "events",
-    "settings"
+    "settings",
+    "chat.context"
   ],
   "settings": {
     "enabled": true,
@@ -65,6 +70,14 @@
     "consolidate_batch": 30,
     "share_with_qq": true,
     "recall_limit": 6,
-    "recall_chars": 420
+    "recall_chars": 420,
+    "context_injection": true,
+    "working_memory": true,
+    "candidate_review": true,
+    "group_private_recall": false,
+    "max_context_chars": 1600,
+    "explore_per_day": 3,
+    "explore_minutes": 5,
+    "explore_sources": 3
   }
 }

@@ -38,6 +38,7 @@ PERMISSION_LABELS = {
     "pet.say": "让桌宠说话",
     "pet.action": "触发桌宠动作",
     "ai.chat": "调用 AI 对话",
+    "chat.context": "向聊天注入上下文",
     "screen.capture": "截取屏幕",
     "timer": "创建定时器",
     "events": "订阅事件",
@@ -49,6 +50,7 @@ KNOWN_EVENTS = {
     "startup",
     "shutdown",
     "settings.saved",
+    "chat.user",
     "chat.reply",
     "screen.context",
     "screen.comment",
@@ -268,6 +270,25 @@ class PluginAPI(QObject):
         for callback in list(self._handlers.get(event, [])):
             self._safe(callback, **payload)
 
+    # ---------- 聊天上下文 ----------
+
+    def register_prompt_provider(self, callback: Callable[..., Any]) -> Callable[..., Any]:
+        """注册一个上下文提供者，返回可传给 unregister 的句柄。
+
+        callback(query=..., viewer=..., source=..., channel=...) -> str
+        """
+        self._require("chat.context")
+        self._assert_main_thread()
+        if not callable(callback):
+            raise PluginError("register_prompt_provider 的 callback 必须可调用。")
+        self.manager.register_prompt_provider(self.info.id, callback)
+        return callback
+
+    def unregister_prompt_provider(self, handle: Callable[..., Any]) -> None:
+        self._require("chat.context")
+        self._assert_main_thread()
+        self.manager.unregister_prompt_provider(self.info.id, handle)
+
     # ---------- 设置与存储 ----------
 
     @property
@@ -312,6 +333,10 @@ class PluginAPI(QObject):
             bridge.deleteLater()
         self._bridges.clear()
         self._handlers.clear()
+        try:
+            self.manager.unregister_prompt_provider(self.info.id)
+        except Exception:
+            pass
 
 
 class PluginManager(QObject):
@@ -347,6 +372,7 @@ class PluginManager(QObject):
         self._loaded: dict[str, LoadedPlugin] = {}
         self._errors: dict[str, int] = {}
         self._ui_windows: dict[str, Any] = {}
+        self._prompt_providers: dict[str, list[Callable[..., Any]]] = {}
         self._releases: dict[str, PluginRelease] = {}
         self._marketplace: dict[str, PluginRelease] = {}
         self._marketplace_loading = False
@@ -554,6 +580,7 @@ class PluginManager(QObject):
             except Exception as exc:
                 self.record_error(loaded.info, exc, "teardown")
         loaded.api.shutdown()
+        self._prompt_providers.pop(plugin_id, None)
         module_name = getattr(loaded.module, "__name__", "")
         if module_name in sys.modules:
             sys.modules.pop(module_name, None)
@@ -908,6 +935,57 @@ class PluginManager(QObject):
     def emit(self, event: str, **payload: Any) -> None:
         for loaded in list(self._loaded.values()):
             loaded.api._dispatch(event, payload)
+
+    # ---------- 聊天上下文 ----------
+
+    def register_prompt_provider(self, plugin_id: str, callback: Callable[..., Any]) -> None:
+        # setup(api) 早于 _loaded 登记，这里不能要求插件已经出现在 _loaded 里。
+        bucket = self._prompt_providers.setdefault(plugin_id, [])
+        if callback not in bucket:
+            bucket.append(callback)
+
+    def unregister_prompt_provider(
+        self, plugin_id: str, callback: Callable[..., Any] | None = None
+    ) -> None:
+        if callback is None:
+            self._prompt_providers.pop(plugin_id, None)
+            return
+        bucket = self._prompt_providers.get(plugin_id)
+        if not bucket:
+            return
+        self._prompt_providers[plugin_id] = [item for item in bucket if item is not callback]
+        if not self._prompt_providers[plugin_id]:
+            self._prompt_providers.pop(plugin_id, None)
+
+    def prompt_context(
+        self,
+        query: str = "",
+        viewer: str = "owner",
+        source: str = "pet",
+        channel: str = "private",
+    ) -> str:
+        """汇总所有插件的上下文，供聊天 / 语音 / 屏幕观察注入 system prompt。"""
+        blocks: list[str] = []
+        for plugin_id, callbacks in list(self._prompt_providers.items()):
+            info = self._infos.get(plugin_id)
+            if info is not None and plugin_id not in self._loaded:
+                continue
+            for callback in list(callbacks):
+                try:
+                    text = callback(
+                        query=str(query or ""),
+                        viewer=str(viewer or "owner"),
+                        source=str(source or "pet"),
+                        channel=str(channel or "private"),
+                    )
+                except Exception as exc:
+                    if info is not None:
+                        self.record_error(info, exc, "上下文")
+                    continue
+                text = str(text or "").strip()
+                if text:
+                    blocks.append(text)
+        return "\n\n".join(blocks)
 
     # ---------- 设置 / 存储 ----------
 

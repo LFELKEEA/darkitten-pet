@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -189,10 +190,16 @@ class ChatInput(QTextEdit):
 
 class ChatWindow(QWidget):
     reply_ready = Signal(str)
+    user_sent = Signal(str)
     settings_requested = Signal()
     visibility_changed = Signal(bool)
 
-    def __init__(self, config: Config, conversation: Conversation | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        conversation: Conversation | None = None,
+        context_provider: Callable[..., str] | None = None,
+    ) -> None:
         super().__init__(
             None,
             Qt.WindowType.FramelessWindowHint
@@ -200,6 +207,7 @@ class ChatWindow(QWidget):
             | Qt.WindowType.Tool,
         )
         self.config = config
+        self.context_provider = context_provider
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
         self.setWindowTitle("和 LFELKEEA 聊天")
@@ -453,6 +461,20 @@ class ChatWindow(QWidget):
         self.send_btn.setDisabled(busy)
         self.send_btn.setText("等等" if busy else "发送")
 
+    def _system_prompt(self, query: str) -> str:
+        if self.context_provider is None:
+            return SYSTEM_PROMPT
+        try:
+            block = self.context_provider(
+                query=query, viewer="owner", source="pet", channel="private"
+            )
+        except Exception:
+            return SYSTEM_PROMPT
+        block = str(block or "").strip()
+        if not block:
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT.rstrip() + "\n\n" + block
+
     def send_current(self) -> None:
         text = self.input.toPlainText().strip()
         if text:
@@ -470,9 +492,11 @@ class ChatWindow(QWidget):
         self._set_busy(True)
         self.append_message("user", text)
         self.conversation.append("user", text)
+        self.user_sent.emit(text)
         self._show_typing()
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.conversation.messages(16)
+        system = self._system_prompt(text)
+        messages = [{"role": "system", "content": system}] + self.conversation.messages(16)
         ai_config = dict(self.config.ai)
         request = AIRequest(ai_config, messages)
         self._active_request = request

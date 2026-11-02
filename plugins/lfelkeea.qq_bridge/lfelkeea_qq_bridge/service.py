@@ -1212,19 +1212,22 @@ class QQBridgeService(QObject):
     # ---------- 活人感内核 ----------
 
     def _viewer(self, message: Any) -> str:
-        """召回时的视角：主人看全部，其他人只看自己的会话。"""
+        """召回视角：主人私聊能看全部；群里只看这个群；其他人只看自己的私聊。"""
+        if message.is_private:
+            return "owner" if self.is_owner(message.user_id) else f"private:{message.user_id}"
+        # 群里是所有者本人在说话时保留 owner 视角，这样群聊记忆照常可见；
+        # 私聊记忆只有显式打开 group_private_recall 才可能被召回。
         if self.is_owner(message.user_id):
             return "owner"
-        if message.is_private:
-            return f"private:{message.user_id}"
         return f"group:{message.group_id}"
 
     def _visibility(self, message: Any) -> str:
+        """写回内核时的可见域：群聊一律只在本群可见。"""
+        if not message.is_private:
+            return f"group:{message.group_id}"
         if self.is_owner(message.user_id):
             return "private"
-        if message.is_private:
-            return f"private:{message.user_id}"
-        return f"group:{message.group_id}"
+        return f"private:{message.user_id}"
 
     def _report_incoming(self, message: Any, text: str) -> None:
         if not self.alive.available():
@@ -1241,6 +1244,8 @@ class QQBridgeService(QObject):
             at=float(message.time or 0) or time.time(),
             kind="group" if message.is_group else "chat",
             salience=0.5 if owner else 0.4,
+            message_id=str(getattr(message, "message_id", "") or ""),
+            source_level="statement",
         )
 
     def _report_reply(
@@ -1255,6 +1260,7 @@ class QQBridgeService(QObject):
             self.alive.report_recall([str(item.get("id") or "") for item in recalled])
         if not reply:
             return
+        reply_id = str(getattr(message, "message_id", "") or "")
         self.alive.report_episode(
             reply,
             actor_id="self",
@@ -1264,6 +1270,7 @@ class QQBridgeService(QObject):
             at=time.time(),
             kind="chat",
             salience=0.35,
+            message_id=f"{reply_id}:reply" if reply_id else "",
         )
         self.alive.report({"type": "affect", "event": "bot_spoke"})
         if _looks_unsure(reply) and _looks_question(message.text):
@@ -1308,7 +1315,9 @@ class QQBridgeService(QObject):
         alive_recalled: list[dict[str, Any]] = []
         if self.settings["alive_enabled"]:
             alive_block, alive_recalled = self.alive.prompt_block(
-                text, viewer=self._viewer(message)
+                text,
+                viewer=self._viewer(message),
+                channel="private" if message.is_private else "group",
             )
         if alive_block:
             system_prompt += "\n\n" + alive_block

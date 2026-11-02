@@ -40,7 +40,15 @@ class PetApp(QObject):
             self.config, self.pet, self.conversation, self.plugins, self
         )
         self.voice = VoiceChatController(
-            self.config, self.pet, self, conversation=self.conversation
+            self.config,
+            self.pet,
+            self,
+            conversation=self.conversation,
+            context_provider=self.plugins.prompt_context,
+        )
+        self.voice.user_said.connect(lambda text: self.plugins.emit("chat.user", text=text))
+        self.voice.reply_said.connect(
+            lambda text: self.plugins.emit("chat.reply", reply=text)
         )
 
         self._cleaned = False
@@ -303,8 +311,15 @@ class PetApp(QObject):
 
     def _ensure_chat(self) -> ChatWindow:
         if self.chat is None:
-            self.chat = ChatWindow(self.config, self.conversation)
+            self.chat = ChatWindow(
+                self.config,
+                self.conversation,
+                context_provider=self.plugins.prompt_context,
+            )
             self.chat.reply_ready.connect(self._on_reply)
+            self.chat.user_sent.connect(
+                lambda text: self.plugins.emit("chat.user", text=text)
+            )
             self.chat.settings_requested.connect(self.open_settings)
             self.chat.visibility_changed.connect(self.pet.set_chat_open)
         return self.chat
@@ -317,6 +332,7 @@ class PetApp(QObject):
         self.pet.set_chat_open(True)
 
     def _on_reply(self, reply: str) -> None:
+        self.plugins.emit("chat.reply", reply=reply)
         short = reply.strip()
         if len(short) > 100:
             short = short[:100].rstrip() + "……"

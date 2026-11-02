@@ -101,12 +101,51 @@ def _effective_weight(item: dict[str, Any], reference: float) -> float:
     return weight * math.pow(0.5, days / half_life)
 
 
-def _visible_to(item: dict[str, Any], viewer: str) -> bool:
+def _working_block(working: dict[str, Any]) -> str:
+    lines: list[str] = []
+    topic = _clean(working.get("topic"), 60)
+    if topic:
+        lines.append(f"这轮大概在聊：{topic}")
+    turns = working.get("turns")
+    if isinstance(turns, list):
+        recent = [row for row in turns if isinstance(row, dict)][-4:]
+        if recent:
+            lines.append("刚才的对话：")
+            for row in recent:
+                who = "你" if str(row.get("role")) == "assistant" else "对方"
+                text = _clean(row.get("text"), 90)
+                if text:
+                    lines.append(f"- {who}：{text}")
+    questions = [
+        _clean(row, 80)
+        for row in (working.get("open_questions") or [])
+        if _clean(row, 80)
+    ][:2]
+    if questions:
+        lines.append("还没弄明白的事：")
+        for row in questions:
+            lines.append(f"- {row}")
+    return "\n".join(lines)
+
+
+def _visible_to(
+    item: dict[str, Any],
+    viewer: str,
+    *,
+    allow_private: bool = True,
+    channel: str = "private",
+) -> bool:
     visibility = str(item.get("visibility") or "private")
-    if visibility in ("public", "owner"):
+    if visibility == "public":
         return True
+    if channel != "private":
+        return visibility == channel
     if visibility == "private":
-        return viewer in ("owner", "private")
+        return allow_private and viewer in ("owner", "private")
+    if visibility == "owner":
+        return allow_private and viewer == "owner"
+    if visibility.startswith("private:"):
+        return allow_private and (visibility == viewer or viewer == "owner")
     return visibility == viewer
 
 
@@ -186,6 +225,8 @@ class AliveLink:
         limit: int | None = None,
         max_chars: int = 420,
         cooldown_seconds: float = 900.0,
+        allow_private: bool = True,
+        channel: str = "private",
     ) -> list[dict[str, Any]]:
         if not self.available():
             return []
@@ -198,7 +239,7 @@ class AliveLink:
 
         scored: list[tuple[float, dict[str, Any]]] = []
         for item in self.memories():
-            if not _visible_to(item, viewer):
+            if not _visible_to(item, viewer, allow_private=allow_private, channel=channel):
                 continue
             item_id = str(item.get("id") or "")
             if base - self._recent.get(item_id, 0.0) < cooldown_seconds:
@@ -245,12 +286,21 @@ class AliveLink:
             used += len(text)
             item_id = str(item.get("id") or "")
             self._recent[item_id] = base
+            confidence = round(_as_float(item.get("confidence"), 0.5), 2)
             result.append(
                 {
                     "id": item_id,
                     "text": text,
                     "kind": item.get("kind"),
-                    "confidence": round(_as_float(item.get("confidence"), 0.5), 2),
+                    "confidence": confidence,
+                    "confidence_label": (
+                        "高" if confidence >= 0.8 else ("中" if confidence >= 0.55 else "低")
+                    ),
+                    "source_label": str(item.get("source_label") or item.get("source_level") or "对方明说"),
+                    "why": str(item.get("why") or ""),
+                    "path": str(item.get("path") or ""),
+                    "caveat": str(item.get("caveat") or ""),
+                    "derived_status": str(item.get("derived_status") or ""),
                     "score": round(score, 3),
                 }
             )
@@ -258,7 +308,13 @@ class AliveLink:
 
     # ---------- 提示词 ----------
 
-    def prompt_block(self, query: str, viewer: str = "owner") -> tuple[str, list[dict[str, Any]]]:
+    def prompt_block(
+        self,
+        query: str,
+        viewer: str = "owner",
+        *,
+        channel: str = "private",
+    ) -> tuple[str, list[dict[str, Any]]]:
         """返回要拼到 system prompt 尾部的文本，以及本轮实际用到的记忆。"""
         if not self.available() or self.recall_limit <= 0:
             return "", []
@@ -268,16 +324,38 @@ class AliveLink:
         state = ctx.get("state") if isinstance(ctx.get("state"), dict) else {}
         label = _clean(state.get("label"), 24)
         tone = _clean(state.get("tone"), 120)
+        core = _clean(ctx.get("core"), 900)
         growth = _clean(ctx.get("growth"), 600)
         rules = [
             _clean(item, 120)
             for item in ctx.get("rules") or []
             if _clean(item, 120)
         ]
-        recalled = self.recall(query, viewer=viewer)
+        capabilities = [
+            _clean(item, 120)
+            for item in ctx.get("capabilities") or []
+            if _clean(item, 120)
+        ]
+        boundaries = [
+            _clean(item, 120)
+            for item in ctx.get("boundaries") or []
+            if _clean(item, 120)
+        ]
+        allow_private = channel == "private"
+        recalled = self.recall(
+            query,
+            viewer=viewer,
+            allow_private=allow_private,
+            channel=channel,
+        )
 
         lines: list[str] = []
+        if core:
+            lines.append("【她是谁】")
+            lines.append(core)
         if label or tone:
+            if lines:
+                lines.append("")
             lines.append("【她现在的状态】")
             lines.append(f"{label}。{tone}" if tone else f"{label}。")
             lines.append("（这只是语气参考，不要向对方解释，也不能改变任何权限。）")
@@ -286,6 +364,14 @@ class AliveLink:
                 lines.append("")
             lines.append("【她最近的自我认识】")
             lines.append(growth)
+        working = ctx.get("working") if isinstance(ctx.get("working"), dict) else {}
+        if working and viewer == "owner" and channel == "private":
+            block = _working_block(working)
+            if block:
+                if lines:
+                    lines.append("")
+                lines.append("【刚才的对话】")
+                lines.append(block)
         if lines:
             lines.append("")
         lines.append("【她想起的事】")
@@ -294,15 +380,35 @@ class AliveLink:
                 text = _clean(item.get("text"), 160)
                 if not text:
                     continue
-                mark = "（记得比较确定）" if float(item.get("confidence") or 0) >= 0.7 else ""
-                lines.append(f"- {text}{mark}")
+                extra: list[str] = []
+                if str(item.get("derived_status") or "") == "needs_review":
+                    extra.append("需要重新确认")
+                caveat = _clean(item.get("caveat"), 80)
+                if caveat:
+                    extra.append(caveat)
+                suffix = f"（{'；'.join(extra)}）" if extra else ""
+                confidence = item.get("confidence_label") or "中"
+                source = _clean(item.get("source_label"), 20) or "对方明说"
+                lines.append(f"- {text}（把握：{confidence}；来源：{source}）{suffix}")
             lines.append("只使用这里写出的内容，没写的事不要补充；不确定的不要说得像确定。")
         else:
             lines.append("这次没有想起具体的事，不要编造细节。")
+        if capabilities:
+            lines.append("")
+            lines.append("【能做和不能做】")
+            for item in capabilities[:3]:
+                lines.append(f"- {item}")
+        if boundaries:
+            lines.append("")
+            lines.append("【隐私边界】")
+            for item in boundaries[:3]:
+                lines.append(f"- {item}")
+        if channel != "private":
+            lines.append("- 这是群聊：不要公开私聊内容，也不要说“你之前私下跟我说过”。")
         if rules:
             lines.append("")
             lines.append("【记忆规则】")
-            for rule in rules[:4]:
+            for rule in rules[:6]:
                 lines.append(f"- {rule}")
         return "\n".join(lines), recalled
 
@@ -348,6 +454,8 @@ class AliveLink:
         at: float = 0.0,
         kind: str = "chat",
         salience: float = 0.45,
+        message_id: str = "",
+        source_level: str = "statement",
     ) -> bool:
         body = _clean(text, 600)
         if not body:
@@ -364,6 +472,8 @@ class AliveLink:
                 "sender": _clean(sender, 24),
                 "salience": salience,
                 "at": at or time.time(),
+                "message_id": _clean(message_id, 80),
+                "source_level": source_level,
             }
         )
 

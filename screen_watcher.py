@@ -561,6 +561,20 @@ class ScreenWatcher(QObject):
             lines.append("请根据这些信息说一句。信息不足就回 SKIP。")
         return "\n".join(lines)
 
+    def _system_prompt(self, query: str) -> str:
+        if self.plugins is None:
+            return SCREEN_SYSTEM_PROMPT
+        try:
+            block = self.plugins.prompt_context(
+                query=query[:400], viewer="owner", source="screen", channel="private"
+            )
+        except Exception:
+            return SCREEN_SYSTEM_PROMPT
+        block = str(block or "").strip()
+        if not block:
+            return SCREEN_SYSTEM_PROMPT
+        return SCREEN_SYSTEM_PROMPT.rstrip() + "\n\n" + block
+
     def _request_comment(self, context: ScreenContext, mode: str, manual: bool) -> None:
         self._busy = True
         self._token += 1
@@ -576,7 +590,7 @@ class ScreenWatcher(QObject):
         else:
             content = prompt
         messages = [
-            {"role": "system", "content": SCREEN_SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt(prompt)},
             {"role": "user", "content": content},
         ]
         ai_config = dict(self.config.ai)

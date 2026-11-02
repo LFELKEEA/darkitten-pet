@@ -185,7 +185,7 @@ class AliveDialog(QDialog):
         texts = QVBoxLayout()
         title = QLabel("活人感内核")
         title.setObjectName("title")
-        subtitle = QLabel("身份 · 记忆 · 状态 · 节律：让连续的生活有依据，也让沉默是允许的")
+        subtitle = QLabel("身份 · 记忆 · 工作记忆 · 状态 · 节律：让连续的生活有依据，也让沉默是允许的")
         subtitle.setObjectName("subtitle")
         texts.addWidget(title)
         texts.addWidget(subtitle)
@@ -233,12 +233,16 @@ class AliveDialog(QDialog):
         self.ov_state = QLabel("—")
         self.ov_rhythm = QLabel("—")
         self.ov_memory = QLabel("—")
+        self.ov_working = QLabel("—")
+        self.ov_review = QLabel("—")
         self.ov_export = QLabel("—")
         for index, (name, widget) in enumerate(
             [
                 ("现在的状态", self.ov_state),
                 ("今天的主动额度", self.ov_rhythm),
                 ("长期记忆", self.ov_memory),
+                ("工作记忆", self.ov_working),
+                ("待审与体检", self.ov_review),
                 ("和 QQ 桥接的通道", self.ov_export),
             ]
         ):
@@ -254,6 +258,8 @@ class AliveDialog(QDialog):
         for text, slot, primary in (
             ("立即导出", self._export_now, False),
             ("整理一次记忆", self._consolidate, True),
+            ("备份记忆", self._backup_now, False),
+            ("完整性体检", self._integrity_check, False),
             ("重置状态", self._reset_affect, False),
             ("刷新", self._refresh_overview, False),
         ):
@@ -356,6 +362,7 @@ class AliveDialog(QDialog):
         tools.addWidget(self.kind_filter)
         self.status_filter = QComboBox()
         self.status_filter.addItem("活动中", "active")
+        self.status_filter.addItem("待审核候选", "candidate")
         self.status_filter.addItem("已归档", "archived")
         self.status_filter.addItem("已被更正", "superseded")
         self.status_filter.currentIndexChanged.connect(self._refresh_memory)
@@ -364,19 +371,26 @@ class AliveDialog(QDialog):
         add = QPushButton("记住一条")
         add.clicked.connect(self._add_memory)
         tools.addWidget(add)
-        correct = QPushButton("更正选中")
-        correct.clicked.connect(self._correct_memory)
-        tools.addWidget(correct)
-        archive = QPushButton("归档选中")
-        archive.clicked.connect(self._archive_memory)
-        tools.addWidget(archive)
-        restore = QPushButton("恢复选中")
-        restore.clicked.connect(self._restore_memory)
-        tools.addWidget(restore)
         layout.addLayout(tools)
 
+        actions = QHBoxLayout()
+        for text, slot in (
+            ("更正选中", self._correct_memory),
+            ("归档选中", self._archive_memory),
+            ("恢复选中", self._restore_memory),
+            ("通过候选", self._approve_candidate),
+            ("驳回候选", self._reject_candidate),
+            ("彻底忘记", self._forget_memory),
+            ("从备份恢复", self._restore_backup),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
         self.memory_table = QTableWidget(0, 6)
-        self.memory_table.setHorizontalHeaderLabels(["类型", "内容", "权重", "可信", "用过", "时间"])
+        self.memory_table.setHorizontalHeaderLabels(["类型", "内容", "权重", "可信", "来源", "时间"])
         self.memory_table.verticalHeader().setVisible(False)
         self.memory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -470,6 +484,29 @@ class AliveDialog(QDialog):
         box3.addLayout(form3)
         layout.addWidget(panel3)
 
+        panel4, box4 = self._panel()
+        form4 = QFormLayout()
+        self.set_context = QCheckBox("把身份、记忆和状态注入桌宠聊天 / 语音 / 屏幕观察")
+        form4.addRow("", self.set_context)
+        self.set_working = QCheckBox("启用工作记忆（记住刚才聊到哪、还没弄明白什么）")
+        form4.addRow("", self.set_working)
+        self.set_candidate_review = QCheckBox("巩固候选需要我确认后才变成长期记忆")
+        form4.addRow("", self.set_candidate_review)
+        self.set_group_private = QCheckBox("允许在群聊里召回私聊记忆（不建议打开）")
+        form4.addRow("", self.set_group_private)
+        self.set_max_context = QSpinBox()
+        self.set_max_context.setRange(600, 4000)
+        self.set_max_context.setSingleStep(100)
+        form4.addRow("上下文长度上限（字）", self.set_max_context)
+        self.set_explore_per_day = QSpinBox()
+        self.set_explore_per_day.setRange(0, 8)
+        form4.addRow("每天自主探索上限", self.set_explore_per_day)
+        self.set_explore_sources = QSpinBox()
+        self.set_explore_sources.setRange(0, 3)
+        form4.addRow("每次探索最多看几个来源", self.set_explore_sources)
+        box4.addLayout(form4)
+        layout.addWidget(panel4)
+
         save = QPushButton("保存设置")
         save.setObjectName("primary")
         save.clicked.connect(self._save_settings)
@@ -500,6 +537,13 @@ class AliveDialog(QDialog):
         self.set_share.setChecked(bool(s.get("share_with_qq")))
         self.set_recall_limit.setValue(int(s.get("recall_limit", 6)))
         self.set_recall_chars.setValue(int(s.get("recall_chars", 420)))
+        self.set_context.setChecked(bool(s.get("context_injection", True)))
+        self.set_working.setChecked(bool(s.get("working_memory", True)))
+        self.set_candidate_review.setChecked(bool(s.get("candidate_review", True)))
+        self.set_group_private.setChecked(bool(s.get("group_private_recall", False)))
+        self.set_max_context.setValue(int(s.get("max_context_chars", 1600)))
+        self.set_explore_per_day.setValue(int(s.get("explore_per_day", 3)))
+        self.set_explore_sources.setValue(int(s.get("explore_sources", 3)))
 
     def _collect_settings(self) -> dict[str, Any]:
         return {
@@ -520,6 +564,13 @@ class AliveDialog(QDialog):
             "share_with_qq": self.set_share.isChecked(),
             "recall_limit": self.set_recall_limit.value(),
             "recall_chars": self.set_recall_chars.value(),
+            "context_injection": self.set_context.isChecked(),
+            "working_memory": self.set_working.isChecked(),
+            "candidate_review": self.set_candidate_review.isChecked(),
+            "group_private_recall": self.set_group_private.isChecked(),
+            "max_context_chars": self.set_max_context.value(),
+            "explore_per_day": self.set_explore_per_day.value(),
+            "explore_sources": self.set_explore_sources.value(),
         }
 
     def _refresh_overview(self) -> None:
@@ -549,6 +600,22 @@ class AliveDialog(QDialog):
         self.ov_memory.setText(
             f"{memory.get('active', 0)} 条活动记忆，{memory.get('episodes', 0)} 条情节"
             + (f"（{kinds}）" if kinds else "")
+        )
+        working = snap.get("working") or {}
+        topic = str(working.get("topic") or "").strip()
+        questions = working.get("open_questions") or []
+        if topic:
+            self.ov_working.setText(
+                f"这轮在聊：{topic}" + (f"；还有 {len(questions)} 件没弄明白" if questions else "")
+            )
+        else:
+            self.ov_working.setText("还没有工作记忆，聊两句就会记起来")
+        pending = int(memory.get("candidates", 0) or 0)
+        needs = int(memory.get("needs_review", 0) or 0)
+        self.ov_review.setText(
+            f"{pending} 条候选等你确认；{needs} 条需要重新确认"
+            if (pending or needs)
+            else "没有待审候选，也没有需要重新确认的记忆"
         )
         export = snap.get("export") or {}
         inbox = snap.get("inbox") or {}
@@ -589,23 +656,37 @@ class AliveDialog(QDialog):
             kind_label = KIND_LABELS.get(str(row.get("kind")), str(row.get("kind")))
             if row.get("level"):
                 kind_label += f"·{row.get('level')}"
+            text = str(row.get("text") or "")
+            if row.get("derived_status") == "needs_review":
+                text = "⚠ " + text
+            weight = row.get("weight", 0)
             cells = [
                 kind_label,
-                str(row.get("text") or ""),
-                f"{row.get('weight', 0):.2f}",
-                f"{row.get('confidence', 0):.2f}",
-                str(row.get("access_count", 0)),
+                text,
+                "—" if status == "candidate" else f"{weight:.2f}",
+                f"{row.get('confidence', 0):.2f} {row.get('confidence_label', '')}".strip(),
+                str(row.get("source_label") or row.get("source") or ""),
                 _when(row.get("last_access") or row.get("created_at") or 0),
             ]
             for column, value in enumerate(cells):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, row.get("id"))
+                if column == 1:
+                    extra = [part for part in (row.get("why"), row.get("caveat")) if part]
+                    if extra:
+                        item.setToolTip("\n".join(str(part) for part in extra))
                 self.memory_table.setItem(index, column, item)
-        self.memory_note.setText(
-            f"共 {len(rows)} 条。权重会随时间按遗忘曲线下降，被真正用过的记忆会加固；"
-            "归档和更正都保留历史，不直接删除。"
-        )
+        if status == "candidate":
+            self.memory_note.setText(
+                f"共 {len(rows)} 条候选。它们是巩固出来的推断，不会参与召回；"
+                "通过后才变成活动记忆，驳回会留在候选历史里。"
+            )
+        else:
+            self.memory_note.setText(
+                f"共 {len(rows)} 条。权重会随时间按遗忘曲线下降，被真正用过的记忆会加固；"
+                "归档和更正都保留历史，“彻底忘记”才会清掉原文并留下墓碑。"
+            )
 
     # ---------- 动作 ----------
 
@@ -710,6 +791,89 @@ class AliveDialog(QDialog):
         self.status.setText(message)
         if success:
             self._refresh_memory()
+
+    def _approve_candidate(self) -> None:
+        item_id = self._selected_memory()
+        if not item_id:
+            self.status.setText("先切到“待审核候选”，选中一条候选。")
+            return
+        success, message = self.service.approve_candidate(item_id)
+        self.status.setText(message)
+        if success:
+            self._refresh_memory()
+            self._refresh_overview()
+
+    def _reject_candidate(self) -> None:
+        item_id = self._selected_memory()
+        if not item_id:
+            self.status.setText("先切到“待审核候选”，选中一条候选。")
+            return
+        success, message = self.service.reject_candidate(item_id)
+        self.status.setText(message)
+        if success:
+            self._refresh_memory()
+            self._refresh_overview()
+
+    def _forget_memory(self) -> None:
+        item_id = self._selected_memory()
+        if not item_id:
+            self.status.setText("先在表格里选中一条记忆。")
+            return
+        if QMessageBox.question(
+            self,
+            "彻底忘记",
+            "这会清掉原文，只留下不可还原的删除记录，无法从界面恢复。确定吗？",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        success, message = self.service.forget_memory(item_id)
+        self.status.setText(message)
+        if success:
+            self._refresh_memory()
+            self._refresh_overview()
+
+    def _backup_now(self) -> None:
+        ok, message = self.service.backup_now()
+        self.status.setText(message)
+
+    def _restore_backup(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+
+        rows = self.service.backups()
+        if not rows:
+            self.status.setText("还没有记忆备份。")
+            return
+        labels = [
+            f"{row.get('name')} · {_when(row.get('mtime', 0))}"
+            for row in rows
+        ]
+        choice, ok = QInputDialog.getItem(self, "从备份恢复", "选择一份备份：", labels, 0, False)
+        if not ok or not choice:
+            return
+        index = labels.index(choice)
+        name = str(rows[index].get("name") or "")
+        if QMessageBox.question(
+            self, "恢复备份", f"用 {name} 覆盖当前记忆？当前状态会先备份。"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        success, message = self.service.restore_backup(name)
+        self.status.setText(message)
+        if success:
+            self._refresh_memory()
+            self._refresh_overview()
+
+    def _integrity_check(self) -> None:
+        report = self.service.integrity_report()
+        lines = [
+            f"活动条目：{report.get('items', 0)}，情节：{report.get('episodes', 0)}",
+            f"待审候选：{report.get('pending_candidates', 0)}，墓碑：{report.get('tombstones', 0)}",
+            f"重复 ID：{len(report.get('duplicates') or [])}",
+            f"缺少主体：{len(report.get('missing_subject') or [])}",
+            f"非法可见域：{len(report.get('invalid_visibility') or [])}",
+            f"孤立证据：{len(report.get('orphan_evidence') or [])}",
+        ]
+        title = "体检通过" if report.get("ok") else "发现需要处理的问题"
+        QMessageBox.information(self, title, "\n".join(lines))
+        self.status.setText(title)
 
     def _consolidate(self) -> None:
         ok, message = self.service.consolidate_now()

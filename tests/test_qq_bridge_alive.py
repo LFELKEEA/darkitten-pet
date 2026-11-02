@@ -267,7 +267,8 @@ class ServiceAliveTests(unittest.TestCase):
         rows = json.loads((service.alive.inbox_path).read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(rows["type"], "episode")
         self.assertEqual(rows["actor_id"], "owner")
-        self.assertEqual(rows["visibility"], "private")
+        # 群聊里说的话属于这个群，不能当私聊记忆，否则会被召回到别的会话。
+        self.assertEqual(rows["visibility"], "group:123456")
         self.assertEqual(rows["kind"], "group")
 
     def test_non_owner_group_uses_group_visibility(self) -> None:
