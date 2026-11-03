@@ -800,8 +800,9 @@ class BundledCatalogTests(unittest.TestCase):
     def test_bundled_mcp_git_uses_uvx_launcher(self):
         git = next(item for item in BUNDLED_CONNECTORS if item["id"] == "mcp-git")
         self.assertEqual(git["command"], "uvx")
-        self.assertIn("mcp-server-git", git["args"])
+        self.assertEqual(git["args"][0], "mcp-server-git==2026.8.18")
         self.assertIn("--repository", git["args"])
+        self.assertEqual(git["timeout"], 120)
 
     def test_npx_mcp_git_is_migrated_back_to_uvx(self):
         root = temp_root()
@@ -835,8 +836,43 @@ class BundledCatalogTests(unittest.TestCase):
 
         git = connectors.get("mcp-git")
         self.assertEqual(git["command"], "uvx")
-        self.assertIn("mcp-server-git", git["args"])
-        self.assertEqual(git["timeout"], 60)
+        self.assertEqual(git["args"][0], "mcp-server-git==2026.8.18")
+        self.assertEqual(git["timeout"], 120)
+        self.assertTrue(git["enabled"])
+
+    def test_unpinned_uvx_mcp_git_is_pinned(self):
+        root = temp_root()
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True)
+        connectors = ConnectorStore(
+            root / "connectors.json", workspace, root / ".trash"
+        )
+        connectors.save(
+            {
+                "id": "mcp-git",
+                "name": "MCP Git",
+                "type": "mcp",
+                "description": "1.6.4 配置",
+                "enabled": True,
+                "command": "uvx",
+                "args": ["mcp-server-git", "--repository", "."],
+                "cwd": ".",
+                "timeout": 60,
+            }
+        )
+
+        seed_catalog(
+            SimpleNamespace(
+                skills=root / "skills",
+                connectors=root / "connectors.json",
+                workspace=workspace,
+                trash=root / ".trash",
+            )
+        )
+
+        git = connectors.get("mcp-git")
+        self.assertEqual(git["args"], ["mcp-server-git==2026.8.18", "--repository", "."])
+        self.assertEqual(git["timeout"], 120)
         self.assertTrue(git["enabled"])
 
     def test_legacy_github_entries_are_renamed_without_losing_settings(self):

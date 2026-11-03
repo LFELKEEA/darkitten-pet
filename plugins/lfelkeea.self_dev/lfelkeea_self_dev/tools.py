@@ -690,9 +690,7 @@ class ToolBox:
 
         argv = self._shell_argv(text, mode)
         seconds = _clamp(timeout, 120, 5, 600)
-        env = dict(os.environ)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
+        env = req_tools.command_env()
         flags = 0
         if os.name == "nt":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)

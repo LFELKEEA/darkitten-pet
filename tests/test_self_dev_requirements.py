@@ -101,6 +101,47 @@ class EnvStoreTests(unittest.TestCase):
             resolve_env("${TIANXI_TEST_NOT_SET_ANYWHERE}")
 
 
+class CommandResolutionTests(unittest.TestCase):
+    def test_merged_path_appends_registry_entries_once(self) -> None:
+        root = temp_root()
+        first, second, third = (str(root / name) for name in ("first", "second", "third"))
+        with mock.patch.dict(
+            os.environ, {"PATH": first + os.pathsep + second}, clear=False
+        ), mock.patch.object(
+            req_tools, "_registry_path", return_value=second + os.pathsep + third
+        ):
+            parts = req_tools.merged_path().split(os.pathsep)
+        self.assertEqual(parts, [first, second, third])
+
+    def test_missing_command_returns_empty(self) -> None:
+        with mock.patch.object(req_tools, "_registry_path", return_value=""):
+            self.assertEqual(req_tools.resolve_command("tianxi-no-such-command-xyz"), "")
+            self.assertFalse(req_tools.command_available("tianxi-no-such-command-xyz"))
+
+    def test_direct_path_is_used(self) -> None:
+        root = temp_root()
+        target = root / "tool.exe"
+        target.write_bytes(b"")
+        self.assertEqual(req_tools.resolve_command(str(target)), str(target))
+
+    @unittest.skipUnless(os.name == "nt", "uvx sibling check is Windows-only")
+    def test_uvx_without_sibling_uv_is_skipped(self) -> None:
+        root = temp_root()
+        broken = root / "broken"
+        broken.mkdir()
+        (broken / "uvx.exe").write_bytes(b"")
+        good = root / "good"
+        good.mkdir()
+        (good / "uvx.exe").write_bytes(b"")
+        (good / "uv.exe").write_bytes(b"")
+        with mock.patch.dict(
+            os.environ, {"PATH": str(broken) + os.pathsep + str(good)}, clear=False
+        ), mock.patch.object(req_tools, "_registry_path", return_value=""):
+            resolved = req_tools.resolve_command("uvx")
+        self.assertEqual(Path(resolved).parent, good)
+        self.assertTrue(req_tools.command_available("uvx"))
+
+
 class RequirementInferenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = temp_root()
@@ -198,6 +239,22 @@ class RequirementInferenceTests(unittest.TestCase):
         self.assertTrue(missing["blocked"])
         self.assertTrue(missing["links"])
         self.assertFalse(missing["has_actions"])
+
+    def test_prepare_plan_for_uvx_does_not_use_npm_cache(self) -> None:
+        connector = {
+            "id": "mcp-git",
+            "name": "MCP Git",
+            "type": "mcp",
+            "command": "uvx",
+            "args": ["mcp-server-git==2026.8.18", "--repository", "."],
+            "enabled": True,
+            "env": {},
+        }
+        with mock.patch.object(req_tools, "command_available", return_value=True):
+            plan = req_tools.prepare_plan("connector", connector, self.store)
+        argv = [command["argv"] for command in plan["commands"]]
+        self.assertIn(["uv", "tool", "install", "mcp-server-git==2026.8.18"], argv)
+        self.assertNotIn(["npm", "cache", "add", "mcp-server-git==2026.8.18"], argv)
 
     def test_prepare_plan_for_playwright_downloads_browser(self) -> None:
         connector = {

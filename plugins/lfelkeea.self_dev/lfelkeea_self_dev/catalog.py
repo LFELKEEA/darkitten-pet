@@ -1365,6 +1365,10 @@ token 只有约 2 小时有效期，优先在平台侧自动刷新，不要手�
     },
 ]
 
+# mcp-server-git 2026.10.x 起依赖 mcp 2.x，依赖树明显变大；固定到仍在
+# 1.x 协议线、依赖更轻的版本，避免每次首次启动都长时间解析和下载。
+MCP_GIT_PACKAGE = "mcp-server-git==2026.8.18"
+
 BUNDLED_CONNECTORS: list[dict[str, Any]] = [
     {
         "id": "github-public",
@@ -1621,13 +1625,13 @@ BUNDLED_CONNECTORS: list[dict[str, Any]] = [
         "id": "mcp-git",
         "name": "MCP Git",
         "type": "mcp",
-        "description": "查看当前工作区 Git 状态、diff、历史和提交。需要 uv/uvx；先确认 uvx 能正常执行。",
+        "description": "查看当前工作区 Git 状态、diff、历史和提交。需要 uv/uvx；首次启动会下载依赖，建议先在「环境与依赖」里预下载。",
         "enabled": False,
         "command": "uvx",
-        "args": ["mcp-server-git", "--repository", "."],
+        "args": [MCP_GIT_PACKAGE, "--repository", "."],
         "env": {},
         "cwd": ".",
-        "timeout": 60,
+        "timeout": 120,
     },
     {
         "id": "mcp-sqlite",
@@ -2086,14 +2090,32 @@ def _migrate_mcp_git_back_to_uvx(connectors: Any) -> int:
             continue
         payload = dict(item)
         payload["command"] = "uvx"
-        payload["args"] = ["mcp-server-git", "--repository", "."]
+        payload["args"] = [MCP_GIT_PACKAGE, "--repository", "."]
         payload["env"] = {}
         payload["cwd"] = "."
-        payload["timeout"] = 60
+        payload["timeout"] = 120
         payload["description"] = (
             "查看当前工作区 Git 状态、diff、历史和提交。需要 uv/uvx；"
-            "先确认 uvx 能正常执行。"
+            "首次启动会下载依赖，建议先在「环境与依赖」里预下载。"
         )
+        connectors.save(payload)
+        changed += 1
+    return changed
+
+
+def _migrate_mcp_git_pin(connectors: Any) -> int:
+    """把 1.6.4 的未固定版本改成固定版本，只动默认配置。"""
+    changed = 0
+    for item in connectors.list():
+        if item.get("id") != "mcp-git" or item.get("type") != "mcp":
+            continue
+        command = str(item.get("command") or "").strip().lower()
+        args = [str(part) for part in item.get("args") or []]
+        if command != "uvx" or args != ["mcp-server-git", "--repository", "."]:
+            continue
+        payload = dict(item)
+        payload["args"] = [MCP_GIT_PACKAGE, "--repository", "."]
+        payload["timeout"] = 120
         connectors.save(payload)
         changed += 1
     return changed
@@ -2116,6 +2138,10 @@ def seed_catalog(paths: Any) -> dict[str, int]:
         pass
     try:
         _migrate_mcp_git_back_to_uvx(connectors)
+    except Exception:
+        pass
+    try:
+        _migrate_mcp_git_pin(connectors)
     except Exception:
         pass
     return result

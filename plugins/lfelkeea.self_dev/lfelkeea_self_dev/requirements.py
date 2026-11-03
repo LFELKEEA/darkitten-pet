@@ -10,7 +10,6 @@ from __future__ import annotations
 """
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Iterable
@@ -178,14 +177,108 @@ def connector_env_names(connector: dict[str, Any]) -> list[str]:
     return sorted(set(names))
 
 
-def command_available(command: str) -> bool:
-    value = str(command or "").strip()
-    if not value:
+_PATHEXT_FALLBACK = ".COM;.EXE;.BAT;.CMD"
+
+
+def _registry_path() -> str:
+    """读注册表里的 Machine + User PATH；非 Windows 或读取失败返回空串。"""
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    parts: list[str] = []
+    for root, sub in (
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(root, sub) as key:
+                value, _kind = winreg.QueryValueEx(key, "Path")
+        except OSError:
+            continue
+        if value:
+            parts.append(str(value))
+    return os.pathsep.join(parts)
+
+
+def merged_path() -> str:
+    """合并当前进程 PATH 和注册表 PATH。
+
+    桌宠启动后新装的工具不会自动进入它已有的 PATH；重新读注册表，
+    依赖检查和子进程就能立刻看到新命令，不用重启桌宠。
+    """
+    seen: set[str] = set()
+    parts: list[str] = []
+    for source in (os.environ.get("PATH", ""), _registry_path()):
+        for raw in str(source or "").split(os.pathsep):
+            part = os.path.expandvars(raw.strip().strip('"'))
+            if not part:
+                continue
+            key = part.rstrip("\\/").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            parts.append(part)
+    return os.pathsep.join(parts)
+
+
+def _extensions() -> list[str]:
+    if os.name != "nt":
+        return [""]
+    raw = os.environ.get("PATHEXT") or _PATHEXT_FALLBACK
+    exts = [item.strip().lower() for item in raw.split(";") if item.strip()]
+    return exts or [".exe"]
+
+
+def _uvx_needs_sibling_uv(path: Path) -> bool:
+    """uvx 依赖同目录的 uv.exe；缺 uv 的旧包装器会直接报错。"""
+    if os.name != "nt" or path.stem.lower() != "uvx":
         return False
-    path = Path(value)
-    if path.is_file():
-        return True
-    return shutil.which(value) is not None
+    return not (path.parent / "uv.exe").is_file()
+
+
+def resolve_command(command: str) -> str:
+    """返回命令的绝对路径；找不到返回空串。
+
+    查找范围包含启动后新写入注册表、但当前进程还看不到的 PATH。
+    """
+    value = str(command or "").strip().strip('"')
+    if not value:
+        return ""
+    direct = Path(value)
+    if direct.is_file():
+        return str(direct)
+    for directory in merged_path().split(os.pathsep):
+        if not directory:
+            continue
+        for ext in _extensions():
+            candidate = Path(directory) / (value + ext)
+            if not candidate.is_file():
+                continue
+            if _uvx_needs_sibling_uv(candidate):
+                continue
+            return str(candidate)
+    return ""
+
+
+def command_env(*, base: dict[str, str] | None = None) -> dict[str, str]:
+    """子进程环境：PATH 用刷新后的值，并统一 UTF-8 输出。"""
+    env = dict(os.environ if base is None else base)
+    path = merged_path()
+    if path:
+        env["PATH"] = path
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
+def command_available(command: str) -> bool:
+    return bool(resolve_command(command))
 
 
 def runtime_doc(command: str) -> dict[str, str]:
@@ -346,7 +439,10 @@ def prepare_plan(kind: str, item: dict[str, Any], env_store: Any) -> dict[str, A
                     )
             else:
                 package = _package_for(item)
-                if package and command_available("npx"):
+                launcher = Path(str(item.get("command") or "")).name.lower()
+                if launcher.endswith(".exe"):
+                    launcher = launcher[:-4]
+                if package and launcher == "npx" and command_available("npx"):
                     commands.append(
                         _command(
                             "npm cache add",
@@ -354,7 +450,7 @@ def prepare_plan(kind: str, item: dict[str, Any], env_store: Any) -> dict[str, A
                             f"预下载 npm 包 {package}；第一次 npx 启动会更快。",
                         )
                     )
-                if package and command_available("uv"):
+                if package and launcher == "uvx" and command_available("uv"):
                     commands.append(
                         _command(
                             "uv tool install",
@@ -429,13 +525,11 @@ def prepare_plan(kind: str, item: dict[str, Any], env_store: Any) -> dict[str, A
 
 def run_command(argv: list[str], *, cwd: Path, timeout: int = 600) -> dict[str, Any]:
     executable = str(argv[0]) if argv else ""
-    resolved = shutil.which(executable) if executable and not Path(executable).is_file() else executable
+    resolved = resolve_command(executable)
     if not resolved:
         return {"ok": False, "code": -1, "output": f"找不到命令：{executable}"}
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
+    env = command_env()
     try:
         completed = subprocess.run(
             [resolved, *[str(part) for part in argv[1:]]],

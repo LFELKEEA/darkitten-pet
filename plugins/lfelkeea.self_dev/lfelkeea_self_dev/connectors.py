@@ -12,7 +12,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .net import NetworkError, http_request, resolve_env
+from .requirements import command_env, resolve_command
 from .resource_util import RESOURCE_ID_RE, ResourceError, atomic_write, inside, read_text, redact, stamp, trash_path
 
 MCP_PROTOCOL = "2025-06-18"
@@ -420,12 +420,10 @@ class MCPClient:
         command = str(self.connector.get("command") or "").strip()
         if not command:
             raise NetworkError("MCP 连接器没有 command。")
-        executable = shutil.which(command) if not Path(command).is_file() else command
+        executable = resolve_command(command)
         if not executable:
             raise NetworkError(f"找不到 MCP 命令：{command}（确认已安装并在 PATH 里）。")
-        env = dict(os.environ)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
+        env = command_env()
         for key, raw in (self.connector.get("env") or {}).items():
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key)):
                 raise NetworkError(f"MCP 环境变量名不合法：{key}")

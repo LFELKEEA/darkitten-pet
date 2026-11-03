@@ -10,11 +10,11 @@ from __future__ import annotations
 import json
 import posixpath
 import re
-import shutil
 import urllib.parse
 from typing import Any
 
 from .net import NetworkError, http_request
+from .requirements import command_available
 from .resource_util import parse_front_matter
 
 GITHUB_API = "https://api.github.com"
@@ -300,4 +300,4 @@ def resolve_mcp_command(
 def runtime_available(command: str) -> bool:
     if command in ("python", "python3"):
         return True
-    return bool(shutil.which(command))
+    return command_available(command)
