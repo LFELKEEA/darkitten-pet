@@ -1621,13 +1621,13 @@ BUNDLED_CONNECTORS: list[dict[str, Any]] = [
         "id": "mcp-git",
         "name": "MCP Git",
         "type": "mcp",
-        "description": "查看和操作当前工作区的 Git：status、diff、history、branch、commit、stash 等。通过 npx 启动 @selfagency/git-mcp，需要 Node.js；写操作、重置和推送每次调用前都要确认。",
+        "description": "查看当前工作区 Git 状态、diff、历史和提交。需要 uv/uvx；先确认 uvx 能正常执行。",
         "enabled": False,
-        "command": "npx",
-        "args": ["-y", "@selfagency/git-mcp", "--repo-path", "."],
+        "command": "uvx",
+        "args": ["mcp-server-git", "--repository", "."],
         "env": {},
         "cwd": ".",
-        "timeout": 120,
+        "timeout": 60,
     },
     {
         "id": "mcp-sqlite",
@@ -2070,11 +2070,11 @@ def _migrate_legacy_github_split(skills: Any, connectors: Any) -> int:
     return changed
 
 
-def _migrate_legacy_mcp_git(connectors: Any) -> int:
-    """把旧的 uvx + mcp-server-git 换成 npx 启动的可用版本。
+def _migrate_mcp_git_back_to_uvx(connectors: Any) -> int:
+    """把 1.6.3 的 npx 配置改回 uvx + mcp-server-git。
 
-    部分环境的 uvx.exe 是缺少 uv.exe 的残缺包装，原配置根本起不来。
-    只替换命令仍是旧默认值的条目，用户自己改过的配置不动。
+    只处理仍是 1.6.3 默认 npx 配置的条目，用户自己改过的配置不动，
+    开关状态保留。
     """
     changed = 0
     for item in connectors.list():
@@ -2082,18 +2082,17 @@ def _migrate_legacy_mcp_git(connectors: Any) -> int:
             continue
         command = str(item.get("command") or "").strip().lower()
         args = [str(part) for part in item.get("args") or []]
-        if command != "uvx" or "mcp-server-git" not in args:
+        if command != "npx" or "@selfagency/git-mcp" not in args:
             continue
         payload = dict(item)
-        payload["command"] = "npx"
-        payload["args"] = ["-y", "@selfagency/git-mcp", "--repo-path", "."]
+        payload["command"] = "uvx"
+        payload["args"] = ["mcp-server-git", "--repository", "."]
         payload["env"] = {}
         payload["cwd"] = "."
-        payload["timeout"] = 120
+        payload["timeout"] = 60
         payload["description"] = (
-            "查看和操作当前工作区的 Git：status、diff、history、branch、commit、"
-            "stash 等。通过 npx 启动 @selfagency/git-mcp，需要 Node.js；"
-            "写操作、重置和推送每次调用前都要确认。"
+            "查看当前工作区 Git 状态、diff、历史和提交。需要 uv/uvx；"
+            "先确认 uvx 能正常执行。"
         )
         connectors.save(payload)
         changed += 1
@@ -2116,7 +2115,7 @@ def seed_catalog(paths: Any) -> dict[str, int]:
     except Exception:
         pass
     try:
-        _migrate_legacy_mcp_git(connectors)
+        _migrate_mcp_git_back_to_uvx(connectors)
     except Exception:
         pass
     return result
