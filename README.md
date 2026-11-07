@@ -4,7 +4,7 @@
 
 当前源码版本：`1.4.1`。
 
-- 下载安装包：[pet-v1.4.0](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.4.0)
+- 下载安装包：[pet-v1.4.1](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.4.1)
 - 插件库：[lfelkeea.github.io/darkitten-launcher/plugins.html](https://lfelkeea.github.io/darkitten-launcher/plugins.html)
 - 插件源码：[`plugins/`](plugins)（示例插件、专注守护、QQ 桥接）
 
@@ -20,7 +20,7 @@
   - `ocr`：本地 Windows OCR 识别屏幕文字，再把文字交给 AI。
   - `auto`：当前模型支持视觉时用截图，否则用窗口标题。
   - 隐私闸门：敏感窗口、全屏应用、聊天中、语音中、刚和桌宠互动过时自动跳过。
-- **Live2D 换装**：1.4.0 起插件可以通过 `pet.model` 接口换 Live2D 模型、注册动作和表情，通过 `pet.persona` 替换台词与 AI 人格。运行库随包放在 `vendor/`（live2d-py + GLFW），不需要单独安装。
+- **Live2D 换装**：1.4.0 起插件可以通过 `pet.model` 接口换 Live2D 模型、注册动作和表情，通过 `pet.persona` 替换台词与 AI 人格；1.4.1 起还可以用 `set_action_menu()` 接管右键「动作」菜单。运行库随包放在 `vendor/`（live2d-py + GLFW），不需要单独安装。
 - **插件系统**：`data/plugins/` 下的本地 Python 插件，带权限声明、事件、定时器、AI、截屏、设置和存储 API。
 - **插件接管右键动作菜单**：换 Live2D 模型的插件可以用自己的动作和表情替换「动作」子菜单，模型卸载后自动恢复。
 - 插件管理界面：启用/停用/重载、删除（移入回收站并清理配置和状态）、权限展示、错误隔离、日志。
