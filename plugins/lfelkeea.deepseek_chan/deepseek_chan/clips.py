@@ -7,8 +7,12 @@
 
 from __future__ import annotations
 
+import bisect
 import json
+import re
 from pathlib import Path
+
+from .model_source import find_model_file
 
 # motion3 文件名 → 动作名
 MOTION_ALIASES = {
@@ -51,6 +55,116 @@ EXPRESSION_ALIASES = {
 # 这些参数对模型有效，表情文件里出现时要保留。
 KEEP_PARAM_PREFIXES = ("key", "Param", "Clothes", "Movement", "LeanInput")
 
+# 没有 cdi3 参数表时的兜底：只发标准 Live2D 参数，避免把大肥鱼的专用参数
+# 塞进别的模型。
+COMMON_PARAMS = {
+    "ParamAngleX",
+    "ParamAngleY",
+    "ParamAngleZ",
+    "ParamBodyAngleX",
+    "ParamBodyAngleY",
+    "ParamBodyAngleZ",
+    "ParamEyeLOpen",
+    "ParamEyeROpen",
+    "ParamEyeLSmile",
+    "ParamEyeRSmile",
+    "ParamEyeBallX",
+    "ParamEyeBallY",
+    "ParamBrowLY",
+    "ParamBrowRY",
+    "ParamMouthOpenY",
+    "ParamMouthForm",
+    "ParamBreath",
+}
+
+# 模型自带动作的英文名提示。命中后给一个中文菜单名。
+MOTION_HINTS = {
+    "idle": ("idle_motion", "待机"),
+    "idle2": ("idle_motion_2", "待机 2"),
+    "idle3": ("idle_motion_3", "待机 3"),
+    "tap": ("tap", "点一下"),
+    "touch": ("touch", "碰一下"),
+    "pat": ("pat", "摸摸头"),
+    "greet": ("greet_motion", "打招呼"),
+    "hello": ("hello", "你好"),
+    "wave": ("wave_motion", "挥手"),
+    "happy": ("happy", "开心"),
+    "angry": ("angry", "生气"),
+    "sad": ("sad", "难过"),
+    "shy": ("shy_motion", "害羞"),
+    "sleep": ("sleep_motion", "睡觉"),
+    "wake": ("wake_motion", "醒来"),
+}
+
+SMOOTH_RATE = 60.0
+
+# 有些作者把标准参数接在很弱的变形器上，真正驱动身体的是另一组
+# 自定义参数（比如 xxxinput）。模型同时有这两套参数时，给同一个
+# 动作补一份等价通道，动作才会真的动起来；目标参数不存在就跳过，
+# 不会影响原来的大肥鱼模型。
+PARAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "ParamBodyAngleX": ("ParamBodyAngleXinput",),
+    "ParamBodyAngleY": ("ParamBodyAngleY3input",),
+    "ParamBodyAngleZ": ("ParamBodyAngleZ2input",),
+}
+
+# 大肥鱼用这三组参数切换手型（默认手 / 狗尾草手 / 竖手指手）。
+# 它们只能取 0 或 1，插值到中间值会把两只手同时画出来。
+SNAP_PARAMS = ("Movement1", "Movement2", "Movement3")
+
+# 挥手、鞠躬、跳舞这类动作需要手臂或躯干真的能弯。只有脸部/头部参数的
+# 静态立绘模型做不出这些姿势，宁可不在菜单里出现，也别让「鞠躬」变成
+# 原地晃一下。
+ARTICULATED_PARAMS = (
+    "Param36",
+    "LArm",
+    "RArm",
+    "LForearm",
+    "RForearm",
+    "LHand",
+    "RHand",
+    "Movement1",
+    "Movement2",
+    "Movement3",
+)
+BODY_ACTIONS = {"hop", "wave", "greet", "wave_big", "stretch", "dance", "bow"}
+
+
+def _can_articulate(available: set[str] | None) -> bool:
+    if not available:
+        return False
+    return any(pid in available for pid in ARTICULATED_PARAMS)
+
+
+def _is_static_rig(available: set[str] | None) -> bool:
+    """没有可动手臂、但带大量自动命名旋转变形器的，基本是静态立绘。"""
+    if not available or _can_articulate(available):
+        return False
+    return any(pid.startswith("Param_Angle_Rotation") for pid in available)
+
+# 这些动作靠一个标志性参数成立；模型没有这个参数时，宁可不显示，
+# 也不要把它变成只有头部晃动的「假动作」。
+SIGNATURE_PARAMS = {
+    "wave": "Param36",
+    "greet": "Param36",
+    "wave_big": "Param36",
+    "stretch": "Param36",
+    "dress": "Clothes1",
+    "dress_short": "Clothes1",
+    "chibi": "Clothes2",
+    "chibi_normal": "Clothes2",
+    "tail_hide": "Clothes5",
+    "tail_show": "Clothes5",
+    "shy": "key7",
+    "love": "key4",
+    "dizzy": "key3",
+    "squint": "key5",
+    "cry": "key2",
+    "deadpan": "key1",
+    "sweat": "key13",
+    "pout": "CheeckPuff",
+}
+
 
 def _clip(duration: float, frames, loop: bool = False) -> dict:
     keys = []
@@ -61,57 +175,447 @@ def _clip(duration: float, frames, loop: bool = False) -> dict:
                 "params": {str(key): round(float(value), 4) for key, value in params.items()},
             }
         )
-    return {"duration": round(max(0.05, float(duration)), 3), "loop": bool(loop), "keys": keys}
+    return {
+        "duration": round(max(0.05, float(duration)), 3),
+        "loop": bool(loop),
+        "keys": keys,
+        # 手型/道具是开关，不是连续角度。渲染层按中点吸附，避免淡入淡出时
+        # 两只手叠在一起。
+        "snap": list(SNAP_PARAMS),
+    }
 
 
 def _wave_frames(*, high: float, start: float = 0.18, end: float = 2.55) -> list:
-    """抬手挥一挥。Param36 是模型里真正能让手臂抬起来的参数。"""
+    """抬手挥一挥。
+
+    Param36 让手臂抬起来，Movement2 把手型切到「举起的手」。
+    这里不能用 Movement1：那是作者做狗尾草道具用的手型，挥手时会凭空
+    多出一根草，看着像动作坏了。
+    """
     return [
-        (0.0, {"Param36": 0, "Movement1": 0, "Movement3": 0, "AngleZ": 0, "AngleY": 0}),
-        (start, {"Param36": high * 0.45, "Movement1": 1, "AngleZ": 4, "AngleY": -2,
+        (0.0, {"Param36": 0, "Movement2": 0, "Movement3": 0, "AngleZ": 0, "AngleY": 0}),
+        (start, {"Param36": high * 0.45, "Movement2": 1, "AngleZ": 4, "AngleY": -2,
                  "ParamMouthForm": 0.45, "ParamEyeLOpen": 0.9, "ParamEyeROpen": 0.9}),
-        (start + 0.28, {"Param36": high, "Movement1": 1, "Movement3": 0, "AngleZ": 7,
+        (start + 0.28, {"Param36": high, "Movement2": 1, "Movement3": 0, "AngleZ": 7,
                         "AngleY": -3, "ParamMouthForm": 0.6, "CheeckPuff": 0.15}),
-        (start + 0.52, {"Param36": high * 0.86, "Movement1": 1, "AngleZ": 4,
+        (start + 0.52, {"Param36": high * 0.86, "Movement2": 1, "AngleZ": 4,
                         "LForearm": 0.3, "LHand": 0.2}),
-        (start + 0.76, {"Param36": high, "Movement1": 1, "AngleZ": 8, "LForearm": -0.25,
+        (start + 0.76, {"Param36": high, "Movement2": 1, "AngleZ": 8, "LForearm": -0.25,
                         "LHand": -0.15}),
-        (start + 1.0, {"Param36": high * 0.84, "Movement1": 1, "AngleZ": 3,
+        (start + 1.0, {"Param36": high * 0.84, "Movement2": 1, "AngleZ": 3,
                        "LForearm": 0.32, "LHand": 0.2}),
-        (start + 1.24, {"Param36": high, "Movement1": 1, "AngleZ": 8, "LForearm": -0.22,
+        (start + 1.24, {"Param36": high, "Movement2": 1, "AngleZ": 8, "LForearm": -0.22,
                         "LHand": -0.12}),
-        (end - 0.25, {"Param36": high * 0.4, "Movement1": 1, "AngleZ": 3,
+        (end - 0.25, {"Param36": high * 0.4, "Movement2": 1, "AngleZ": 3,
                       "LForearm": 0, "LHand": 0, "ParamMouthForm": 0.35}),
-        (end, {"Param36": 0, "Movement1": 0, "AngleZ": 0, "AngleY": 0,
+        (end, {"Param36": 0, "Movement2": 0, "AngleZ": 0, "AngleY": 0,
                "ParamMouthForm": 0.15, "CheeckPuff": 0}),
     ]
 
 
-def procedural_clips() -> dict[str, dict]:
+def _model_config(model_dir: Path) -> tuple[Path | None, dict]:
+    path = find_model_file(model_dir)
+    if path is None:
+        return None, {}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return path, {}
+    return path, data if isinstance(data, dict) else {}
+
+
+def model_parameters(model_dir: Path) -> set[str] | None:
+    """读取模型真正拥有的参数 ID。读不到时返回 None。"""
+    model_json, data = _model_config(model_dir)
+    base = model_json.parent if model_json is not None else Path(model_dir)
+    ids: set[str] = set()
+
+    for group in data.get("Groups") or []:
+        if isinstance(group, dict) and group.get("Target") == "Parameter":
+            ids.update(str(item) for item in group.get("Ids") or [])
+
+    refs = data.get("FileReferences") or {}
+    display = refs.get("DisplayInfo")
+    cdi_paths: list[Path] = []
+    if display:
+        cdi_paths.append(base / str(display))
+    try:
+        cdi_paths.extend(sorted(base.rglob("*.cdi3.json")))
+    except OSError:
+        pass
+    for cdi in cdi_paths:
+        if not cdi.is_file():
+            continue
+        try:
+            info = json.loads(cdi.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        for item in info.get("Parameters") or []:
+            if isinstance(item, dict) and item.get("Id"):
+                ids.add(str(item["Id"]))
+        if ids:
+            break
+
+    return ids or None
+
+
+def _resolve_ref(base: Path, relative: str) -> Path | None:
+    if not relative:
+        return None
+    path = (base / str(relative)).resolve()
+    try:
+        path.relative_to(base.resolve())
+    except (OSError, ValueError):
+        return None
+    return path if path.is_file() else None
+
+
+def _unique_key(name: str, used: set[str]) -> str:
+    key = str(name or "motion")
+    if key not in used:
+        used.add(key)
+        return key
+    index = 2
+    while f"{key}_{index}" in used:
+        index += 1
+    key = f"{key}_{index}"
+    used.add(key)
+    return key
+
+
+def model_motions(model_dir: Path) -> list[tuple[str, Path]]:
+    """返回 [(动作名, motion3 文件)]，优先用 model3.json 的 Motions 表。"""
+    model_json, data = _model_config(model_dir)
+    base = model_json.parent if model_json is not None else Path(model_dir)
+    entries: list[tuple[str, Path]] = []
+    refs = data.get("FileReferences") or {}
+    used: set[str] = set()
+
+    motions = refs.get("Motions")
+    if isinstance(motions, dict):
+        for group in motions.values():
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if not isinstance(item, dict):
+                    continue
+                path = _resolve_ref(base, str(item.get("File") or ""))
+                if path is None:
+                    continue
+                stem = path.name[: -len(".motion3.json")]
+                alias = MOTION_ALIASES.get(stem)
+                if alias is None:
+                    hint = MOTION_HINTS.get(stem.lower())
+                    alias = hint[0] if hint else stem
+                entries.append((_unique_key(alias, used), path))
+
+    if not entries:
+        try:
+            files = sorted(base.rglob("*.motion3.json"))
+        except OSError:
+            files = []
+        for path in files:
+            stem = path.name[: -len(".motion3.json")]
+            alias = MOTION_ALIASES.get(stem)
+            if alias is None:
+                hint = MOTION_HINTS.get(stem.lower())
+                alias = hint[0] if hint else stem
+            entries.append((_unique_key(alias, used), path))
+    return entries
+
+
+def model_expression_files(model_dir: Path) -> list[tuple[str, Path]]:
+    """返回 [(表情名, exp3 文件)]。"""
+    model_json, data = _model_config(model_dir)
+    base = model_json.parent if model_json is not None else Path(model_dir)
+    refs = data.get("FileReferences") or {}
+    entries: list[tuple[str, Path]] = []
+    used: set[str] = set()
+
+    for item in refs.get("Expressions") or []:
+        if not isinstance(item, dict):
+            continue
+        path = _resolve_ref(base, str(item.get("File") or ""))
+        if path is None:
+            continue
+        name = str(item.get("Name") or path.name[: -len(".exp3.json")])
+        alias = EXPRESSION_ALIASES.get(name) or name
+        entries.append((_unique_key(alias, used), path))
+
+    if not entries:
+        try:
+            files = sorted(base.rglob("*.exp3.json"))
+        except OSError:
+            files = []
+        for path in files:
+            name = path.name[: -len(".exp3.json")]
+            alias = EXPRESSION_ALIASES.get(name)
+            if alias is None:
+                continue
+            entries.append((_unique_key(alias, used), path))
+    return entries
+
+
+def _expand_aliases(clip: dict, available: set[str] | None) -> dict:
+    """给模型真正存在的等价参数补一份同样的关键帧。"""
+    if not available:
+        return clip
+    keys = []
+    for key in clip.get("keys") or []:
+        if not isinstance(key, dict):
+            continue
+        params = dict(key.get("params") or {})
+        for source, targets in PARAM_ALIASES.items():
+            if source not in params:
+                continue
+            value = params[source]
+            for target in targets:
+                if target in available and target not in params:
+                    params[target] = value
+        keys.append({"t": key.get("t", 0.0), "params": params})
+    expanded = dict(clip)
+    expanded["keys"] = keys
+    return expanded
+
+
+def _filter_clip(clip: dict, available: set[str] | None) -> dict | None:
+    """只保留模型真有的参数；一个都不剩就丢掉这段动作。"""
+    if available is None:
+        return clip
+    keys = []
+    for key in clip.get("keys") or []:
+        if not isinstance(key, dict):
+            continue
+        params = {
+            str(pid): value
+            for pid, value in (key.get("params") or {}).items()
+            if str(pid) in available
+        }
+        if params:
+            keys.append({"t": float(key.get("t", 0.0)), "params": params})
+    if not keys:
+        return None
+    return {
+        "duration": float(clip.get("duration") or 1.0),
+        "loop": bool(clip.get("loop")),
+        "keys": keys,
+        "snap": list(clip.get("snap") or ()),
+    }
+
+
+def _sample_track(
+    times: list[float], values: list[float], points: list[float], periodic: bool = False
+) -> list[float]:
+    """C1 连续的 Hermite 采样，避免每个关键帧都停一下。"""
+    if not times:
+        return []
+    if len(times) == 1:
+        return [values[0] for _ in points]
+
+    slopes: list[float] = []
+    for index, moment in enumerate(times):
+        if index == 0:
+            span = times[1] - times[0]
+            slope = (values[1] - values[0]) / span if span > 0 else 0.0
+        elif index == len(times) - 1:
+            span = times[-1] - times[-2]
+            slope = (values[-1] - values[-2]) / span if span > 0 else 0.0
+        else:
+            span = times[index + 1] - times[index - 1]
+            slope = (values[index + 1] - values[index - 1]) / span if span > 0 else 0.0
+        slopes.append(slope)
+
+    # 循环动作在首尾接缝处保持同一斜率，否则每次循环都会“顿一下”。
+    if periodic and len(times) >= 3:
+        span = (times[1] - times[0]) + (times[-1] - times[-2])
+        if span > 0:
+            seam = (values[1] - values[-2]) / span
+            slopes[0] = seam
+            slopes[-1] = seam
+
+
+    result: list[float] = []
+    for moment in points:
+        if moment <= times[0]:
+            result.append(values[0])
+            continue
+        if moment >= times[-1]:
+            result.append(values[-1])
+            continue
+        index = max(0, min(len(times) - 2, bisect.bisect_right(times, moment) - 1))
+        t0, t1 = times[index], times[index + 1]
+        span = t1 - t0
+        if span <= 0:
+            result.append(values[index + 1])
+            continue
+        u = (moment - t0) / span
+        u2 = u * u
+        u3 = u2 * u
+        h00 = 2 * u3 - 3 * u2 + 1
+        h10 = u3 - 2 * u2 + u
+        h01 = -2 * u3 + 3 * u2
+        h11 = u3 - u2
+        value = (
+            h00 * values[index]
+            + h10 * span * slopes[index]
+            + h01 * values[index + 1]
+            + h11 * span * slopes[index + 1]
+        )
+        # 允许一点自然过冲，但不让它飞出去。
+        low = min(values[index], values[index + 1])
+        high = max(values[index], values[index + 1])
+        margin = (high - low) * 0.15
+        result.append(max(low - margin, min(high + margin, value)))
+    return result
+
+
+def smooth_clip(clip: dict, rate: float = SMOOTH_RATE) -> dict:
+    """把稀疏关键帧重采样成高频曲线，动作不会在每个关键帧停顿。"""
+    duration = max(0.05, float(clip.get("duration") or 1.0))
+    tracks: dict[str, list[tuple[float, float]]] = {}
+    for key in clip.get("keys") or []:
+        if not isinstance(key, dict):
+            continue
+        try:
+            at = float(key.get("t", 0.0))
+        except (TypeError, ValueError):
+            continue
+        for pid, raw in (key.get("params") or {}).items():
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            tracks.setdefault(str(pid), []).append((at, value))
+    if not tracks:
+        return clip
+
+    cleaned: dict[str, list[tuple[float, float]]] = {}
+    for pid, points in tracks.items():
+        points.sort(key=lambda item: item[0])
+        merged: list[tuple[float, float]] = []
+        for at, value in points:
+            if merged and abs(at - merged[-1][0]) < 1e-6:
+                merged[-1] = (at, value)
+            else:
+                merged.append((at, value))
+        cleaned[pid] = merged
+
+    count = max(2, int(round(duration * max(10.0, rate))) + 1)
+    moments = [duration * index / (count - 1) for index in range(count)]
+    loop = bool(clip.get("loop"))
+    series: dict[str, list[float]] = {}
+    for pid, points in cleaned.items():
+        times = [item[0] for item in points]
+        values = [item[1] for item in points]
+        if times[0] > 0:
+            times.insert(0, 0.0)
+            values.insert(0, values[0])
+        if times[-1] < duration:
+            times.append(duration)
+            values.append(values[-1])
+        series[pid] = _sample_track(times, values, moments, periodic=loop)
+
+    # Movement1/2/3 是手型开关，不是连续通道。插值到 0.5 会同时显示两只手，
+    # 看起来就是残影，所以这里按中点硬切。
+    for pid in SNAP_PARAMS:
+        if pid in series:
+            series[pid] = [1.0 if value >= 0.5 else 0.0 for value in series[pid]]
+
+    keys = []
+    for index, moment in enumerate(moments):
+        params = {
+            pid: round(values[index], 4)
+            for pid, values in series.items()
+            if index < len(values)
+        }
+        if params:
+            keys.append({"t": round(moment, 4), "params": params})
+    return {
+        "duration": round(duration, 3),
+        "loop": loop,
+        "keys": keys,
+        "snap": list(clip.get("snap") or ()),
+    }
+
+
+# 主动点菜单里的姿势动作时，播完要停在最后一帧；自动待机播放则只播一遍就退回。
+# 宿主目前会在非循环动作播完后淡出，所以这里生成一份「末帧一直保持」的变体：
+# 在原时长后面接一个 24 小时的同值尾帧，渲染时就会稳定停在最后姿势。
+HOLD_SECONDS = 24 * 60 * 60
+HOLD_SUFFIX = "@hold"
+HOLD_CLIPS = (
+    "dress",
+    "dress_short",
+    "chibi",
+    "chibi_normal",
+    "tail_hide",
+    "tail_show",
+    "hand_up",
+    "hand_down",
+    "foxtail_out",
+    "foxtail_in",
+    "point_out",
+    "point_in",
+    "special",
+)
+
+
+def hold_clip(clip: dict, seconds: float = HOLD_SECONDS) -> dict:
+    duration = max(0.05, float(clip.get("duration") or 1.0))
+    keys = [key for key in clip.get("keys") or [] if isinstance(key, dict)]
+    if not keys:
+        return clip
+    last = keys[-1].get("params") or {}
+    if not last:
+        return clip
+    held = keys + [{"t": round(duration + seconds, 3), "params": dict(last)}]
+    return {
+        "duration": round(duration + seconds, 3),
+        "loop": False,
+        "keys": held,
+        "snap": list(clip.get("snap") or ()),
+    }
+
+
+def build_hold_clips(clips: dict) -> dict:
+    """给姿势类动作各生成一个停在末帧的变体；循环动作不需要。"""
+    out: dict[str, dict] = {}
+    for name in HOLD_CLIPS:
+        clip = clips.get(name)
+        if not clip or clip.get("loop"):
+            continue
+        out[name + HOLD_SUFFIX] = hold_clip(clip)
+    return out
+
+
+def procedural_clips(available_params: set[str] | None = None) -> dict[str, dict]:
     clips: dict[str, dict] = {}
 
     clips["nod"] = _clip(
         1.35,
         [
             (0.0, {"AngleX": 0, "ParamAngleX": 0}),
-            (0.24, {"AngleX": -10, "ParamAngleX": -4, "ParamEyeLOpen": 0.7, "ParamEyeROpen": 0.7}),
-            (0.52, {"AngleX": -1, "ParamAngleX": 0, "ParamEyeLOpen": 1, "ParamEyeROpen": 1}),
-            (0.8, {"AngleX": -9, "ParamAngleX": -3, "ParamEyeLOpen": 0.72, "ParamEyeROpen": 0.72}),
+            (0.24, {"AngleX": -11, "ParamAngleX": -12, "ParamEyeLOpen": 0.7, "ParamEyeROpen": 0.7}),
+            (0.52, {"AngleX": -1, "ParamAngleX": -1, "ParamEyeLOpen": 1, "ParamEyeROpen": 1}),
+            (0.8, {"AngleX": -10, "ParamAngleX": -11, "ParamEyeLOpen": 0.72, "ParamEyeROpen": 0.72}),
             (1.35, {"AngleX": 0, "ParamAngleX": 0, "ParamEyeLOpen": 1, "ParamEyeROpen": 1}),
         ],
     )
 
+    # 起跳时间对齐宿主的整图跳跃：0.12s 下蹲，0.42s 升到最高，0.62s 落地。
     clips["hop"] = _clip(
-        0.95,
+        0.9,
         [
             (0.0, {"AngleX": 0, "Param36": 0, "ParamBodyAngleX": 0}),
-            (0.2, {"AngleX": 8, "Param36": 0.55, "ParamBodyAngleX": 4,
-                   "ParamMouthForm": 0.5, "ParamEyeLOpen": 0.85, "ParamEyeROpen": 0.85}),
-            (0.5, {"AngleX": -4, "Param36": 0.3, "ParamBodyAngleX": -2,
-                   "ParamEyeLOpen": 0.6, "ParamEyeROpen": 0.6}),
-            (0.75, {"AngleX": 2, "Param36": 0.1, "ParamBodyAngleX": 1}),
-            (0.95, {"AngleX": 0, "Param36": 0, "ParamBodyAngleX": 0, "ParamMouthForm": 0.1,
-                    "ParamEyeLOpen": 1, "ParamEyeROpen": 1}),
+            (0.12, {"AngleX": -5, "Param36": 0.15, "ParamBodyAngleX": -2,
+                    "ParamEyeLOpen": 0.55, "ParamEyeROpen": 0.55}),
+            (0.42, {"AngleX": 7, "Param36": 0.6, "ParamBodyAngleX": 3,
+                    "ParamMouthOpenY": 0.3, "ParamMouthForm": 0.6,
+                    "ParamEyeLOpen": 0.95, "ParamEyeROpen": 0.95}),
+            (0.62, {"AngleX": -3, "Param36": 0.3, "ParamBodyAngleX": -1,
+                    "ParamEyeLOpen": 0.7, "ParamEyeROpen": 0.7}),
+            (0.9, {"AngleX": 0, "Param36": 0, "ParamBodyAngleX": 0, "ParamMouthForm": 0.15,
+                   "ParamMouthOpenY": 0, "ParamEyeLOpen": 1, "ParamEyeROpen": 1}),
         ],
     )
 
@@ -119,10 +623,10 @@ def procedural_clips() -> dict[str, dict]:
         1.45,
         [
             (0.0, {"AngleY": 0, "ParamAngleY": 0}),
-            (0.22, {"AngleY": 13, "ParamAngleY": 5, "AngleZ": -3}),
-            (0.48, {"AngleY": -13, "ParamAngleY": -5, "AngleZ": 3}),
-            (0.74, {"AngleY": 10, "ParamAngleY": 4, "AngleZ": -2}),
-            (1.0, {"AngleY": -8, "ParamAngleY": -3, "AngleZ": 2}),
+            (0.22, {"AngleY": 14, "ParamAngleY": 14, "AngleZ": -3}),
+            (0.48, {"AngleY": -14, "ParamAngleY": -14, "AngleZ": 3}),
+            (0.74, {"AngleY": 11, "ParamAngleY": 11, "AngleZ": -2}),
+            (1.0, {"AngleY": -9, "ParamAngleY": -9, "AngleZ": 2}),
             (1.45, {"AngleY": 0, "ParamAngleY": 0, "AngleZ": 0}),
         ],
     )
@@ -130,10 +634,10 @@ def procedural_clips() -> dict[str, dict]:
     clips["tilt"] = _clip(
         2.8,
         [
-            (0.0, {"AngleZ": 0, "CheeckPuff": 0}),
-            (0.55, {"AngleZ": 16, "ParamAngleZ": 6, "AngleY": -4, "CheeckPuff": 0.35,
+            (0.0, {"AngleZ": 0, "ParamAngleZ": 0, "CheeckPuff": 0}),
+            (0.55, {"AngleZ": 17, "ParamAngleZ": 13, "AngleY": -4, "CheeckPuff": 0.35,
                     "ParamMouthForm": 0.55, "ParamEyeLOpen": 0.88, "ParamEyeROpen": 0.88}),
-            (1.9, {"AngleZ": 15, "ParamAngleZ": 6, "AngleY": -4, "CheeckPuff": 0.32,
+            (1.9, {"AngleZ": 16, "ParamAngleZ": 12, "AngleY": -4, "CheeckPuff": 0.32,
                    "ParamMouthForm": 0.5}),
             (2.8, {"AngleZ": 0, "ParamAngleZ": 0, "AngleY": 0, "CheeckPuff": 0,
                    "ParamMouthForm": 0.1}),
@@ -145,7 +649,7 @@ def procedural_clips() -> dict[str, dict]:
     clips["wave_big"] = _clip(
         3.4,
         _wave_frames(high=1.0, start=0.12, end=3.0)
-        + [(3.4, {"Param36": 0, "Movement1": 0, "AngleZ": 0, "AngleY": 0})],
+        + [(3.4, {"Param36": 0, "Movement2": 0, "AngleZ": 0, "AngleY": 0})],
     )
 
     clips["think"] = _clip(
@@ -299,8 +803,8 @@ def procedural_clips() -> dict[str, dict]:
     clips["stretch"] = _clip(
         3.6,
         [
-            (0.0, {"Param36": 0, "Movement1": 0, "Movement2": 0}),
-            (0.5, {"Param36": 1, "Movement1": 1, "Movement2": 0, "LArm": 0.35,
+            (0.0, {"Param36": 0, "Movement2": 0}),
+            (0.5, {"Param36": 1, "Movement2": 1, "LArm": 0.35,
                    "LForearm": -0.3, "AngleX": 9, "AngleY": -4, "ParamMouthOpenY": 0.5,
                    "ParamEyeLOpen": 0.55, "ParamEyeROpen": 0.55, "ParamBodyAngleX": 4}),
             (1.3, {"Param36": 1, "LArm": 0.5, "LForearm": -0.45, "AngleX": 11,
@@ -309,7 +813,7 @@ def procedural_clips() -> dict[str, dict]:
                    "AngleZ": -3, "ParamMouthOpenY": 0.35}),
             (2.8, {"Param36": 0.4, "LArm": 0.1, "LForearm": 0, "AngleX": 2,
                    "ParamMouthOpenY": 0.12, "ParamEyeLOpen": 0.85, "ParamEyeROpen": 0.85}),
-            (3.6, {"Param36": 0, "Movement1": 0, "LArm": 0, "AngleX": 0, "AngleZ": 0,
+            (3.6, {"Param36": 0, "Movement2": 0, "LArm": 0, "AngleX": 0, "AngleZ": 0,
                    "ParamMouthOpenY": 0, "ParamEyeLOpen": 1, "ParamEyeROpen": 1,
                    "ParamBodyAngleX": 0}),
         ],
@@ -318,32 +822,50 @@ def procedural_clips() -> dict[str, dict]:
     clips["bow"] = _clip(
         2.9,
         [
-            (0.0, {"AngleX": 0, "ParamBodyAngleX": 0}),
-            (0.55, {"AngleX": -21, "ParamAngleX": -8, "ParamBodyAngleX": -13, "AngleY": 3,
-                    "ParamEyeLOpen": 0.7, "ParamEyeROpen": 0.7, "ParamMouthForm": -0.1}),
-            (1.8, {"AngleX": -20, "ParamAngleX": -8, "ParamBodyAngleX": -12, "AngleY": 3,
-                   "ParamEyeLOpen": 0.68, "ParamEyeROpen": 0.68}),
-            (2.9, {"AngleX": 0, "ParamAngleX": 0, "ParamBodyAngleX": 0, "AngleY": 0,
+            (0.0, {"AngleX": 0, "ParamAngleX": 0}),
+            (0.55, {"AngleX": -26, "ParamAngleX": -10, "AngleY": 2,
+                    "ParamEyeLOpen": 0.55, "ParamEyeROpen": 0.55, "ParamMouthForm": -0.1}),
+            (1.8, {"AngleX": -25, "ParamAngleX": -10, "AngleY": 2,
+                   "ParamEyeLOpen": 0.52, "ParamEyeROpen": 0.52}),
+            (2.9, {"AngleX": 0, "ParamAngleX": 0, "AngleY": 0,
                    "ParamEyeLOpen": 1, "ParamEyeROpen": 1, "ParamMouthForm": 0.1}),
         ],
     )
 
+    # Clothes1：1 = 短裙，-1 = 长裙。换装动作要停在长裙，不能换完又弹回短裙。
     clips["dress"] = _clip(
         4.6,
         [
             (0.0, {"Clothes1": 1, "AngleZ": 0, "AngleY": 0}),
-            (0.8, {"Clothes1": 0, "AngleZ": 12, "AngleY": 10, "ParamMouthForm": 0.55,
+            (0.8, {"Clothes1": -1, "AngleZ": 12, "AngleY": 10, "ParamMouthForm": 0.55,
                    "ParamEyeLOpen": 0.9, "ParamEyeROpen": 0.9}),
-            (1.5, {"Clothes1": 0, "AngleZ": -14, "AngleY": -12, "ParamBodyAngleZ": -7}),
-            (2.2, {"Clothes1": 0, "AngleZ": 13, "AngleY": 11, "ParamBodyAngleZ": 6}),
-            (2.9, {"Clothes1": 0, "AngleZ": -10, "AngleY": -8, "ParamBodyAngleZ": -4}),
-            (3.6, {"Clothes1": 0, "AngleZ": 5, "AngleY": 4, "ParamBodyAngleZ": 2}),
-            (4.0, {"Clothes1": 1, "AngleZ": 0, "AngleY": 0, "ParamBodyAngleZ": 0,
+            (1.5, {"Clothes1": -1, "AngleZ": -14, "AngleY": -12, "ParamBodyAngleZ": -7}),
+            (2.2, {"Clothes1": -1, "AngleZ": 13, "AngleY": 11, "ParamBodyAngleZ": 6}),
+            (2.9, {"Clothes1": -1, "AngleZ": -10, "AngleY": -8, "ParamBodyAngleZ": -4}),
+            (3.6, {"Clothes1": -1, "AngleZ": 5, "AngleY": 4, "ParamBodyAngleZ": 2}),
+            (4.0, {"Clothes1": -1, "AngleZ": 0, "AngleY": 0, "ParamBodyAngleZ": 0,
                    "ParamMouthForm": 0.2}),
-            (4.6, {"Clothes1": 1, "AngleZ": 0, "AngleY": 0, "ParamMouthForm": 0}),
+            (4.6, {"Clothes1": -1, "AngleZ": 0, "AngleY": 0, "ParamMouthForm": 0}),
         ],
     )
 
+    # 换回短裙：长裙之后想单独换回来，不用把所有动作都清掉。
+    clips["dress_short"] = _clip(
+        3.6,
+        [
+            (0.0, {"Clothes1": -1, "AngleZ": 0, "AngleY": 0}),
+            (0.7, {"Clothes1": 1, "AngleZ": 12, "AngleY": 9, "ParamMouthForm": 0.5,
+                   "ParamEyeLOpen": 0.9, "ParamEyeROpen": 0.9}),
+            (1.3, {"Clothes1": 1, "AngleZ": -13, "AngleY": -10, "ParamBodyAngleZ": -6}),
+            (1.9, {"Clothes1": 1, "AngleZ": 11, "AngleY": 8, "ParamBodyAngleZ": 5}),
+            (2.5, {"Clothes1": 1, "AngleZ": -7, "AngleY": -5, "ParamBodyAngleZ": -3}),
+            (3.0, {"Clothes1": 1, "AngleZ": 3, "AngleY": 2, "ParamBodyAngleZ": 1}),
+            (3.6, {"Clothes1": 1, "AngleZ": 0, "AngleY": 0, "ParamBodyAngleZ": 0,
+                   "ParamMouthForm": 0, "ParamEyeLOpen": 1, "ParamEyeROpen": 1}),
+        ],
+    )
+
+    # Clothes2：0 = 原体型，1 = 最小。变小之后要停在小体型。
     clips["chibi"] = _clip(
         3.9,
         [
@@ -355,8 +877,23 @@ def procedural_clips() -> dict[str, dict]:
             (2.1, {"Clothes2": 1, "AngleZ": -7, "AngleY": -3}),
             (2.6, {"Clothes2": 1, "AngleZ": 4, "AngleY": 2}),
             (3.1, {"Clothes2": 1, "AngleZ": 0, "AngleY": 0, "ParamMouthForm": 0.3}),
-            (3.5, {"Clothes2": 0, "AngleZ": 0, "AngleY": 0}),
-            (3.9, {"Clothes2": 0, "ParamMouthForm": 0}),
+            (3.5, {"Clothes2": 1, "AngleZ": 0, "AngleY": 0}),
+            (3.9, {"Clothes2": 1, "ParamMouthForm": 0}),
+        ],
+    )
+
+    # 变回原来的体型：单独点「变小」之后也能恢复。
+    clips["chibi_normal"] = _clip(
+        2.8,
+        [
+            (0.0, {"Clothes2": 1, "AngleZ": 0}),
+            (0.45, {"Clothes2": 1, "AngleZ": 9, "AngleY": 4, "ParamMouthForm": 0.5,
+                    "ParamEyeLOpen": 0.9, "ParamEyeROpen": 0.9}),
+            (0.9, {"Clothes2": 0, "AngleZ": -9, "AngleY": -4, "ParamMouthForm": 0.6}),
+            (1.5, {"Clothes2": 0, "AngleZ": 5, "AngleY": 2, "ParamMouthForm": 0.3}),
+            (2.1, {"Clothes2": 0, "AngleZ": -2, "ParamMouthForm": 0.1}),
+            (2.8, {"Clothes2": 0, "AngleZ": 0, "AngleY": 0, "ParamMouthForm": 0,
+                   "ParamEyeLOpen": 1, "ParamEyeROpen": 1}),
         ],
     )
 
@@ -392,7 +929,8 @@ def procedural_clips() -> dict[str, dict]:
         ],
     )
 
-    sing_frames = [(0.0, {"ParamMouthOpenY": 0, "ParamMouthForm": 0.3, "AngleZ": 0})]
+    sing_frames = [(0.0, {"ParamMouthOpenY": 0, "ParamMouthForm": 0.3, "AngleZ": 0,
+                          "AngleX": 0, "ParamBodyAngleZ": 0, "ParamBodyAngleX": 0})]
     for index in range(10):
         at = 0.3 + index * 0.36
         sing_frames.append(
@@ -403,12 +941,17 @@ def procedural_clips() -> dict[str, dict]:
                     "ParamMouthForm": 0.45,
                     "AngleZ": 3 if index % 2 else -3,
                     "AngleY": 3 if index % 3 == 0 else -2,
+                    "AngleX": 2 if index % 2 else -4,
+                    "ParamBodyAngleZ": 5 if index % 2 else -5,
+                    "ParamBodyAngleX": 2 if index % 2 else -2,
                     "Param36": 0.18,
                 },
             )
         )
     sing_frames.append((4.3, {"ParamMouthOpenY": 0, "ParamMouthForm": 0.1,
-                              "AngleZ": 0, "AngleY": 0, "Param36": 0}))
+                              "AngleZ": 0, "AngleY": 0, "AngleX": 0,
+                              "ParamBodyAngleZ": 0, "ParamBodyAngleX": 0,
+                              "Param36": 0}))
     clips["sing"] = _clip(4.4, sing_frames)
 
     dance_frames = [(0.0, {"AngleZ": 0, "AngleY": 0, "Param36": 0})]
@@ -425,8 +968,7 @@ def procedural_clips() -> dict[str, dict]:
                         "ParamBodyAngleZ": 6 * side,
                         "AngleX": -3,
                         "Param36": 0.85 if side > 0 else 0.15,
-                        "Movement1": 1 if side > 0 else 0,
-                        "Movement2": 0 if side > 0 else 1,
+                        "Movement2": 1 if side > 0 else 0,
                         "ParamMouthForm": 0.6,
                         "CheeckPuff": 0.2,
                     },
@@ -443,7 +985,7 @@ def procedural_clips() -> dict[str, dict]:
             ]
         )
     dance_frames.append((4.9, {"AngleZ": 0, "AngleY": 0, "ParamBodyAngleZ": 0, "AngleX": 0,
-                               "Param36": 0, "Movement1": 0, "Movement2": 0,
+                               "Param36": 0, "Movement2": 0,
                                "ParamMouthForm": 0.2, "CheeckPuff": 0}))
     clips["dance"] = _clip(5.0, dance_frames)
 
@@ -488,13 +1030,14 @@ def procedural_clips() -> dict[str, dict]:
         ],
     )
 
+    # Clothes5：1 = 尾巴露出，0 及以下 = 收起。藏尾巴要停在收起状态。
     clips["tail_hide"] = _clip(
         2.6,
         [
             (0.0, {"Clothes5": 1}),
             (0.4, {"Clothes5": -1, "AngleZ": 6, "ParamMouthForm": 0.4, "CheeckPuff": 0.2}),
             (1.8, {"Clothes5": -1, "AngleZ": -4, "CheeckPuff": 0.15}),
-            (2.6, {"Clothes5": 1, "AngleZ": 0, "ParamMouthForm": 0.1, "CheeckPuff": 0}),
+            (2.6, {"Clothes5": -1, "AngleZ": 0, "ParamMouthForm": 0.1, "CheeckPuff": 0}),
         ],
     )
 
@@ -510,20 +1053,39 @@ def procedural_clips() -> dict[str, dict]:
         ],
     )
 
-    return clips
+    result: dict[str, dict] = {}
+    articulated = _can_articulate(available_params)
+    static_rig = _is_static_rig(available_params)
+    for name, clip in clips.items():
+        signature = SIGNATURE_PARAMS.get(name)
+        if available_params is not None and signature and signature not in available_params:
+            continue
+        # 手臂/躯干做不了的动作，不放进菜单。
+        if available_params is not None and name in BODY_ACTIONS and not articulated:
+            continue
+        # 静态立绘连头部俯仰都没有，点头也只能靠平移硬凑，不如不显示。
+        if static_rig and name == "nod":
+            continue
+        expanded = _expand_aliases(clip, available_params)
+        filtered = _filter_clip(expanded, available_params)
+        if filtered is not None:
+            result[name] = smooth_clip(filtered)
+    return result
 
 
-def expression_clips(model_dir: Path) -> dict[str, dict]:
-    """把 Exp3 里的表情转成常驻姿势。"""
+def expression_clips(
+    model_dir: Path, available_params: set[str] | None = None
+) -> dict[str, dict]:
+    """把 Exp3 里的表情转成常驻姿势。
+
+    available_params 为 None 时只保留已知前缀（兼容旧模型）；
+    能读到模型参数表时，按真实参数过滤。
+    """
     expressions: dict[str, dict] = {}
     root = Path(model_dir)
     if not root.is_dir():
         return expressions
-    for path in sorted(root.rglob("*.exp3.json")):
-        name = path.name[: -len(".exp3.json")]
-        alias = EXPRESSION_ALIASES.get(name)
-        if alias is None:
-            continue
+    for alias, path in model_expression_files(root):
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
@@ -533,7 +1095,12 @@ def expression_clips(model_dir: Path) -> dict[str, dict]:
             if not isinstance(item, dict):
                 continue
             pid = str(item.get("Id") or "").strip()
-            if not pid or not pid.startswith(KEEP_PARAM_PREFIXES):
+            if not pid:
+                continue
+            if available_params is not None:
+                if pid not in available_params:
+                    continue
+            elif not pid.startswith(KEEP_PARAM_PREFIXES):
                 continue
             try:
                 value = float(item.get("Value", 0.0))
@@ -548,7 +1115,7 @@ def expression_clips(model_dir: Path) -> dict[str, dict]:
     return expressions
 
 
-def motion_clip(path: Path, name: str) -> dict:
+def motion_clip(path: Path, name: str, *, loop: bool | None = None) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     meta = data.get("Meta") or {}
     try:
@@ -582,7 +1149,9 @@ def motion_clip(path: Path, name: str) -> dict:
             key = round(at, 3)
             frames.setdefault(key, {})[pid] = round(value, 4)
     ordered = [(at, params) for at, params in sorted(frames.items())]
-    return _clip(duration, ordered, loop=False)
+    if loop is None:
+        loop = bool(meta.get("Loop") or False)
+    return _clip(duration, ordered, loop=loop)
 
 
 def _segments_to_samples(segments: list, rate: float = 30.0) -> list[tuple[float, float]]:
@@ -626,12 +1195,15 @@ def _segments_to_samples(segments: list, rate: float = 30.0) -> list[tuple[float
             if index + 5 >= len(segments):
                 break
             try:
-                t1 = float(segments[index])
-                v1 = float(segments[index + 1])
-                c1t = float(segments[index + 2])
-                c1v = float(segments[index + 3])
-                c2t = float(segments[index + 4])
-                c2v = float(segments[index + 5])
+                # Cubism 的贝塞尔段是 [1, c1t, c1v, c2t, c2v, t1, v1]：
+                # 前四个是控制点，最后两个才是终点。之前按「终点在前」
+                # 解析，会把控制点当成关键帧，手臂会被甩到错误的位置。
+                c1t = float(segments[index])
+                c1v = float(segments[index + 1])
+                c2t = float(segments[index + 2])
+                c2v = float(segments[index + 3])
+                t1 = float(segments[index + 4])
+                v1 = float(segments[index + 5])
             except (TypeError, ValueError):
                 break
             index += 6
@@ -681,19 +1253,25 @@ def _append_bezier(
 
 
 def build_clips(model_dir: Path) -> tuple[dict[str, dict], dict[str, dict]]:
-    """返回 (动作, 表情)。"""
+    """返回 (动作, 表情)，按模型自己的参数表和动作表适配。"""
     model_dir = Path(model_dir)
-    clips = procedural_clips()
+    params = model_parameters(model_dir)
+    if params is None:
+        params = set(COMMON_PARAMS)
+    clips = procedural_clips(params)
     if model_dir.is_dir():
-        for path in model_dir.rglob("*.motion3.json"):
-            alias = MOTION_ALIASES.get(path.name[: -len(".motion3.json")])
-            if alias is None:
-                continue
+        for alias, path in model_motions(model_dir):
             try:
-                clips[alias] = motion_clip(path, alias)
+                # 作者导出的过渡动作（举手、竖手指、狗尾草等）Meta.Loop 也是 true，
+                # 但它们是「切到某个手型再停住」，无限循环会变成反复伸手又缩回去。
+                # 只有真正的待机动作保留循环。
+                clip = motion_clip(path, alias, loop=alias.startswith("idle"))
             except (OSError, ValueError, TypeError):
                 continue
-    expressions = expression_clips(model_dir)
+            filtered = _filter_clip(clip, params)
+            if filtered is not None:
+                clips[alias] = smooth_clip(filtered)
+    expressions = expression_clips(model_dir, params)
     return clips, expressions
 
 

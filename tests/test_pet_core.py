@@ -320,6 +320,17 @@ class ActionMenuTests(unittest.TestCase):
         callbacks[menu.actions()[0].menu().actions()[0]]()
         self.assertEqual(calls, ["wave"])
 
+        # 子菜单动作必须能通过 QAction.triggered 触发，不能只依赖 exec_ 的返回值。
+        menu.actions()[0].menu().actions()[1].trigger()
+        self.assertEqual(calls, ["wave", "nod"])
+
+    def test_default_actions_also_fire_from_triggered(self) -> None:
+        window, menu = self._bare_window()
+        window.start_action = lambda name, announce=False: window.__dict__.setdefault("_acts", []).append(name)
+        window._fill_action_menu(menu)
+        menu.actions()[0].trigger()
+        self.assertEqual(window._acts, ["hop"])
+
     def test_default_menu_when_plugin_clears(self) -> None:
         window, menu = self._bare_window()
         window.set_action_menu(

@@ -1,6 +1,8 @@
-"""右键「动作」菜单：用深度求索娘自己的动作和表情替换小猫菜单。"""
+"""右键「动作」菜单：用当前皮肤的动作和表情替换小猫菜单。"""
 
 from __future__ import annotations
+
+from .clips import MOTION_HINTS
 
 CLIP_LABELS = {
     "wave": "挥手",
@@ -23,14 +25,16 @@ CLIP_LABELS = {
     "proud": "得意",
     "sigh": "叹气",
     "sing": "唱歌",
-    "dance": "转圈跳舞",
+    "dance": "跳舞",
     "think": "思考",
     "glance": "东张西望",
     "bow": "鞠躬",
     "sneeze": "打喷嚏",
     "wave_big": "用力挥手",
     "dress": "换长裙",
+    "dress_short": "换回短裙",
     "chibi": "变小",
+    "chibi_normal": "变回原样",
     "tail_hide": "藏尾巴",
     "tail_show": "露尾巴",
     "hand_up": "举手",
@@ -68,6 +72,8 @@ EXPRESSION_LABELS = {
     "point_off": "收回食指",
 }
 
+EXTRA_CLIP_LABELS = {alias: label for alias, label in MOTION_HINTS.values()}
+
 GROUPS = (
     ("常用", ("wave", "greet", "nod", "shake", "tilt", "hop", "stretch", "listen")),
     (
@@ -78,34 +84,69 @@ GROUPS = (
     ("表演", ("sing", "dance", "think", "glance", "bow", "sneeze", "wave_big")),
     (
         "换装与小道具",
-        ("dress", "chibi", "tail_hide", "tail_show", "hand_up", "hand_down",
-         "foxtail_out", "foxtail_in", "point_out", "point_in", "special", "idle_motion"),
+        ("dress", "dress_short", "chibi", "chibi_normal", "tail_hide", "tail_show",
+         "hand_up", "hand_down", "foxtail_out", "foxtail_in", "point_out", "point_in",
+         "special", "idle_motion"),
     ),
 )
 
 
-def build_menu(clips, expressions, play, expression, clear_expression) -> list[dict]:
+def clip_label(name: str) -> str:
+    return CLIP_LABELS.get(name) or EXTRA_CLIP_LABELS.get(name) or str(name)
+
+
+def expression_label(name: str) -> str:
+    return EXPRESSION_LABELS.get(name) or str(name)
+
+
+def build_menu(clips, expressions, play, expression, clear_expression, reset_action) -> list[dict]:
     """生成 set_action_menu 需要的分组；只包含模型实际有的动作。"""
     clip_names = set(clips or {})
     expression_names = set(expressions or {})
     groups: list[dict] = []
+    used: set[str] = set()
 
     for title, names in GROUPS:
-        items = [
-            {"label": CLIP_LABELS[name], "callback": (lambda name=name: play(name))}
-            for name in names
-            if name in clip_names
-        ]
+        items = []
+        for name in names:
+            if name not in clip_names:
+                continue
+            used.add(name)
+            items.append({"label": clip_label(name), "callback": (lambda name=name: play(name))})
         if items:
             groups.append({"title": title, "items": items})
 
+    # 其他模型自带的动作，按原文件名放到最后一组。
+    extra = sorted(clip_names - used)
+    if extra:
+        groups.append(
+            {
+                "title": "模型自带",
+                "items": [
+                    {"label": clip_label(name), "callback": (lambda name=name: play(name))}
+                    for name in extra
+                ],
+            }
+        )
+
+    known = [name for name in EXPRESSION_LABELS if name in expression_names]
+    others = sorted(expression_names - set(known))
     expr_items = [
-        {"label": EXPRESSION_LABELS[name], "callback": (lambda name=name: expression(name))}
-        for name in EXPRESSION_LABELS
-        if name in expression_names
+        {"label": expression_label(name), "callback": (lambda name=name: expression(name))}
+        for name in known + others
     ]
     if expr_items:
-        expr_items.append({"label": "恢复默认表情", "callback": clear_expression})
         groups.append({"title": "表情", "items": expr_items})
+
+    # 换装、体型、手型和道具会一直留在身上，给一组统一的还原入口。
+    groups.append(
+        {
+            "title": "还原",
+            "items": [
+                {"label": "还原默认动作", "callback": reset_action},
+                {"label": "还原默认表情", "callback": clear_expression},
+            ],
+        }
+    )
 
     return groups

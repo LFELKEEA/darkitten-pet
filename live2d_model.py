@@ -32,6 +32,21 @@ GL_UNSIGNED_BYTE = 0x1401
 GL_PACK_ALIGNMENT = 0x0D05
 GL_COLOR_BUFFER_BIT = 0x4000
 
+# live2d 的全局初始化只能做一次：换模型会重建渲染线程，
+# 重复 init() / dispose() 会让进程直接崩溃。
+_LIVE2D_INIT_LOCK = threading.Lock()
+_LIVE2D_READY = False
+
+
+def _init_live2d(live2d) -> None:
+    global _LIVE2D_READY
+    with _LIVE2D_INIT_LOCK:
+        if _LIVE2D_READY:
+            return
+        live2d.glInit()
+        live2d.init()
+        _LIVE2D_READY = True
+
 
 class Live2DUnavailable(RuntimeError):
     pass
@@ -105,6 +120,8 @@ class _Clip:
         for pid, track in self._tracks.items():
             track.sort(key=lambda item: item[0])
         self.params = list(self._tracks)
+        # 开关型参数（手型、道具）：混合时只能取两端的值，不能停在中间。
+        self.snap = tuple(str(pid) for pid in (data.get("snap") or ()))
 
     def restart(self) -> None:
         self.time = 0.0
@@ -192,13 +209,19 @@ def _alpha_bounds(raw: bytes, width: int, height: int, threshold: int = 8) -> tu
                 if y > max_y:
                     max_y = y
     if max_x < 0:
-        return 0, 0, width, height
+        # 整帧都是透明的：不能把 0,0,width,height 当成内容边界，
+        # 否则刚换完模型、第一帧还没画出来时会把整块方形画布锁死成裁剪区，
+        # 之后人物就缩在中间一小块里，看起来像消失了。
+        return 0, 0, 0, 0
     # 留一点余量，动作里头部/手臂小幅越界时不会被裁掉。
-    pad = 18
-    left = max(0, min_x - pad)
-    bottom = max(0, min_y - pad)
-    right = min(width, max_x + pad + step)
-    top = min(height, max_y + pad + step)
+    # 横向留得比纵向多：挥手、伸懒腰、跳舞时手臂主要往两侧伸，
+    # 26px 的余量不够，抬手到最高点会被裁掉一截。
+    pad_x = max(32, width // 12)
+    pad_y = max(26, height // 32)
+    left = max(0, min_x - pad_x)
+    bottom = max(0, min_y - pad_y)
+    right = min(width, max_x + pad_x + step)
+    top = min(height, max_y + pad_y + step)
     return left, bottom, max(1, right - left), max(1, top - bottom)
 
 
@@ -247,6 +270,9 @@ class _RenderThread(QThread):
         self._talking = False
         self._sleeping = False
         self._extra: dict[str, float] = {}
+        self._canvas: tuple[float, float] = (1.0, 1.0)
+        self._glfw = None
+        self._window = None
 
     # ---------- 主线程侧 ----------
 
@@ -279,18 +305,58 @@ class _RenderThread(QThread):
                 raise Live2DUnavailable("无法创建隐藏的 OpenGL 窗口。")
             glfw.make_context_current(window)
             glfw.swap_interval(0)
+            self._glfw = glfw
+            self._window = window
 
-            live2d.glInit()
-            live2d.init()
+            _init_live2d(live2d)
 
-            model = live2d.Model()
-            model.LoadModelJson(self.model_path, create_renderer=False)
-            canvas = model.GetCanvasSize()
+            model, canvas = self._build_model(live2d, self.model_path)
+            self._canvas = canvas
+            self._run_loop(model, live2d)
+        except Exception as exc:  # pragma: no cover - 运行环境相关
+            self.failed.emit(str(exc))
+        finally:
+            self._window = None
+            self._glfw = None
+            try:
+                if model is not None:
+                    model.DestroyRenderer()
+            except Exception:
+                pass
+            # 不要在这里释放 live2d 全局状态，也不要 glfw.terminate()。
+            # 换模型时同一个进程会重建渲染线程，dispose()/init() 和
+            # glfw 反复 terminate/init 都会让下一次加载直接崩溃。
+            # 全局状态保留到进程退出，由系统回收。
+            try:
+                if window is not None and glfw is not None:
+                    glfw.destroy_window(window)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _param_defaults(model, params) -> dict[str, float]:
+        """记下每个参数的默认值，用来补齐没有动作覆盖的通道。"""
+        defaults: dict[str, float] = {}
+        for pid in params:
+            try:
+                defaults[pid] = float(model.GetParamDefaultById(pid))
+            except Exception:
+                defaults[pid] = 0.0
+        return defaults
+
+    def _build_model(self, live2d, path: str):
+        """在当前 GL 上下文里加载模型并建好 renderer。"""
+        model = live2d.Model()
+        try:
+            model.LoadModelJson(str(path), create_renderer=False)
+            try:
+                canvas = model.GetCanvasSize()
+            except Exception:
+                canvas = (1.0, 1.0)
             try:
                 model.CreateRenderer(self.mask_count)
             except Exception:
                 model.CreateRenderer(1)
-            # 先用正方形画布，模型按高度自适应；第一帧之后再按内容裁掉透明边。
             model.Resize(self.height, self.height)
             model.SetAutoBreath(False)
             model.SetAutoBlink(False)
@@ -305,34 +371,23 @@ class _RenderThread(QThread):
                     model.SetOffsetY(self.offset[1])
                 except Exception:
                     pass
+        except Exception:
+            try:
+                model.DestroyRenderer()
+            except Exception:
+                pass
+            raise
+        return model, (float(canvas[0]), float(canvas[1]))
 
-            self._canvas = (float(canvas[0]), float(canvas[1]))
-            self._run_loop(model)
-        except Exception as exc:  # pragma: no cover - 运行环境相关
-            self.failed.emit(str(exc))
-        finally:
-            try:
-                if model is not None:
-                    model.DestroyRenderer()
-            except Exception:
-                pass
-            try:
-                if live2d is not None:
-                    live2d.glRelease()
-                    live2d.dispose()
-            except Exception:
-                pass
-            try:
-                if window is not None and glfw is not None:
-                    glfw.destroy_window(window)
-                    glfw.terminate()
-            except Exception:
-                pass
-
-    def _run_loop(self, model) -> None:
+    def _run_loop(self, model, live2d) -> None:
         frame_time = 1.0 / self.fps
         last = time.perf_counter()
         base_time = 0.0
+        # Cubism 的物理弹簧是按固定步长调的。直接喂变化的帧间隔会让
+        # 头发/尾巴/裙摆在 30~120ms 的步长下越振越大，看起来像在抖。
+        # 这里把物理固定按 1/60 秒推进，渲染再按实际帧率出图。
+        physics_step = 1.0 / 60.0
+        physics_acc = 0.0
         blink_at = time.perf_counter() + random.uniform(2.0, 5.0)
         blink_start = -1.0
         clips: list[_Clip] = []
@@ -341,8 +396,11 @@ class _RenderThread(QThread):
         expression_until = -1.0
         extra: dict[str, float] = {}
         crop: tuple[int, int, int, int] | None = None
+        crop_misses = 0
+        detached = False
         full = self.height
         params = set(model.GetParamIds())
+        defaults = self._param_defaults(model, params)
 
         while not self._stop.is_set():
             started = time.perf_counter()
@@ -399,6 +457,79 @@ class _RenderThread(QThread):
                         fading.append(expression)
                     expression = None
                     expression_until = -1.0
+                elif name == "detach":
+                    # 插件卸载/重载时不要销毁渲染线程：反复新建 OpenGL 线程
+                    # 会让下一次加载渲染出全透明画面，人物就像消失了一样。
+                    # 这里只清掉动作和表情，线程留在原地待命，等下一次 load。
+                    fading.extend(clips)
+                    clips = []
+                    if expression is not None:
+                        fading.append(expression)
+                    expression = None
+                    expression_until = -1.0
+                    detached = True
+                elif name == "load":
+                    # 换模型：复用当前渲染线程和 GL 上下文，不再新建线程。
+                    change = payload if isinstance(payload, dict) else {}
+                    new_path = str(change.get("path") or self.model_path)
+                    new_height = max(240, min(1600, int(change.get("height") or self.height)))
+                    new_fps = max(8, min(60, int(change.get("fps") or self.fps)))
+                    new_scale = float(change.get("scale", self.scale))
+                    raw_offset = change.get("offset") or self.offset
+                    try:
+                        new_offset = (float(raw_offset[0]), float(raw_offset[1]))
+                    except (TypeError, ValueError, IndexError):
+                        new_offset = self.offset
+                    old_height, old_fps = self.height, self.fps
+                    old_scale, old_offset = self.scale, self.offset
+                    self.scale, self.offset = new_scale, new_offset
+                    self.height = new_height
+                    self.width = new_height
+                    self.fps = new_fps
+                    if new_height != old_height and self._window is not None and self._glfw is not None:
+                        try:
+                            self._glfw.set_window_size(self._window, self.width, self.height)
+                            self._glfw.make_context_current(self._window)
+                        except Exception:
+                            pass
+                    try:
+                        new_model, new_canvas = self._build_model(live2d, new_path)
+                    except Exception as exc:
+                        self.height, self.fps = old_height, old_fps
+                        self.width = old_height
+                        self.scale, self.offset = old_scale, old_offset
+                        self.failed.emit(f"换模型失败：{exc}")
+                        continue
+                    old_model = model
+                    model = new_model
+                    self.model_path = new_path
+                    self._canvas = new_canvas
+                    full = self.height
+                    frame_time = 1.0 / self.fps
+                    try:
+                        if old_model is not None:
+                            old_model.DestroyRenderer()
+                    except Exception:
+                        pass
+                    params = set(model.GetParamIds())
+                    defaults = self._param_defaults(model, params)
+                    clips = []
+                    fading = []
+                    expression = None
+                    expression_until = -1.0
+                    crop = None
+                    crop_misses = 0
+                    detached = False
+                    physics_acc = 0.0
+                    blink_start = -1.0
+                    blink_at = time.perf_counter() + random.uniform(1.0, 2.6)
+                    with self._lock:
+                        self._clips = {}
+                        self._expressions = {}
+                        self._extra = {}
+                    extra = {}
+                    definitions = {}
+                    expression_defs = {}
                 elif name == "expression":
                     target = str(payload.get("name", ""))
                     data = expression_defs.get(target)
@@ -420,6 +551,11 @@ class _RenderThread(QThread):
                         fading.append(expression)
                     expression = None
                     expression_until = -1.0
+
+            if detached:
+                # 没有模型挂载时保持线程空转，等下一次 load 复用同一个 GL 上下文。
+                time.sleep(frame_time)
+                continue
 
             for item in list(clips):
                 item.advance(dt)
@@ -459,17 +595,39 @@ class _RenderThread(QThread):
                     pose[pid] = base * (1.0 - expression.weight) + value * expression.weight
             for layer in fading + clips:
                 values = layer.value_at(layer.time)
+                snap = layer.snap
                 for pid, value in values.items():
+                    if pid in snap:
+                        # 开关参数不走权重混合，否则淡入过程中会停在两套
+                        # 手型之间，袖口和手会错位。权重过半再整段切换，
+                        # 淡入淡出过程中只会看到默认手和抬起的手二选一。
+                        if layer.weight >= 0.5:
+                            pose[pid] = 1.0 if value >= 0.5 else 0.0
+                        continue
                     base = pose.get(pid, 0.0)
                     pose[pid] = base * (1.0 - layer.weight) + value * layer.weight
 
+            # 淡入淡出会让开关参数停在 0.5，导致两套手型同时出现。
+            # 按中点吸附到最近的一端，动作切换才不会看到残影。
+            for layer in fading + clips:
+                for pid in layer.snap:
+                    if pid in pose:
+                        pose[pid] = 1.0 if pose[pid] >= 0.5 else 0.0
+
             try:
-                # 每帧从模型默认姿势开始，避免上一帧的装饰参数残留。
-                model.ResetAllParameters()
+                # Cubism 的 Update 会把 saved 参数载入并据此计算形变。
+                # 只 SetParamById 再 Update 的话，参数会被载入的旧值覆盖；
+                # 只在 Update 之后 SetParamById 的话，自定义参数几乎不参与形变。
+                # 所以每帧把完整姿势写进 saved 存储，再 Update。
+                for pid in params:
+                    model.SetSaveParamById(
+                        pid, float(pose.get(pid, defaults.get(pid, 0.0)))
+                    )
                 model.Update(dt)
-                for pid, value in pose.items():
-                    model.SetParamById(pid, float(value))
-                model.UpdatePhysics(dt)
+                physics_acc = min(physics_acc + dt, physics_step * 4)
+                while physics_acc >= physics_step:
+                    model.UpdatePhysics(physics_step)
+                    physics_acc -= physics_step
                 _clear_frame(full, full)
                 model.Draw()
             except Exception as exc:  # 渲染一帧失败不终止整个线程
@@ -482,6 +640,14 @@ class _RenderThread(QThread):
                 if crop is None:
                     image = _qimage(raw, full, full)
                     left, bottom, width, height = _alpha_bounds(raw, full, full)
+                    if width < 2 or height < 2:
+                        # 第一帧可能是透明的（新模型刚建好、还没真正画出来），
+                        # 先不锁裁剪区，下一帧再试。
+                        crop_misses += 1
+                        if crop_misses < 240:
+                            time.sleep(frame_time)
+                            continue
+                        left, bottom, width, height = 0, 0, full, full
                     crop = (left, bottom, width, height)
                     self.ready.emit(
                         {
@@ -520,12 +686,12 @@ class _RenderThread(QThread):
         drift = math.sin(t * 0.17 + 1.2)
         breathe = math.sin(t * 1.55)
         pose: dict[str, float] = {
-            "ParamBreath": 0.5 + 0.5 * breathe,
-            "ParamAngleX": 2.4 * sway + 1.1 * drift,
-            "ParamAngleY": 1.2 * math.sin(t * 0.31 + 2.0) - 0.6 * breathe,
-            "ParamAngleZ": 1.7 * math.sin(t * 0.27 + 3.0),
-            "ParamBodyAngleX": 1.5 * sway,
-            "ParamBodyAngleZ": 1.2 * math.sin(t * 0.27 + 3.0),
+            "ParamBreath": 0.45 + 0.35 * breathe,
+            "ParamAngleX": 1.5 * sway + 0.6 * drift,
+            "ParamAngleY": 0.8 * math.sin(t * 0.31 + 2.0) - 0.4 * breathe,
+            "ParamAngleZ": 1.1 * math.sin(t * 0.27 + 3.0),
+            "ParamBodyAngleX": 0.8 * sway,
+            "ParamBodyAngleZ": 0.8 * math.sin(t * 0.27 + 3.0),
             "ParamEyeBallX": 0.0,
             "ParamEyeBallY": 0.0,
             "PupilX": 0.0,
@@ -588,6 +754,7 @@ class Live2DController(QObject):
         self._width = 360
         self._height = 740
         self._resizing = False
+        self._detached = False
 
     # ---------- 状态 ----------
 
@@ -631,8 +798,6 @@ class Live2DController(QObject):
         scale: float = 1.0,
         offset: tuple[float, float] = (0.0, 0.0),
     ) -> bool:
-        if self.is_active:
-            self.unload()
         path = Path(str(model_path)).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"找不到模型文件：{path}")
@@ -641,11 +806,49 @@ class Live2DController(QObject):
             raise Live2DUnavailable(reason)
 
         # 先用正方形画布渲染，线程会按模型实际内容裁掉透明边。
-        self._height = max(240, min(1600, int(height)))
-        self._width = self._height
-        self._fps = max(10, min(60, int(fps)))
-        self._scale = float(scale)
-        self._offset = (float(offset[0]), float(offset[1]))
+        height = max(240, min(1600, int(height)))
+        fps = max(10, min(60, int(fps)))
+        scale = float(scale)
+        offset = (float(offset[0]), float(offset[1]))
+
+        thread = self._thread
+        self._detached = False
+        if thread is not None and thread.isRunning():
+            # 复用正在运行的渲染线程和 GL 上下文，只让它换模型。
+            # 反复销毁/新建线程和 OpenGL 上下文会让进程直接退出。
+            self._height = height
+            self._width = height
+            self._fps = fps
+            self._scale = scale
+            self._offset = offset
+            self._loaded = False
+            self._info = {}
+            self._owner = str(owner or "")
+            self._path = str(path)
+            self._last_error = ""
+            thread.push(
+                "load",
+                {
+                    "path": str(path),
+                    "height": height,
+                    "fps": fps,
+                    "scale": scale,
+                    "offset": offset,
+                },
+            )
+            return True
+
+        # 旧线程可能已经停了，先彻底收尾再新建。
+        if thread is not None:
+            if not self.unload():
+                raise Live2DUnavailable(
+                    "上一个模型还没完全停下来，暂时不能换模型。请稍等几秒再试。"
+                )
+        self._height = height
+        self._width = height
+        self._fps = fps
+        self._scale = scale
+        self._offset = offset
         thread = _RenderThread(
             str(path),
             self._width,
@@ -666,20 +869,54 @@ class Live2DController(QObject):
         thread.start()
         return True
 
-    def unload(self) -> None:
+    def detach(self) -> bool:
+        """卸下当前模型，但保留渲染线程和 GL 上下文。
+
+        插件重载/重新扫描会频繁卸载再加载模型。每次销毁再新建渲染线程，
+        第二次加载会渲染出全透明画面，所以这里只让线程清空动作待命。
+        """
+        thread = self._live_thread()
+        self._loaded = False
+        self._info = {}
+        self._owner = ""
+        self._last_error = ""
+        self._detached = True
+        if thread is not None:
+            thread.push("detach", None)
+        return True
+
+    def unload(self) -> bool:
         thread = self._thread
-        self._thread = None
         self._loaded = False
         self._info = {}
         self._owner = ""
         self._auto_gaze = False
-        if thread is not None:
-            thread.stop()
-            thread.wait(2500)
-            if thread.isRunning():
-                thread.terminate()
-                thread.wait(800)
+        self._detached = False
+        if thread is None:
+            self.failed.emit("")
+            return True
+        # 先断开旧线程的信号，避免它退出前的最后一帧回到已经换掉的模型上。
+        for signal in (thread.frame_ready, thread.ready, thread.failed):
+            try:
+                signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        thread.stop()
+        # 模型加载可能还在 C++ 里跑，给足时间等它自己退出。
+        # 这里不再调用 terminate()：强杀持有 OpenGL 上下文的线程同样会崩溃。
+        stopped = thread.wait(10000)
+        if not stopped:
+            self._thread = thread
+            self._last_error = "上一个模型没有及时停下，请稍后再试。"
+            self.failed.emit(self._last_error)
+            return False
+        self._thread = None
+        try:
+            thread.deleteLater()
+        except RuntimeError:
+            pass
         self.failed.emit("")
+        return True
 
     # ---------- 渲染线程回调 ----------
 

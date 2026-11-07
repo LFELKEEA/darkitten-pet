@@ -319,6 +319,20 @@ class PetWindow(QWidget):
     def _fill_action_menu(self, menu: QMenu) -> dict:
         """填充「动作」菜单，返回 {QAction: 回调}。"""
         callbacks: dict[object, object] = {}
+
+        def bind(action, callback) -> None:
+            callbacks[action] = callback
+
+            def invoke(_checked: bool = False, cb=callback) -> None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+            # 直接连 triggered：部分 Qt 版本里子菜单的 exec_ 返回值
+            # 不一定能按对象身份查回回调，点了会像没反应。
+            action.triggered.connect(invoke)
+
         if self._model_active and self._action_menu_groups:
             for group in self._action_menu_groups:
                 title = str(group.get("title") or "")
@@ -329,7 +343,7 @@ class PetWindow(QWidget):
                     submenu = menu
                 for item in group.get("items") or []:
                     action = submenu.addAction(str(item.get("label") or ""))
-                    callbacks[action] = item.get("callback")
+                    bind(action, item.get("callback"))
             return callbacks
 
         for key, label in (
@@ -341,7 +355,7 @@ class PetWindow(QWidget):
             ("nod", "点点头"),
         ):
             action = menu.addAction(label)
-            callbacks[action] = lambda name=key: self.start_action(name, announce=True)
+            bind(action, lambda name=key: self.start_action(name, announce=True))
         return callbacks
 
     def _line(self, kind: str, choices) -> str:
@@ -839,7 +853,9 @@ class PetWindow(QWidget):
             return True
         if owner and controller.owner and controller.owner != owner:
             return False
-        controller.unload()
+        # 插件卸载/重载只把模型摘下来，保留渲染线程；真正退出时
+        # cleanup() 会调用 controller.unload() 停掉线程。
+        controller.detach()
         self._model_active = False
         self._model_frame = None
         self._model_aspect = 0.0
@@ -862,7 +878,9 @@ class PetWindow(QWidget):
         }
 
     def _on_model_frame(self, image: QImage) -> None:
-        if image.isNull():
+        if image.isNull() or not self._model_active:
+            # 插件卸载后渲染线程还在待命，队列里可能还有一帧旧画面，
+            # 不能再画到桌宠上，否则人物会重新冒出来。
             return
         self._model_frame = image
         self.update()
@@ -902,7 +920,7 @@ class PetWindow(QWidget):
 
         action_menu = menu.addMenu("动作")
         action_menu.setStyleSheet(MENU_STYLE)
-        action_callbacks = self._fill_action_menu(action_menu)
+        self._fill_action_menu(action_menu)
 
         size_menu = menu.addMenu("显示大小")
         size_menu.setStyleSheet(MENU_STYLE)
@@ -949,11 +967,6 @@ class PetWindow(QWidget):
             self.screen_watch_toggled.emit(screen_action.isChecked())
         elif chosen is voice_help_action:
             self.say("按住我别松手，说完再松开，就能直接和我说话。", 5600)
-        elif chosen in action_callbacks:
-            try:
-                action_callbacks[chosen]()
-            except Exception:
-                pass
         elif chosen in size_items:
             self.set_scale(size_items[chosen] / 100.0)
         elif chosen is sleep_action:

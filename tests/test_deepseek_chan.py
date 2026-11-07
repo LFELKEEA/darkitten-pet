@@ -4,7 +4,9 @@ import json
 import math
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -14,18 +16,27 @@ sys.path.insert(0, str(PLUGIN))
 
 from deepseek_chan import lines  # noqa: E402
 from deepseek_chan.clips import (  # noqa: E402
+    HOLD_SUFFIX,
     action_for_host,
     build_clips,
+    build_hold_clips,
     expression_clips,
+    model_expression_files,
+    model_motions,
+    model_parameters,
     motion_clip,
     procedural_clips,
+    smooth_clip,
 )
 from deepseek_chan.menu import GROUPS, build_menu  # noqa: E402
 from deepseek_chan.model_source import (  # noqa: E402
     MODEL_NAME,
+    discover_models,
+    extract_archive,
     extract_zip,
     find_model_file,
     locate,
+    watermark_switch,
 )
 
 REAL_MODEL_DIR = ROOT / "data" / "models" / "deepseek_chan"
@@ -177,6 +188,37 @@ class ClipTests(unittest.TestCase):
                 params.update(key["params"])
             self.assertEqual(params, {"ParamAngleX", "ParamMouthForm"})
 
+    def test_motion_bezier_uses_last_point_as_end(self) -> None:
+        """贝塞尔段是 [1, c1t, c1v, c2t, c2v, t, v]，终点在最后。"""
+        motion = {
+            "Version": 3,
+            "Meta": {"Duration": 0.5, "Fps": 30, "Loop": False},
+            "Curves": [
+                {
+                    "Target": "Parameter",
+                    "Id": "Param41",
+                    "Segments": [
+                        0.0, 0.0,
+                        1, 0.1, 0.0, 0.3, 0.5, 0.4, 1.0,
+                        0, 0.5, 2.0,
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bezier.motion3.json"
+            path.write_text(json.dumps(motion), encoding="utf-8")
+            clip = motion_clip(path, "bezier")
+
+        times = [key["t"] for key in clip["keys"]]
+        values = [key["params"]["Param41"] for key in clip["keys"]]
+        self.assertEqual(times, sorted(times))
+        self.assertAlmostEqual(times[-1], 0.5, places=3)
+        self.assertAlmostEqual(values[-1], 2.0, places=3)
+        # 控制点被误当成终点时，曲线会在 0.1~0.4 之间来回跳。
+        for before, after in zip(values, values[1:]):
+            self.assertGreaterEqual(after + 1e-6, before)
+
     def test_expression_clip_filters_non_model_params(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -190,6 +232,130 @@ class ClipTests(unittest.TestCase):
             self.assertTrue(clip["loop"])
             params = clip["keys"][0]["params"]
             self.assertEqual(set(params), {"key1", "ParamEyeLOpen"})
+
+    def test_actions_drive_custom_input_params_when_present(self) -> None:
+        available = {
+            "ParamBodyAngleX",
+            "ParamBodyAngleXinput",
+            "ParamBodyAngleZ",
+            "ParamBodyAngleZ2input",
+            "ParamAngleX",
+            "Param32x",
+            "Param36",
+        }
+        clips = procedural_clips(available)
+
+        hop = clips["hop"]
+        for key in hop["keys"]:
+            params = key["params"]
+            if "ParamBodyAngleX" in params:
+                self.assertAlmostEqual(
+                    params["ParamBodyAngleXinput"], params["ParamBodyAngleX"]
+                )
+
+        dance = clips["dance"]
+        for key in dance["keys"]:
+            params = key["params"]
+            if "ParamBodyAngleZ" in params:
+                self.assertAlmostEqual(
+                    params["ParamBodyAngleZ2input"], params["ParamBodyAngleZ"]
+                )
+
+        # 点头用标准头部俯仰参数，不能把只存在自定义模型里的 Param32x 当成俯仰。
+        nod = clips["nod"]
+        self.assertTrue(
+            any(abs(key["params"].get("ParamAngleX", 0.0)) >= 9.0 for key in nod["keys"])
+        )
+        for key in nod["keys"]:
+            self.assertNotIn("Param32x", key["params"])
+
+    def test_wave_clips_use_raised_hand_without_prop(self) -> None:
+        """挥手/伸懒腰/跳舞要举空手，不能切成狗尾草手型。"""
+        clips = procedural_clips()
+        for name in ("wave", "greet", "wave_big", "stretch", "dance"):
+            params: set[str] = set()
+            for key in clips[name]["keys"]:
+                params.update(key["params"])
+            self.assertNotIn("Movement1", params, name)
+            self.assertIn("Movement2", params, name)
+            self.assertEqual(
+                clips[name]["snap"], ["Movement1", "Movement2", "Movement3"], name
+            )
+
+    def test_switch_params_do_not_blend(self) -> None:
+        clip = smooth_clip(
+            {
+                "duration": 1.0,
+                "loop": False,
+                "keys": [
+                    {"t": 0.0, "params": {"Movement2": 0.0}},
+                    {"t": 1.0, "params": {"Movement2": 1.0}},
+                ],
+            }
+        )
+        values = {key["params"]["Movement2"] for key in clip["keys"]}
+        self.assertEqual(values, {0.0, 1.0})
+
+    def test_posture_clips_end_in_changed_state(self) -> None:
+        """换装/变小/藏尾巴要停在改变后的状态，否则看起来像没换。"""
+        clips = procedural_clips()
+        last = {name: clips[name]["keys"][-1]["params"] for name in
+                ("dress", "dress_short", "chibi", "chibi_normal", "tail_hide", "tail_show")}
+        self.assertEqual(last["dress"]["Clothes1"], -1)
+        self.assertEqual(last["dress_short"]["Clothes1"], 1)
+        self.assertEqual(last["chibi"]["Clothes2"], 1)
+        self.assertEqual(last["chibi_normal"]["Clothes2"], 0)
+        self.assertEqual(last["tail_hide"]["Clothes5"], -1)
+        self.assertEqual(last["tail_show"]["Clothes5"], 1)
+
+    def test_hold_variants_keep_last_frame(self) -> None:
+        clips = procedural_clips()
+        held = build_hold_clips(clips)
+        for name in ("dress", "dress_short", "chibi", "chibi_normal", "tail_hide", "tail_show"):
+            variant = held[name + HOLD_SUFFIX]
+            self.assertFalse(variant["loop"], name)
+            self.assertGreater(variant["duration"], clips[name]["duration"] + 60, name)
+            self.assertEqual(
+                variant["keys"][-1]["params"], clips[name]["keys"][-1]["params"], name
+            )
+        # 循环动作没有末帧，不该生成保持变体。
+        self.assertNotIn("idle_motion" + HOLD_SUFFIX, held)
+
+    def test_idle_auto_play_only_uses_reversible_poses(self) -> None:
+        from deepseek_chan import service
+
+        auto = set(service.IDLE_GESTURES) | set(service.CUTE_GESTURES) | set(
+            service.POSE_GESTURES
+        )
+        for name in ("dress", "chibi", "tail_hide", "tail_show", "special", "idle_motion"):
+            self.assertNotIn(name, auto, name)
+        for name in ("hand_up", "hand_down", "foxtail_out", "foxtail_in",
+                     "point_out", "point_in"):
+            self.assertIn(name, service.POSE_GESTURES, name)
+
+    def test_static_rig_hides_actions_it_cannot_perform(self) -> None:
+        available = {
+            "ParamAngleX",
+            "ParamAngleY",
+            "ParamAngleZ",
+            "Param32x",
+            "Paramheadxy",
+            "Param_Angle_Rotation1_ArtMesh1",
+            "ParamEyeLOpen",
+            "ParamEyeROpen",
+            "ParamEyeBallX",
+            "ParamEyeBallY",
+            "ParamBrowLY",
+            "ParamBrowRY",
+            "ParamMouthOpenY",
+            "ParamMouthForm",
+            "CheeckPuff",
+        }
+        clips = procedural_clips(available)
+        for name in ("nod", "hop", "wave", "greet", "stretch", "dance", "bow"):
+            self.assertNotIn(name, clips, name)
+        for name in ("shake", "tilt", "glance", "think", "surprise", "sneeze"):
+            self.assertIn(name, clips, name)
 
     def test_host_actions_map_to_real_clips(self) -> None:
         clips = procedural_clips()
@@ -235,11 +401,38 @@ class ClipTests(unittest.TestCase):
         self.assertIn("point_on", expressions)
 
 
+class WatermarkTests(unittest.TestCase):
+    def test_reads_author_switch_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "shuiyin1.exp3.json").write_text(
+                json.dumps({"Parameters": [{"Id": "Paramheadxy", "Value": 30}]}),
+                encoding="utf-8",
+            )
+            (directory / "水印2.exp3.json").write_text(
+                json.dumps({"Parameters": [{"Id": "Paramheadxy3", "Value": 30}]}),
+                encoding="utf-8",
+            )
+            (directory / "red.exp3.json").write_text(
+                json.dumps({"Parameters": [{"Id": "ParamEyeLOpen", "Value": 0}]}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                watermark_switch(directory),
+                {"Paramheadxy": 30.0, "Paramheadxy3": 30.0},
+            )
+
+    def test_missing_directory_is_safe(self) -> None:
+        self.assertEqual(watermark_switch(None), {})
+        self.assertEqual(watermark_switch(Path("definitely-not-here")), {})
+
+
 class MenuTests(unittest.TestCase):
     def test_build_menu_uses_only_available_clips(self) -> None:
         played: list[str] = []
         expressed: list[str] = []
         cleared: list[bool] = []
+        reset: list[bool] = []
 
         clips = {"wave": {}, "nod": {}, "dance": {}, "dress": {}}
         expressions = {"blush": {}, "heart": {}}
@@ -249,29 +442,35 @@ class MenuTests(unittest.TestCase):
             played.append,
             expressed.append,
             lambda: cleared.append(True),
+            lambda: reset.append(True),
         )
 
         titles = [group["title"] for group in groups]
-        self.assertEqual(titles, ["常用", "表演", "换装与小道具", "表情"])
+        self.assertEqual(titles, ["常用", "表演", "换装与小道具", "表情", "还原"])
         labels = [item["label"] for group in groups for item in group["items"]]
         self.assertIn("挥手", labels)
-        self.assertIn("转圈跳舞", labels)
+        self.assertIn("跳舞", labels)
         self.assertIn("换长裙", labels)
-        self.assertIn("恢复默认表情", labels)
+        self.assertIn("还原默认动作", labels)
+        self.assertIn("还原默认表情", labels)
+        self.assertNotIn("恢复默认表情", labels)
         self.assertNotIn("比心", labels)
 
         first = groups[0]["items"][0]
         first["callback"]()
         self.assertEqual(played, ["wave"])
-        groups[-1]["items"][0]["callback"]()
+        groups[3]["items"][0]["callback"]()
         self.assertEqual(expressed, ["blush"])
-        groups[-1]["items"][-1]["callback"]()
+        groups[-1]["items"][0]["callback"]()
+        self.assertEqual(reset, [True])
+        groups[-1]["items"][1]["callback"]()
         self.assertEqual(cleared, [True])
 
     def test_build_menu_hides_groups_without_clips(self) -> None:
-        groups = build_menu({"wave": {}}, {}, lambda _name: None, lambda _name: None, lambda: None)
-        self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0]["title"], "常用")
+        groups = build_menu(
+            {"wave": {}}, {}, lambda _name: None, lambda _name: None, lambda: None, lambda: None
+        )
+        self.assertEqual([group["title"] for group in groups], ["常用", "还原"])
         self.assertEqual([item["label"] for item in groups[0]["items"]], ["挥手"])
 
     def test_every_label_is_chinese_and_complete(self) -> None:
@@ -281,6 +480,76 @@ class MenuTests(unittest.TestCase):
         for label in list(CLIP_LABELS.values()) + list(EXPRESSION_LABELS.values()):
             self.assertTrue(label.strip())
             self.assertTrue(any(ord(char) > 127 for char in label), label)
+
+
+class ServicePlayTests(unittest.TestCase):
+    def _service(self):
+        from deepseek_chan.service import DeepSeekChanService
+
+        service = object.__new__(DeepSeekChanService)
+        service.ready = True
+        service.clips = {
+            "hand_up": {"duration": 1.0, "loop": False, "keys": []},
+            "idle_motion": {"duration": 5.0, "loop": True, "keys": []},
+        }
+        service.hold_clips = {
+            "hand_up" + HOLD_SUFFIX: {"duration": 90000.0, "loop": False, "keys": []}
+        }
+        service._last_action = ""
+        service._played_clips = set()
+        calls = []
+
+        class Model:
+            def play(self, name, **kwargs):
+                calls.append((name, kwargs))
+
+            def stop(self, name):
+                calls.append(("stop:" + name, {}))
+
+        service.api = types.SimpleNamespace(
+            model=Model(),
+            log=lambda *args, **kwargs: None,
+            action=lambda *args, **kwargs: None,
+        )
+        return service, calls
+
+    def test_menu_play_uses_hold_variant(self) -> None:
+        service, calls = self._service()
+        service._play_menu("hand_up")
+        self.assertEqual(calls[0][0], "hand_up" + HOLD_SUFFIX)
+        self.assertFalse(calls[0][1]["loop"])
+
+    def test_idle_play_does_not_hold(self) -> None:
+        service, calls = self._service()
+        service._play("hand_up")
+        self.assertEqual(calls[0][0], "hand_up")
+        self.assertFalse(calls[0][1]["loop"])
+
+    def test_looping_idle_motion_stays_looping(self) -> None:
+        service, calls = self._service()
+        service._play_menu("idle_motion")
+        self.assertEqual(calls[0][0], "idle_motion")
+        self.assertTrue(calls[0][1]["loop"])
+
+    def test_reset_action_stops_played_and_held_clips_only(self) -> None:
+        service, calls = self._service()
+
+        class Expressions:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear_expression(self):
+                self.cleared += 1
+
+        expressions = Expressions()
+        service.api.model.clear_expression = expressions.clear_expression
+        service._play_menu("hand_up")
+        service._reset_action()
+        stopped = [name for name, _ in calls if name.startswith("stop:")]
+        self.assertIn("stop:hand_up" + HOLD_SUFFIX, stopped)
+        # 还原动作不能顺手把表情也清掉。
+        self.assertEqual(expressions.cleared, 0)
+        self.assertEqual(service._played_clips, set())
 
 
 class LinesTests(unittest.TestCase):
@@ -393,10 +662,12 @@ class MenuInstallTests(unittest.TestCase):
 
         service._install_menu()
 
-        self.assertEqual([group["title"] for group in captured], ["常用", "表演", "表情"])
+        self.assertEqual(
+            [group["title"] for group in captured], ["常用", "表演", "表情", "还原"]
+        )
         labels = [item["label"] for group in captured for item in group["items"]]
         self.assertIn("挥手", labels)
-        self.assertIn("恢复默认表情", labels)
+        self.assertIn("还原默认表情", labels)
 
     def test_old_host_without_menu_api_only_logs(self) -> None:
         model = type("Model", (), {"clear_expression": lambda _self: None})()
@@ -405,6 +676,52 @@ class MenuInstallTests(unittest.TestCase):
         service.clips = {"wave": {}}
         service._install_menu()
         self.assertTrue(any("1.4.1" in text for text in logs), logs)
+
+
+class HostActionTests(unittest.TestCase):
+    def _service(self):
+        from types import SimpleNamespace
+
+        from deepseek_chan.service import DeepSeekChanService
+
+        played: list[str] = []
+        actions: list[str] = []
+
+        class Model:
+            def play(self, name, **_kwargs):
+                played.append(name)
+
+            def set_action_menu(self, _groups):
+                return None
+
+        api = SimpleNamespace(
+            manager=SimpleNamespace(pet=object(), data_dir=tempfile.gettempdir()),
+            settings={},
+            storage={},
+            log=lambda *_args, **_kwargs: None,
+            model=Model(),
+            action=lambda name: actions.append(name),
+        )
+        service = DeepSeekChanService(api)
+        service.ready = True
+        service.clips = {"hop": {}, "dance": {}, "nod": {}}
+        return service, played, actions
+
+    def test_hop_and_dance_also_play_host_body_animation(self) -> None:
+        service, played, actions = self._service()
+        service._play("hop")
+        self.assertEqual(played, ["hop"])
+        self.assertEqual(actions, ["hop"])
+        service._play("dance")
+        self.assertEqual(actions, ["hop", "spin"])
+        service._play("nod")
+        self.assertEqual(actions, ["hop", "spin"])
+
+    def test_host_sync_does_not_restart_host_animation(self) -> None:
+        service, played, actions = self._service()
+        service._play("hop", with_host=False)
+        self.assertEqual(played, ["hop"])
+        self.assertEqual(actions, [])
 
 
 class PackagingTests(unittest.TestCase):
@@ -438,6 +755,339 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn("DeepSeek免费公皮.zip", {
             path.name for path in PLUGIN.rglob("*") if path.is_file()
         })
+
+
+GENERIC_PARAMS = [
+    "ParamAngleX",
+    "ParamAngleY",
+    "ParamAngleZ",
+    "ParamBodyAngleX",
+    "ParamBodyAngleZ",
+    "ParamEyeLOpen",
+    "ParamEyeROpen",
+    "ParamEyeBallX",
+    "ParamEyeBallY",
+    "ParamBrowLY",
+    "ParamBrowRY",
+    "ParamMouthOpenY",
+    "ParamMouthForm",
+    "ParamBreath",
+]
+
+GENERIC_MOTION = {
+    "Version": 3,
+    "Meta": {"Duration": 2.0, "Fps": 30, "Loop": True},
+    "Curves": [
+        {"Target": "Parameter", "Id": "ParamAngleX", "Segments": [0.0, 0.0, 0, 1.0, 8.0, 0, 2.0, 0.0]},
+        {"Target": "Parameter", "Id": "ParamEyeLOpen", "Segments": [0.0, 1.0, 0, 2.0, 1.0]},
+    ],
+}
+
+GENERIC_EXPRESSION = {
+    "Type": "Live2D Expression",
+    "Parameters": [
+        {"Id": "ParamEyeLOpen", "Value": 0.2},
+        {"Id": "NotARealParam", "Value": 9.0},
+    ],
+}
+
+
+def _write_generic_model(root: Path, *, with_tables: bool = True) -> Path:
+    """一个没有大肥鱼特征参数的普通模型。"""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "模型.moc3").write_bytes(b"moc3")
+    (root / "tex.png").write_bytes(b"png")
+    (root / "模型.cdi3.json").write_text(
+        json.dumps({"Parameters": [{"Id": name} for name in GENERIC_PARAMS + ["ParamExtra"]]}),
+        encoding="utf-8",
+    )
+    (root / "motions").mkdir()
+    (root / "motions" / "idle.motion3.json").write_text(
+        json.dumps(GENERIC_MOTION), encoding="utf-8"
+    )
+    (root / "motions" / "tap.motion3.json").write_text(
+        json.dumps(GENERIC_MOTION), encoding="utf-8"
+    )
+    (root / "expressions").mkdir()
+    (root / "expressions" / "wink.exp3.json").write_text(
+        json.dumps(GENERIC_EXPRESSION), encoding="utf-8"
+    )
+    data = {
+        "Version": 3,
+        "Groups": [
+            {"Target": "Parameter", "Name": "Param", "Ids": ["ParamAngleX", "ParamEyeLOpen"]}
+        ],
+        "FileReferences": {"DisplayInfo": "模型.cdi3.json"},
+    }
+    if with_tables:
+        data["FileReferences"]["Motions"] = {
+            "Idle": [{"File": "motions/idle.motion3.json"}],
+            "Tap": [{"File": "motions/tap.motion3.json"}],
+        }
+        data["FileReferences"]["Expressions"] = [
+            {"Name": "wink", "File": "expressions/wink.exp3.json"}
+        ]
+    model = root / "模型.model3.json"
+    model.write_text(json.dumps(data), encoding="utf-8")
+    return model
+
+
+class GenericModelTests(unittest.TestCase):
+    def test_parameters_come_from_groups_and_display_info(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "模型"
+            _write_generic_model(root)
+            params = model_parameters(root)
+            self.assertIsNotNone(params)
+            self.assertIn("ParamAngleX", params)
+            self.assertIn("ParamExtra", params)
+            self.assertNotIn("Param36", params)
+
+    def test_signature_actions_are_dropped_for_other_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "模型"
+            _write_generic_model(root)
+            clips, _expressions = build_clips(root)
+
+            self.assertIn("nod", clips)
+            self.assertNotIn("hop", clips)  # 没有手臂/躯干通道，做不出跳跃
+            self.assertNotIn("wave", clips)  # 依赖 Param36
+            self.assertNotIn("dress", clips)  # 依赖 Clothes1
+            self.assertNotIn("shy", clips)  # 依赖 key7
+            self.assertNotIn("pout", clips)  # 依赖 CheeckPuff
+
+            for name, clip in clips.items():
+                self.assertTrue(clip["keys"], name)
+                for key in clip["keys"]:
+                    for pid in key["params"]:
+                        self.assertIn(pid, GENERIC_PARAMS + ["ParamExtra"], f"{name}:{pid}")
+
+    def test_model_tables_supply_motions_and_expressions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "模型"
+            _write_generic_model(root)
+
+            motions = dict(model_motions(root))
+            self.assertIn("idle_motion", motions)
+            self.assertTrue(motions["idle_motion"].name.endswith("idle.motion3.json"))
+
+            expressions = dict(model_expression_files(root))
+            self.assertIn("wink", expressions)
+
+            clips, clips_expressions = build_clips(root)
+            idle = clips["idle_motion"]
+            self.assertTrue(idle["loop"])
+            self.assertAlmostEqual(idle["duration"], 2.0)
+            # 模型导出的过渡动作 Meta.Loop 是 true，但只应播一次，
+            # 否则会反复伸手再缩回去。
+            self.assertFalse(clips["tap"]["loop"])
+            self.assertIn("wink", clips_expressions)
+            params = clips_expressions["wink"]["keys"][0]["params"]
+            self.assertEqual(set(params), {"ParamEyeLOpen"})
+            self.assertNotIn("NotARealParam", params)
+
+    def test_fallback_scan_keeps_known_expression_aliases_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "模型"
+            _write_generic_model(root, with_tables=False)
+            (root / "动画").mkdir()
+            (root / "动画" / "idle.motion3.json").write_text(
+                json.dumps(GENERIC_MOTION), encoding="utf-8"
+            )
+            (root / "Exp3").mkdir()
+            (root / "Exp3" / "脸红.exp3.json").write_text(
+                json.dumps(GENERIC_EXPRESSION), encoding="utf-8"
+            )
+            (root / "Exp3" / "wink.exp3.json").write_text(
+                json.dumps(GENERIC_EXPRESSION), encoding="utf-8"
+            )
+
+            motions = dict(model_motions(root))
+            self.assertIn("idle_motion", motions)
+            expressions = dict(model_expression_files(root))
+            self.assertIn("blush", expressions)
+            self.assertNotIn("wink", expressions)
+
+    def test_all_generated_clips_are_dense(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "模型"
+            _write_generic_model(root)
+            clips, _ = build_clips(root)
+            for name, clip in clips.items():
+                keys = clip["keys"]
+                self.assertGreaterEqual(len(keys), 2, name)
+                for before, after in zip(keys, keys[1:]):
+                    gap = after["t"] - before["t"]
+                    self.assertLessEqual(gap, 0.018, f"{name}: {gap}")
+
+
+class SmoothClipTests(unittest.TestCase):
+    def test_resamples_sparse_keys_at_60hz(self) -> None:
+        clip = {
+            "duration": 1.0,
+            "loop": False,
+            "keys": [
+                {"t": 0.0, "params": {"ParamA": 0.0}},
+                {"t": 0.5, "params": {"ParamA": 1.0}},
+                {"t": 1.0, "params": {"ParamA": 0.0}},
+            ],
+        }
+        smooth = smooth_clip(clip, rate=60.0)
+        self.assertAlmostEqual(smooth["duration"], 1.0)
+        self.assertEqual(len(smooth["keys"]), 61)
+        for before, after in zip(smooth["keys"], smooth["keys"][1:]):
+            self.assertAlmostEqual(after["t"] - before["t"], 1 / 60, delta=0.001)
+
+        # smoothstep 会在中点给出 0.5；Hermite 应该带着速度穿过去。
+        middle = min(smooth["keys"], key=lambda key: abs(key["t"] - 0.25))
+        self.assertGreater(middle["params"]["ParamA"], 0.55)
+
+    def test_loop_seam_has_matching_slope(self) -> None:
+        clip = {
+            "duration": 1.0,
+            "loop": True,
+            "keys": [
+                {"t": 0.0, "params": {"ParamA": 0.0}},
+                {"t": 0.5, "params": {"ParamA": 1.0}},
+                {"t": 1.0, "params": {"ParamA": 0.0}},
+            ],
+        }
+        smooth = smooth_clip(clip, rate=120.0)
+        keys = smooth["keys"]
+        start = keys[1]["params"]["ParamA"] - keys[0]["params"]["ParamA"]
+        end = keys[-1]["params"]["ParamA"] - keys[-2]["params"]["ParamA"]
+        self.assertGreater(start, 0)
+        self.assertLess(end, 0)
+        # 接缝两侧速度方向一致、幅度接近，循环时不会卡顿。
+        self.assertAlmostEqual(abs(start), abs(end), delta=abs(start) * 0.35)
+
+    def test_procedural_clips_are_smoothed(self) -> None:
+        clips = procedural_clips()
+        for name, clip in clips.items():
+            for before, after in zip(clip["keys"], clip["keys"][1:]):
+                gap = after["t"] - before["t"]
+                self.assertLessEqual(gap, 0.018, f"{name}: {gap}")
+
+
+class GenericArchiveTests(unittest.TestCase):
+    def test_extract_any_zipped_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "任意模型.zip"
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr("任意模型/任意.model3.json", "{}")
+                handle.writestr("任意模型/模型.moc3", b"moc3")
+                handle.writestr("任意模型/tex.png", b"png")
+                handle.writestr("任意模型/psd/模型.psd", b"psd")
+            model = extract_archive(archive, tmp_path / "data")
+            self.assertEqual(model.name, "任意.model3.json")
+            self.assertIn("model_", model.parent.name)
+            self.assertTrue((model.parent / "模型.moc3").is_file())
+            self.assertFalse((model.parent / "psd").exists())
+            self.assertTrue((model.parent / ".source.json").is_file())
+
+    def test_scan_finds_rar_and_7z_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "免费模型冰糖.rar").write_bytes(b"rar-bytes")
+            (root / "免费模型艾莲.7z").write_bytes(b"7z-bytes")
+
+            with mock.patch(
+                "deepseek_chan.model_source._legacy_candidates", return_value=[]
+            ):
+                location = locate({"search_dirs": [str(root)]})
+                models = discover_models({"search_dirs": [str(root)]})
+
+            self.assertIsNotNone(location)
+            self.assertIsNotNone(location.archive)
+            self.assertIn(location.archive.name, {"免费模型冰糖.rar", "免费模型艾莲.7z"})
+            archives = {
+                item.archive.name for item in models if item.archive is not None
+            }
+            self.assertEqual(archives, {"免费模型冰糖.rar", "免费模型艾莲.7z"})
+
+    def test_manual_model_folder_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "模型"
+            model = _write_generic_model(root)
+            with mock.patch(
+                "deepseek_chan.model_source._legacy_candidates", return_value=[]
+            ):
+                location = locate({"model_path": str(root)})
+                models = discover_models({"model_path": str(root), "search_dirs": []})
+            self.assertIsNotNone(location)
+            self.assertEqual(location.model, model)
+            self.assertEqual(location.source, "手动指定")
+            self.assertEqual(models[0].model, model)
+
+
+class GenericMenuTests(unittest.TestCase):
+    def test_menu_keeps_model_specific_actions_and_expressions(self) -> None:
+        played: list[str] = []
+        expressed: list[str] = []
+        groups = build_menu(
+            {"nod": {}, "idle_motion": {}, "special_tap": {}},
+            {"blush": {}, "wink": {}},
+            played.append,
+            expressed.append,
+            lambda: None,
+            lambda: None,
+        )
+        titles = [group["title"] for group in groups]
+        self.assertIn("常用", titles)
+        self.assertIn("模型自带", titles)
+        self.assertIn("表情", titles)
+
+        labels = [item["label"] for group in groups for item in group["items"]]
+        self.assertIn("点头", labels)
+        self.assertIn("待机动作", labels)
+        self.assertIn("special_tap", labels)
+        self.assertIn("脸红", labels)
+        self.assertIn("wink", labels)
+        self.assertIn("还原默认表情", labels)
+
+        extra = next(group for group in groups if group["title"] == "模型自带")
+        extra["items"][0]["callback"]()
+        self.assertEqual(played, ["special_tap"])
+
+
+class SettingsMigrationTests(unittest.TestCase):
+    def test_old_30fps_is_bumped_once(self) -> None:
+        from types import SimpleNamespace
+
+        from deepseek_chan.service import DeepSeekChanService
+
+        saved: list[dict] = []
+        api = SimpleNamespace(
+            manager=SimpleNamespace(pet=object(), data_dir=tempfile.gettempdir()),
+            settings={"fps": 30},
+            storage={},
+            save_settings=lambda values: saved.append(dict(values)),
+        )
+        service = DeepSeekChanService(api)
+        service._migrate_settings()
+        self.assertEqual(saved, [{"settings_version": 2, "fps": 60}])
+        self.assertEqual(service.settings["fps"], 60)
+
+        service._migrate_settings()
+        self.assertEqual(len(saved), 1)
+
+    def test_manual_30fps_is_kept_after_migration(self) -> None:
+        from types import SimpleNamespace
+
+        from deepseek_chan.service import DeepSeekChanService
+
+        saved: list[dict] = []
+        api = SimpleNamespace(
+            manager=SimpleNamespace(pet=object(), data_dir=tempfile.gettempdir()),
+            settings={"settings_version": 2, "fps": 30},
+            storage={},
+            save_settings=lambda values: saved.append(dict(values)),
+        )
+        service = DeepSeekChanService(api)
+        service._migrate_settings()
+        self.assertEqual(saved, [])
+        self.assertEqual(service.settings["fps"], 30)
 
 
 if __name__ == "__main__":

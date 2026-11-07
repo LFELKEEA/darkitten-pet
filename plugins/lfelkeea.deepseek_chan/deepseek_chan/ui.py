@@ -47,12 +47,24 @@ class DeepSeekChanDialog(QDialog):
         self.model_label.setWordWrap(True)
         self.model_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         model_layout.addWidget(self.model_label)
+
+        picker = QHBoxLayout()
+        picker.addWidget(QLabel("已发现"))
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(260)
+        self.use_model = QPushButton("使用")
+        picker.addWidget(self.model_combo, 1)
+        picker.addWidget(self.use_model)
+        model_layout.addLayout(picker)
+
         buttons = QHBoxLayout()
         self.pick_model = QPushButton("选择 .model3.json")
-        self.pick_zip = QPushButton("选择 ZIP")
+        self.pick_zip = QPushButton("选择压缩包")
+        self.pick_folder = QPushButton("选择文件夹")
         self.rescan = QPushButton("重新扫描")
         buttons.addWidget(self.pick_model)
         buttons.addWidget(self.pick_zip)
+        buttons.addWidget(self.pick_folder)
         buttons.addWidget(self.rescan)
         buttons.addStretch(1)
         model_layout.addLayout(buttons)
@@ -63,13 +75,19 @@ class DeepSeekChanDialog(QDialog):
         self.idle_check = QCheckBox("待机时随机做小动作")
         self.chatter_check = QCheckBox("偶尔主动说话")
         self.reaction_check = QCheckBox("摸头 / 戳一戳 / 聊天时变表情")
-        self.persona_check = QCheckBox("把 AI 说话风格换成深度求索娘")
+        self.persona_check = QCheckBox("把 AI 说话风格换成深度求索娘（用别的模型时可以关掉）")
         self.gaze_check = QCheckBox("视线跟随鼠标")
+        self.watermark_check = QCheckBox("隐藏模型自带水印（使用作者提供的水印开关）")
+        self.fps_combo = QComboBox()
+        self.fps_combo.addItem("60 帧（更顺）", 60)
+        self.fps_combo.addItem("30 帧（省资源）", 30)
         behavior_layout.addRow(self.idle_check)
         behavior_layout.addRow(self.chatter_check)
         behavior_layout.addRow(self.reaction_check)
         behavior_layout.addRow(self.persona_check)
         behavior_layout.addRow(self.gaze_check)
+        behavior_layout.addRow(self.watermark_check)
+        behavior_layout.addRow("渲染帧率", self.fps_combo)
 
         intervals = QGridLayout()
         intervals.addWidget(QLabel("小动作间隔（秒）"), 0, 0)
@@ -122,6 +140,8 @@ class DeepSeekChanDialog(QDialog):
 
         self.pick_model.clicked.connect(self._pick_model)
         self.pick_zip.clicked.connect(self._pick_zip)
+        self.pick_folder.clicked.connect(self._pick_folder)
+        self.use_model.clicked.connect(self._use_selected)
         self.rescan.clicked.connect(self._rescan)
         self.save_button.clicked.connect(self._save)
         self.close_button.clicked.connect(self.close)
@@ -130,6 +150,7 @@ class DeepSeekChanDialog(QDialog):
         clear_expression.clicked.connect(self._clear_expression)
 
         self._load_values()
+        self._refresh_models()
         self._refresh_status()
 
     def _load_values(self) -> None:
@@ -139,27 +160,54 @@ class DeepSeekChanDialog(QDialog):
         self.reaction_check.setChecked(bool(settings.get("reactions", True)))
         self.persona_check.setChecked(bool(settings.get("persona", True)))
         self.gaze_check.setChecked(bool(settings.get("gaze_follow", True)))
+        self.watermark_check.setChecked(bool(settings.get("hide_watermark", True)))
         self.idle_min.setValue(int(settings.get("idle_min_seconds", 10) or 10))
         self.idle_max.setValue(int(settings.get("idle_max_seconds", 24) or 24))
         self.chatter_min.setValue(int(settings.get("chatter_min_minutes", 4) or 4))
         self.chatter_max.setValue(int(settings.get("chatter_max_minutes", 9) or 9))
+        fps = int(settings.get("fps", 60) or 60)
+        index = self.fps_combo.findData(fps)
+        self.fps_combo.setCurrentIndex(index if index >= 0 else 0)
         self.action_combo.clear()
         self.action_combo.addItems(self.service.available_actions())
         self.expression_combo.clear()
         self.expression_combo.addItems(self.service.available_expressions())
 
+    def _refresh_models(self) -> None:
+        current = str(self.service.model_path or self.service.settings.get("model_path") or "")
+        self.model_combo.clear()
+        try:
+            locations = self.service.available_models()
+        except Exception:
+            locations = []
+        for location in locations:
+            target = location.model or location.archive or location.directory
+            if target is None:
+                continue
+            label = location.label or Path(target).stem
+            text = f"{label}  ·  {location.source}"
+            if location.archive is not None:
+                text += f"（{location.archive.suffix.upper()}）"
+            self.model_combo.addItem(text, str(target))
+        if self.model_combo.count() == 0:
+            self.model_combo.addItem("没有扫描到模型", "")
+        if current:
+            index = self.model_combo.findData(current)
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+
     def _refresh_status(self) -> None:
         model = self.service.model_path
         if self.service.ready and model is not None:
-            self.status.setText("模型运行中")
+            self.status.setText(f"模型运行中：{model.name}")
             self.model_label.setText(str(model))
         elif model is not None:
             self.status.setText("模型加载中…")
             self.model_label.setText(str(model))
         else:
             self.status.setText(
-                "还没找到模型。插件不带模型：去 B 站神宫凉子（UID 13737731）下载 "
-                "DeepSeek免费公皮.zip，放到 D 盘根目录或下载目录，或者手动选择。"
+                "还没找到模型。支持 .model3.json、模型文件夹和 zip / rar / 7z；"
+                "放到 D:\\模型 会自动扫描，也可以手动选择。"
             )
             self.model_label.setText("未加载")
 
@@ -172,10 +220,20 @@ class DeepSeekChanDialog(QDialog):
 
     def _pick_zip(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择模型压缩包", str(Path.home()), "压缩包 (*.zip)"
+            self, "选择模型压缩包", str(Path.home()), "压缩包 (*.zip *.rar *.7z)"
         )
         if path:
             self._apply_model(path)
+
+    def _pick_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择模型文件夹", str(Path.home()))
+        if path:
+            self._apply_model(path)
+
+    def _use_selected(self) -> None:
+        path = self.model_combo.currentData()
+        if path:
+            self._apply_model(str(path))
 
     def _apply_model(self, path: str) -> None:
         self.service.settings["model_path"] = path
@@ -187,6 +245,7 @@ class DeepSeekChanDialog(QDialog):
         self.service.settings["model_path"] = ""
         self.api.save_settings({"model_path": ""})
         self.service.reload_model()
+        self._refresh_models()
         self._refresh_status()
 
     def _save(self) -> None:
@@ -194,12 +253,15 @@ class DeepSeekChanDialog(QDialog):
         high = max(self.idle_min.value(), self.idle_max.value())
         c_low = min(self.chatter_min.value(), self.chatter_max.value())
         c_high = max(self.chatter_min.value(), self.chatter_max.value())
+        old_fps = int(self.service.settings.get("fps", 60) or 60)
         values = {
             "idle_actions": self.idle_check.isChecked(),
             "chatter": self.chatter_check.isChecked(),
             "reactions": self.reaction_check.isChecked(),
             "persona": self.persona_check.isChecked(),
             "gaze_follow": self.gaze_check.isChecked(),
+            "hide_watermark": self.watermark_check.isChecked(),
+            "fps": int(self.fps_combo.currentData() or 60),
             "idle_min_seconds": low,
             "idle_max_seconds": high,
             "chatter_min_minutes": c_low,
@@ -211,6 +273,10 @@ class DeepSeekChanDialog(QDialog):
             self.api.model.follow_cursor(self.gaze_check.isChecked())
         except Exception:
             pass
+        self.service.apply_watermark()
+        if int(values["fps"]) != old_fps and self.service.model_path is not None:
+            # 帧率要重新加载模型才会生效。
+            self.service.reload_model(str(self.service.model_path))
         self.status.setText("设置已保存")
         self._refresh_status()
 
