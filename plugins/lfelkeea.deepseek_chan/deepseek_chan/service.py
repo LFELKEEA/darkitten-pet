@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .clips import action_for_host, build_clips
 from .lines import PERSONA_PROMPT, greeting_for_hour, pick, reaction_line
+from .menu import build_menu
 from .model_source import extract_zip, find_model_file, locate
 
 IDLE_GESTURES = [
@@ -99,6 +100,10 @@ class DeepSeekChanService:
         self._prompt_handle = None
         try:
             self.api.clear_lines()
+        except Exception:
+            pass
+        try:
+            self.api.model.clear_action_menu()
         except Exception:
             pass
         try:
@@ -227,6 +232,8 @@ class DeepSeekChanService:
         except Exception as exc:
             self.api.log(f"定义动作失败：{exc}")
 
+        self._install_menu()
+
         if self.settings.get("persona", True):
             try:
                 self.api.say(greeting_for_hour(datetime.now().hour), 4600)
@@ -243,6 +250,33 @@ class DeepSeekChanService:
 
     def _should_show_credit(self) -> bool:
         return bool(self.settings.get("show_credit_on_first_run", True))
+
+    def _install_menu(self) -> None:
+        setter = getattr(self.api.model, "set_action_menu", None)
+        if setter is None:
+            self.api.log("宿主还不支持替换动作菜单，需要 LFELKEEA 1.4.1 或更新版本")
+            return
+        if not self.clips:
+            return
+        groups = build_menu(
+            self.clips,
+            self.expressions,
+            self._play,
+            self._expression,
+            self._clear_expression,
+        )
+        try:
+            setter(groups)
+        except Exception as exc:
+            self.api.log(f"注册动作菜单失败：{exc}")
+
+    def _clear_expression(self) -> None:
+        if not self.ready:
+            return
+        try:
+            self.api.model.clear_expression()
+        except Exception as exc:
+            self.api.log(f"恢复默认表情失败：{exc}")
 
     # ---------- 每秒心跳 ----------
 

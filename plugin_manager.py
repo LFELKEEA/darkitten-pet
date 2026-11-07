@@ -247,6 +247,25 @@ class PetModelAPI:
             raise PluginError("params 需要 {参数名: 数值} 形式的字典。")
         self._controller().set_params(values)
 
+    # ---------- 右键动作菜单 ----------
+
+    def set_action_menu(self, groups: list[dict[str, Any]]) -> None:
+        """用插件自己的动作/表情替换右键「动作」菜单。
+
+        每项形如 ``{"title": "常用", "items": [{"label": "挥手", "callback": fn}]}``。
+        回调在桌宠主线程执行；模型卸载或插件停止后自动恢复内置菜单。
+        """
+        self.api._require("pet.action")
+        self.api._assert_main_thread()
+        if not isinstance(groups, list):
+            raise PluginError("set_action_menu 需要分组列表。")
+        self.api.manager.pet.set_action_menu(groups, owner=self.api.info.id)
+
+    def clear_action_menu(self) -> None:
+        self.api._require("pet.action")
+        self.api._assert_main_thread()
+        self.api.manager.pet.clear_action_menu(self.api.info.id)
+
 
 class PluginAPI(QObject):
     """暴露给插件作者的受控接口。

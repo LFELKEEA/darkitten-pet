@@ -20,6 +20,7 @@ from deepseek_chan.clips import (  # noqa: E402
     motion_clip,
     procedural_clips,
 )
+from deepseek_chan.menu import GROUPS, build_menu  # noqa: E402
 from deepseek_chan.model_source import (  # noqa: E402
     MODEL_NAME,
     extract_zip,
@@ -232,6 +233,54 @@ class ClipTests(unittest.TestCase):
         self.assertIn("body_small", expressions)
         self.assertIn("tail_off", expressions)
         self.assertIn("point_on", expressions)
+
+
+class MenuTests(unittest.TestCase):
+    def test_build_menu_uses_only_available_clips(self) -> None:
+        played: list[str] = []
+        expressed: list[str] = []
+        cleared: list[bool] = []
+
+        clips = {"wave": {}, "nod": {}, "dance": {}, "dress": {}}
+        expressions = {"blush": {}, "heart": {}}
+        groups = build_menu(
+            clips,
+            expressions,
+            played.append,
+            expressed.append,
+            lambda: cleared.append(True),
+        )
+
+        titles = [group["title"] for group in groups]
+        self.assertEqual(titles, ["常用", "表演", "换装与小道具", "表情"])
+        labels = [item["label"] for group in groups for item in group["items"]]
+        self.assertIn("挥手", labels)
+        self.assertIn("转圈跳舞", labels)
+        self.assertIn("换长裙", labels)
+        self.assertIn("恢复默认表情", labels)
+        self.assertNotIn("比心", labels)
+
+        first = groups[0]["items"][0]
+        first["callback"]()
+        self.assertEqual(played, ["wave"])
+        groups[-1]["items"][0]["callback"]()
+        self.assertEqual(expressed, ["blush"])
+        groups[-1]["items"][-1]["callback"]()
+        self.assertEqual(cleared, [True])
+
+    def test_build_menu_hides_groups_without_clips(self) -> None:
+        groups = build_menu({"wave": {}}, {}, lambda _name: None, lambda _name: None, lambda: None)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["title"], "常用")
+        self.assertEqual([item["label"] for item in groups[0]["items"]], ["挥手"])
+
+    def test_every_label_is_chinese_and_complete(self) -> None:
+        from deepseek_chan.menu import CLIP_LABELS, EXPRESSION_LABELS
+
+        self.assertEqual(set(CLIP_LABELS), {name for _, names in GROUPS for name in names})
+        for label in list(CLIP_LABELS.values()) + list(EXPRESSION_LABELS.values()):
+            self.assertTrue(label.strip())
+            self.assertTrue(any(ord(char) > 127 for char in label), label)
 
 
 class LinesTests(unittest.TestCase):

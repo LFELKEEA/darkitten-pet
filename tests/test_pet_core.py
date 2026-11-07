@@ -35,6 +35,8 @@ class FakePet:
     def __init__(self) -> None:
         self.said: list[str] = []
         self.actions: list[str] = []
+        self.action_menu: list[dict] = []
+        self.action_menu_owner = ""
         self._hidden_by_user = False
         self._sleeping = False
         self._chat_open = False
@@ -46,6 +48,16 @@ class FakePet:
 
     def start_action(self, name: str, announce: bool = True) -> None:
         self.actions.append(name)
+
+    def set_action_menu(self, groups, owner: str = "") -> None:
+        self.action_menu = list(groups or [])
+        self.action_menu_owner = owner
+
+    def clear_action_menu(self, owner: str = "") -> None:
+        if owner and owner != self.action_menu_owner:
+            return
+        self.action_menu = []
+        self.action_menu_owner = ""
 
 
 def write_plugin(
@@ -196,6 +208,34 @@ class PluginTests(unittest.TestCase):
         self.assertFalse(self.manager.has_ui("demo.noui"))
         self.assertFalse(self.manager.open_ui("demo.noui"))
 
+    def test_plugin_can_replace_action_menu(self) -> None:
+        write_plugin(
+            self.plugins_root,
+            "demo.menu",
+            "def setup(api):\n"
+            "    api.model.set_action_menu([\n"
+            "        {'title': '常用', 'items': [{'label': '挥手', 'callback': lambda: None}]},\n"
+            "    ])\n",
+            permissions=["pet.model", "pet.action"],
+        )
+        self.manager.discover()
+        self.assertTrue(self.manager.load_plugin("demo.menu"))
+        self.assertEqual(self.pet.action_menu_owner, "demo.menu")
+        self.assertEqual(self.pet.action_menu[0]["title"], "常用")
+
+    def test_action_menu_needs_permission(self) -> None:
+        write_plugin(
+            self.plugins_root,
+            "demo.nomenu",
+            "def setup(api):\n"
+            "    api.model.set_action_menu([])\n",
+            permissions=["pet.model"],
+        )
+        self.manager.discover()
+        self.assertFalse(self.manager.load_plugin("demo.nomenu"))
+        self.assertIn("pet.action", self.manager.get("demo.nomenu").error)
+        self.assertEqual(self.pet.action_menu, [])
+
     def test_callback_error_is_isolated(self) -> None:
         write_plugin(
             self.plugins_root,
@@ -244,6 +284,70 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(values["interval"], 10)
         self.assertEqual(values["mode"], "at")
         self.assertEqual(values["saved"], 10)
+
+
+class ActionMenuTests(unittest.TestCase):
+    """插件接管右键「动作」菜单，模型下线后要退回小猫自带动作。"""
+
+    def _bare_window(self):
+        from pet import PetWindow
+        from PySide6.QtWidgets import QMenu
+
+        window = PetWindow.__new__(PetWindow)
+        window._action_menu_groups = []
+        window._action_menu_owner = ""
+        window._model_active = False
+        return window, QMenu()
+
+    def test_plugin_groups_replace_default_actions(self) -> None:
+        window, menu = self._bare_window()
+        calls = []
+        groups = [
+            {"title": "常用", "items": [
+                {"label": "挥手", "callback": lambda: calls.append("wave")},
+                {"label": "点头", "callback": lambda: calls.append("nod")},
+            ]},
+            {"title": "表情", "items": [
+                {"label": "脸红", "callback": lambda: calls.append("blush")},
+            ]},
+        ]
+        window.set_action_menu(groups, owner="demo.plugin")
+        window._model_active = True
+
+        callbacks = window._fill_action_menu(menu)
+        labels = [action.text() for action in menu.actions()]
+        self.assertEqual(labels, ["常用", "表情"])
+        callbacks[menu.actions()[0].menu().actions()[0]]()
+        self.assertEqual(calls, ["wave"])
+
+    def test_default_menu_when_plugin_clears(self) -> None:
+        window, menu = self._bare_window()
+        window.set_action_menu(
+            [{"title": "常用", "items": [{"label": "挥手", "callback": lambda: None}]}],
+            owner="demo.plugin",
+        )
+        window._model_active = True
+        window.clear_action_menu("other.plugin")
+        self.assertEqual(len(window._action_menu_groups), 1)
+        window.clear_action_menu("demo.plugin")
+        self.assertEqual(window._action_menu_groups, [])
+
+        callbacks = window._fill_action_menu(menu)
+        labels = [action.text() for action in menu.actions()]
+        self.assertEqual(labels, ["跳一下", "转个圈", "伸个懒腰", "抖抖耳朵", "歪歪头", "点点头"])
+        self.assertEqual(len(callbacks), 6)
+
+    def test_non_callable_items_are_dropped(self) -> None:
+        window, _menu = self._bare_window()
+        window.set_action_menu(
+            [
+                {"title": "", "items": [{"label": "坏项", "callback": None}, {"label": ""}]},
+                {"title": "常用", "items": [{"label": "挥手", "callback": lambda: None}]},
+            ],
+            owner="demo.plugin",
+        )
+        self.assertEqual(len(window._action_menu_groups), 1)
+        self.assertEqual(window._action_menu_groups[0]["title"], "常用")
 
 
 class AIClientTests(unittest.TestCase):

@@ -101,6 +101,8 @@ class PetWindow(QWidget):
         self._gaze_tick = 0
         self._line_override = None
         self._line_override_owner = ""
+        self._action_menu_groups: list[dict] = []
+        self._action_menu_owner = ""
         self._action_name = ""
         self._action_t0 = -1.0
         self._action_duration = 0.0
@@ -280,6 +282,67 @@ class PetWindow(QWidget):
             return
         self._line_override = None
         self._line_override_owner = ""
+
+    def set_action_menu(self, groups, owner: str = "") -> None:
+        """插件可以用自己的动作和表情替换右键的「动作」菜单。
+
+        groups 形如 ``[{"title": "常用", "items": [{"label": "挥手", "callback": fn}]}]``；
+        title 为空时直接挂在「动作」下面。
+        """
+        normalized: list[dict] = []
+        for group in groups or []:
+            if not isinstance(group, dict):
+                continue
+            items: list[dict] = []
+            for item in group.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label") or "").strip()
+                callback = item.get("callback")
+                if label and callable(callback):
+                    items.append({"label": label, "callback": callback})
+            if items:
+                normalized.append(
+                    {"title": str(group.get("title") or "").strip(), "items": items}
+                )
+        if not normalized:
+            return
+        self._action_menu_groups = normalized
+        self._action_menu_owner = str(owner or "")
+
+    def clear_action_menu(self, owner: str = "") -> None:
+        if owner and owner != self._action_menu_owner:
+            return
+        self._action_menu_groups = []
+        self._action_menu_owner = ""
+
+    def _fill_action_menu(self, menu: QMenu) -> dict:
+        """填充「动作」菜单，返回 {QAction: 回调}。"""
+        callbacks: dict[object, object] = {}
+        if self._model_active and self._action_menu_groups:
+            for group in self._action_menu_groups:
+                title = str(group.get("title") or "")
+                if title:
+                    submenu = menu.addMenu(title)
+                    submenu.setStyleSheet(MENU_STYLE)
+                else:
+                    submenu = menu
+                for item in group.get("items") or []:
+                    action = submenu.addAction(str(item.get("label") or ""))
+                    callbacks[action] = item.get("callback")
+            return callbacks
+
+        for key, label in (
+            ("hop", "跳一下"),
+            ("spin", "转个圈"),
+            ("stretch", "伸个懒腰"),
+            ("shake", "抖抖耳朵"),
+            ("lean", "歪歪头"),
+            ("nod", "点点头"),
+        ):
+            action = menu.addAction(label)
+            callbacks[action] = lambda name=key: self.start_action(name, announce=True)
+        return callbacks
 
     def _line(self, kind: str, choices) -> str:
         options = tuple(choices)
@@ -780,6 +843,7 @@ class PetWindow(QWidget):
         self._model_active = False
         self._model_frame = None
         self._model_aspect = 0.0
+        self.clear_action_menu()
         self._apply_metrics()
         self.update()
         return True
@@ -838,17 +902,7 @@ class PetWindow(QWidget):
 
         action_menu = menu.addMenu("动作")
         action_menu.setStyleSheet(MENU_STYLE)
-        action_items: dict[object, str] = {}
-        for key, label in (
-            ("hop", "跳一下"),
-            ("spin", "转个圈"),
-            ("stretch", "伸个懒腰"),
-            ("shake", "抖抖耳朵"),
-            ("lean", "歪歪头"),
-            ("nod", "点点头"),
-        ):
-            act = action_menu.addAction(label)
-            action_items[act] = key
+        action_callbacks = self._fill_action_menu(action_menu)
 
         size_menu = menu.addMenu("显示大小")
         size_menu.setStyleSheet(MENU_STYLE)
@@ -895,8 +949,11 @@ class PetWindow(QWidget):
             self.screen_watch_toggled.emit(screen_action.isChecked())
         elif chosen is voice_help_action:
             self.say("按住我别松手，说完再松开，就能直接和我说话。", 5600)
-        elif chosen in action_items:
-            self.start_action(action_items[chosen], announce=True)
+        elif chosen in action_callbacks:
+            try:
+                action_callbacks[chosen]()
+            except Exception:
+                pass
         elif chosen in size_items:
             self.set_scale(size_items[chosen] / 100.0)
         elif chosen is sleep_action:
@@ -999,6 +1056,8 @@ class PetWindow(QWidget):
             self._live2d = None
         self._model_frame = None
         self._model_active = False
+        self._action_menu_groups = []
+        self._action_menu_owner = ""
 
     def icon(self) -> QIcon:
         avatar = self._assets.get("avatar")
