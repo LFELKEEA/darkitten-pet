@@ -38,6 +38,8 @@ PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,63}$")
 PERMISSION_LABELS = {
     "pet.say": "让桌宠说话",
     "pet.action": "触发桌宠动作",
+    "pet.model": "替换桌宠模型与模型动作",
+    "pet.persona": "替换桌宠内置台词",
     "ai.chat": "调用 AI 对话",
     "chat.context": "向聊天注入上下文",
     "screen.capture": "截取屏幕",
@@ -121,6 +123,131 @@ class _ChatBridge(QObject):
         self.api._finish_chat(self.token, None, error)
 
 
+class PetModelAPI:
+    """Live2D 模型接口。所有调用都在桌宠主线程完成。"""
+
+    def __init__(self, api: "PluginAPI") -> None:
+        self.api = api
+
+    # ---------- 内部 ----------
+
+    def _pet(self):
+        self.api._require("pet.model")
+        self.api._assert_main_thread()
+        return self.api.manager.pet
+
+    def _controller(self):
+        pet = self._pet()
+        controller = getattr(pet, "_live2d", None)
+        if controller is None or not controller.is_active:
+            raise PluginError("模型还没有加载，请先调用 api.model.load(path)。")
+        return controller
+
+    # ---------- 加载 ----------
+
+    @property
+    def available(self) -> bool:
+        try:
+            from live2d_model import runtime_available
+
+            return runtime_available()[0]
+        except Exception:
+            return False
+
+    def load(
+        self,
+        path: str,
+        *,
+        height: int = 720,
+        fps: int = 30,
+        scale: float = 1.0,
+        offset: tuple[float, float] = (0.0, 0.0),
+        follow_cursor: bool = True,
+    ) -> bool:
+        pet = self._pet()
+        model_path = str(path or "").strip()
+        if not model_path:
+            raise PluginError("model.load 需要一个 .model3.json 路径。")
+        return bool(
+            pet.load_live2d(
+                model_path,
+                owner=self.api.info.id,
+                height=max(240, min(1600, int(height))),
+                fps=max(10, min(60, int(fps))),
+                scale=float(scale),
+                offset=(float(offset[0]), float(offset[1])),
+                follow_cursor=bool(follow_cursor),
+            )
+        )
+
+    def unload(self) -> bool:
+        return bool(self._pet().unload_live2d(self.api.info.id))
+
+    @property
+    def info(self) -> dict[str, Any]:
+        return self._pet().model_info()
+
+    # ---------- 动作 ----------
+
+    def define_clips(self, clips: dict[str, Any]) -> None:
+        if not isinstance(clips, dict):
+            raise PluginError("define_clips 需要 {名字: 片段} 形式的字典。")
+        self._controller().define_clips(clips)
+
+    def define_expressions(self, expressions: dict[str, Any]) -> None:
+        if not isinstance(expressions, dict):
+            raise PluginError("define_expressions 需要 {名字: 参数} 形式的字典。")
+        self._controller().define_expressions(expressions)
+
+    def play(
+        self,
+        name: str,
+        *,
+        loop: bool = False,
+        speed: float = 1.0,
+        weight: float = 1.0,
+        restart: bool = True,
+        fade: float = 0.18,
+    ) -> None:
+        self._controller().play(
+            str(name),
+            loop=bool(loop),
+            speed=float(speed),
+            weight=float(weight),
+            restart=bool(restart),
+            fade=float(fade),
+        )
+
+    def stop(self, name: str) -> None:
+        self._controller().stop(str(name))
+
+    def stop_all(self) -> None:
+        self._controller().stop_all()
+
+    def expression(self, name: str, *, fade: float = 0.3, hold: float = 0.0) -> None:
+        self._controller().set_expression(str(name), fade=float(fade), hold=float(hold))
+
+    def clear_expression(self) -> None:
+        self._controller().clear_expression()
+
+    def gaze(self, x: float, y: float) -> None:
+        self._controller().set_gaze(float(x), float(y))
+
+    def follow_cursor(self, enabled: bool = True) -> None:
+        self._controller().set_follow_cursor(bool(enabled))
+
+    def talk(self, enabled: bool) -> None:
+        self._controller().set_talking(bool(enabled))
+
+    def sleep(self, enabled: bool) -> None:
+        self._controller().set_sleeping(bool(enabled))
+
+    def params(self, values: dict[str, float]) -> None:
+        if not isinstance(values, dict):
+            raise PluginError("params 需要 {参数名: 数值} 形式的字典。")
+        self._controller().set_params(values)
+
+
 class PluginAPI(QObject):
     """暴露给插件作者的受控接口。
 
@@ -139,6 +266,7 @@ class PluginAPI(QObject):
         self._bridges: dict[int, _ChatBridge] = {}
         self._request_seq = 0
         self._storage: dict[str, Any] | None = None
+        self._model_api: "PetModelAPI | None" = None
 
     # ---------- 基础工具 ----------
 
@@ -176,6 +304,29 @@ class PluginAPI(QObject):
         if name not in specs:
             raise PluginError(f"未知动作：{name}")
         self.manager.pet.start_action(name, announce=True)
+
+    @property
+    def model(self) -> PetModelAPI:
+        self._require("pet.model")
+        if self._model_api is None:
+            self._model_api = PetModelAPI(self)
+        return self._model_api
+
+    def set_lines(self, callback: Callable[[str, tuple[str, ...]], str]) -> None:
+        """替换桌宠的内置台词（闲聊、摸头、戳一戳、动作、睡觉等）。
+
+        callback(kind, choices) 返回要显示的文本；返回空字符串则沿用原台词。
+        """
+        self._require("pet.persona")
+        self._assert_main_thread()
+        if not callable(callback):
+            raise PluginError("set_lines 的 callback 必须可调用。")
+        self.manager.pet.set_line_override(callback, self.info.id)
+
+    def clear_lines(self) -> None:
+        self._require("pet.persona")
+        self._assert_main_thread()
+        self.manager.pet.clear_line_override(self.info.id)
 
     # ---------- AI ----------
 
@@ -336,6 +487,16 @@ class PluginAPI(QObject):
         self._handlers.clear()
         try:
             self.manager.unregister_prompt_provider(self.info.id)
+        except Exception:
+            pass
+        if self._model_api is not None:
+            try:
+                self.manager.pet.unload_live2d(self.info.id)
+            except Exception:
+                pass
+            self._model_api = None
+        try:
+            self.manager.pet.clear_line_override(self.info.id)
         except Exception:
             pass
 

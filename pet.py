@@ -12,6 +12,7 @@ from PySide6.QtGui import (
     QCursor,
     QGuiApplication,
     QIcon,
+    QImage,
     QPainter,
     QPixmap,
     QRegion,
@@ -92,6 +93,14 @@ class PetWindow(QWidget):
         self._draw_rect = QRectF()
         self._mask_cleared = False
         self._hit_region = QRegion()
+        self._live2d = None
+        self._model_frame: QImage | None = None
+        self._model_aspect = 0.0
+        self._model_active = False
+        self._talk_token = 0
+        self._gaze_tick = 0
+        self._line_override = None
+        self._line_override_owner = ""
         self._action_name = ""
         self._action_t0 = -1.0
         self._action_duration = 0.0
@@ -177,7 +186,10 @@ class PetWindow(QWidget):
         area = screen.availableGeometry()
         height = int(self._base_height * self.scale_factor)
         height = min(height, int(area.height() * 0.62))
-        aspect = self._pix_normal.width() / max(1, self._pix_normal.height())
+        if self._model_active and self._model_aspect > 0.05:
+            aspect = self._model_aspect
+        else:
+            aspect = self._pix_normal.width() / max(1, self._pix_normal.height())
         width = max(120, int(height * aspect))
         window_w = width + self.margin * 2
         window_h = height + self.margin * 2
@@ -204,6 +216,10 @@ class PetWindow(QWidget):
 
     def _update_mask(self) -> None:
         if self._mask_cleared:
+            return
+        if self._model_active:
+            # Live2D 的轮廓每帧都在动，命中区按绘制区算，避免每帧重算区域卡顿。
+            self._hit_region = QRegion(self._draw_rect.toRect())
             return
         bitmap = self._scaled_normal.mask()
         base = QRegion(bitmap)
@@ -254,10 +270,55 @@ class PetWindow(QWidget):
             self.y() + int(self._draw_rect.top() + self._draw_rect.height() * 0.12),
         )
 
+    def set_line_override(self, callback, owner: str = "") -> None:
+        """插件可以替换内置台词。callback(kind, choices) 返回字符串或空。"""
+        self._line_override = callback
+        self._line_override_owner = str(owner or "")
+
+    def clear_line_override(self, owner: str = "") -> None:
+        if owner and owner != self._line_override_owner:
+            return
+        self._line_override = None
+        self._line_override_owner = ""
+
+    def _line(self, kind: str, choices) -> str:
+        options = tuple(choices)
+        if self._line_override is not None:
+            try:
+                text = self._line_override(kind, options)
+            except Exception:
+                text = ""
+            text = str(text or "").strip()
+            if text:
+                return text
+        return random.choice(options)
+
+    @property
+    def current_action(self) -> str:
+        return self._action_name
+
+    @property
+    def sleeping(self) -> bool:
+        return self._sleeping
+
     def say(self, text: str, duration: int = 5200) -> None:
         if self._hidden_by_user:
             return
         self.bubble.show_text(text, self._visible_rect(), duration)
+        if self._live2d is not None and self._live2d.is_active:
+            self._live2d.set_talking(True)
+            self._talk_token += 1
+            token = self._talk_token
+            QTimer.singleShot(
+                max(600, min(5200, int(duration))),
+                lambda: self._stop_talking(token),
+            )
+
+    def _stop_talking(self, token: int) -> None:
+        if token != self._talk_token:
+            return
+        if self._live2d is not None:
+            self._live2d.set_talking(False)
 
     def _schedule_blink(self) -> None:
         self._blink_timer.start(random.randint(3200, 7600))
@@ -312,7 +373,7 @@ class PetWindow(QWidget):
             and self._chatter_level() != "off"
             and time.monotonic() - self._last_interaction > 55
         ):
-            self.say(random.choice(IDLE_LINES), 4800)
+            self.say(self._line("idle", IDLE_LINES), 4800)
             self._last_interaction = time.monotonic()
         self._schedule_chatter()
 
@@ -331,16 +392,18 @@ class PetWindow(QWidget):
             return
         self._sleeping = sleeping
         self._manual_sleep = sleeping and not auto
+        if self._live2d is not None:
+            self._live2d.set_sleeping(sleeping)
         self.effects.set_sleeping(sleeping)
         if sleeping:
             self._cancel_voice_hold(notify=True)
             self._finish_action()
             self._chatter_timer.stop()
-            self.say(random.choice(SLEEP_LINES), 4200)
+            self.say(self._line("sleep", SLEEP_LINES), 4200)
         else:
             self.effects.emit_sparkles(6)
             self._last_interaction = time.monotonic()
-            self.say(random.choice(WAKE_LINES), 3800)
+            self.say(self._line("wake", WAKE_LINES), 3800)
             self._schedule_chatter()
         self.update()
 
@@ -353,7 +416,23 @@ class PetWindow(QWidget):
         if self._action_t0 >= 0 and now - self._action_t0 >= self._action_duration:
             self._finish_action()
         self._drag_tilt += (self._drag_tilt_target - self._drag_tilt) * 0.18
+        self._gaze_tick += 1
+        if self._gaze_tick % 5 == 0:
+            self._update_gaze()
         self.update()
+
+    def _update_gaze(self) -> None:
+        controller = self._live2d
+        if controller is None or not controller.is_active or not controller.auto_gaze:
+            return
+        cursor = QCursor.pos()
+        center_x = self.x() + self.width() / 2.0
+        center_y = self.y() + self._draw_rect.top() + self._draw_rect.height() * 0.16
+        span_x = max(120.0, self.width() * 0.9)
+        span_y = max(120.0, self.height() * 0.6)
+        gx = max(-1.0, min(1.0, (cursor.x() - center_x) / span_x))
+        gy = max(-1.0, min(1.0, (center_y - cursor.y()) / span_y))
+        controller.set_gaze(gx, gy)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -364,7 +443,9 @@ class PetWindow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         now = self._clock.elapsed() / 1000.0
-        bob = math.sin(now * 1.9) * 2.2
+        model_frame = self._model_frame if self._model_active else None
+        bob_amount = 1.1 if model_frame is not None else 2.2
+        bob = math.sin(now * 1.9) * bob_amount
         sway = math.sin(now * 0.72) * 0.85
         breath_y = 1.0 - math.sin(now * 1.9) * 0.006
         breath_x = 1.0 + math.sin(now * 1.9) * 0.004
@@ -387,7 +468,6 @@ class PetWindow(QWidget):
         pixmap = self._scaled_blink if blinking else self._scaled_normal
         if self._sleeping:
             painter.setOpacity(0.94)
-
         action_dx = 0.0
         action_dy = 0.0
         action_angle = 0.0
@@ -424,7 +504,10 @@ class PetWindow(QWidget):
         painter.rotate(sway + action_angle)
         painter.scale(breath_x * action_sx, breath_y * action_sy)
         target = QRectF(-width / 2.0, -height, width, height)
-        painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
+        if model_frame is not None and not model_frame.isNull():
+            painter.drawImage(target, model_frame)
+        else:
+            painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
 
     def _trigger_bounce(self) -> None:
         self._bounce_t0 = self._clock.elapsed() / 1000.0
@@ -450,7 +533,7 @@ class PetWindow(QWidget):
         if announce:
             self._last_interaction = time.monotonic()
             if name in ACTION_LINES:
-                self.say(random.choice(ACTION_LINES[name]), 3400)
+                self.say(self._line("action:" + name, ACTION_LINES[name]), 3400)
         self.update()
 
     def _finish_action(self) -> None:
@@ -471,7 +554,7 @@ class PetWindow(QWidget):
         head = self._head_global()
         local = QPointF(head.x() - self.effects.x(), head.y() - self.effects.y())
         self.effects.emit_hearts(local, 7)
-        self.say(random.choice(PAT_LINES), 4800)
+        self.say(self._line("pat", PAT_LINES), 4800)
         self.petted.emit()
 
     def _poke(self) -> None:
@@ -481,7 +564,7 @@ class PetWindow(QWidget):
         self.effects.follow(self._global_rect())
         local = QPointF(self.width() * 0.5, self.height() * 0.55)
         self.effects.emit_sparkles(6)
-        self.say(random.choice(POKE_LINES), 4200)
+        self.say(self._line("poke", POKE_LINES), 4200)
         self.poked.emit()
 
     def _single_click(self, click_local: QPoint, token: int) -> None:
@@ -604,7 +687,7 @@ class PetWindow(QWidget):
                 self.config.set("position", [self.x(), self.y()], save=True)
                 self.effects.follow(self._global_rect())
                 if random.random() < 0.45:
-                    self.say(random.choice(DRAG_LINES), 3800)
+                    self.say(self._line("drag", DRAG_LINES), 3800)
                 event.accept()
                 return
             token = self._pending_click_token + 1
@@ -621,7 +704,7 @@ class PetWindow(QWidget):
             self._wake()
             self._last_interaction = time.monotonic()
             self._trigger_bounce()
-            self.say(random.choice(CHAT_OPEN_LINES), 3200)
+            self.say(self._line("chat_open", CHAT_OPEN_LINES), 3200)
             self.chat_requested.emit()
             event.accept()
             return
@@ -648,6 +731,96 @@ class PetWindow(QWidget):
         self.effects.follow(self._global_rect())
         self.scale_changed.emit(new_scale)
         self.say(f"大小：{int(new_scale * 100)}%", 2400)
+
+    # ---------- Live2D 模型 ----------
+
+    def _ensure_live2d(self):
+        if self._live2d is not None:
+            return self._live2d
+        from live2d_model import Live2DController
+
+        controller = Live2DController(self)
+        controller.frame_ready.connect(self._on_model_frame)
+        controller.loaded.connect(self._on_model_loaded)
+        controller.failed.connect(self._on_model_failed)
+        self._live2d = controller
+        return controller
+
+    def load_live2d(
+        self,
+        path: str,
+        *,
+        owner: str = "",
+        height: int = 720,
+        fps: int = 30,
+        scale: float = 1.0,
+        offset: tuple[float, float] = (0.0, 0.0),
+        follow_cursor: bool = True,
+    ) -> bool:
+        controller = self._ensure_live2d()
+        controller.set_follow_cursor(bool(follow_cursor))
+        controller.set_sleeping(self._sleeping)
+        controller.load(
+            path,
+            owner=owner,
+            height=height,
+            fps=fps,
+            scale=scale,
+            offset=offset,
+        )
+        return True
+
+    def unload_live2d(self, owner: str = "") -> bool:
+        controller = self._live2d
+        if controller is None:
+            return True
+        if owner and controller.owner and controller.owner != owner:
+            return False
+        controller.unload()
+        self._model_active = False
+        self._model_frame = None
+        self._model_aspect = 0.0
+        self._apply_metrics()
+        self.update()
+        return True
+
+    def model_info(self) -> dict:
+        controller = self._live2d
+        if controller is None:
+            return {"active": False, "owner": "", "width": 0, "height": 0}
+        info = controller.info
+        return {
+            "active": controller.is_active,
+            "owner": controller.owner,
+            "width": int(info.get("width") or 0),
+            "height": int(info.get("height") or 0),
+            "error": controller.last_error,
+        }
+
+    def _on_model_frame(self, image: QImage) -> None:
+        if image.isNull():
+            return
+        self._model_frame = image
+        self.update()
+
+    def _on_model_loaded(self, info: dict) -> None:
+        width = float(info.get("width") or 0)
+        height = float(info.get("height") or 0)
+        if height > 1 and width > 1:
+            self._model_aspect = width / height
+        self._model_active = True
+        self._mask_cleared = False
+        self._apply_metrics()
+        self.update()
+
+    def _on_model_failed(self, message: str) -> None:
+        if not message:
+            return
+        self._model_active = False
+        self._model_frame = None
+        self._model_aspect = 0.0
+        self._apply_metrics()
+        self.update()
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         self._pending_click_token += 1
@@ -821,6 +994,11 @@ class PetWindow(QWidget):
         self.bubble.hide_now()
         self.bubble.close()
         self.effects.close()
+        if self._live2d is not None:
+            self._live2d.unload()
+            self._live2d = None
+        self._model_frame = None
+        self._model_active = False
 
     def icon(self) -> QIcon:
         avatar = self._assets.get("avatar")

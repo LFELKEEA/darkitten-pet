@@ -9,6 +9,9 @@ _example_plugins = sorted(
     name for name in os.listdir(_plugin_root) if name.startswith('example.')
 )
 datas = [('assets', 'assets'), ('docs', 'docs'), ('version.json', '.')]
+# Live2D 运行库随包分发，插件运行时从 exe 同级目录加载。
+if os.path.isdir(os.path.join(SPECPATH, 'vendor')):
+    datas.append(('vendor', 'vendor'))
 for _name in _example_plugins:
     datas.append((os.path.join('plugins', _name), os.path.join('plugins', _name)))
 datas += collect_data_files('_sounddevice_data')

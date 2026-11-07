@@ -2,9 +2,9 @@
 
 住在 Windows 桌面上的白发红瞳猫耳少女。支持 AI 聊天、长按语音对话、主动搭话、定时观察屏幕，以及本地插件扩展。
 
-当前源码版本：`1.3.5`。
+当前源码版本：`1.4.0`。
 
-- 下载安装包：[pet-v1.3.5](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.3.5)
+- 下载安装包：[pet-v1.4.0](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.4.0)
 - 插件库：[lfelkeea.github.io/darkitten-launcher/plugins.html](https://lfelkeea.github.io/darkitten-launcher/plugins.html)
 - 插件源码：[`plugins/`](plugins)（示例插件、专注守护、QQ 桥接）
 
@@ -20,11 +20,22 @@
   - `ocr`：本地 Windows OCR 识别屏幕文字，再把文字交给 AI。
   - `auto`：当前模型支持视觉时用截图，否则用窗口标题。
   - 隐私闸门：敏感窗口、全屏应用、聊天中、语音中、刚和桌宠互动过时自动跳过。
+- **Live2D 换装**：1.4.0 起插件可以通过 `pet.model` 接口换 Live2D 模型、注册动作和表情，通过 `pet.persona` 替换台词与 AI 人格。运行库随包放在 `vendor/`（live2d-py + GLFW），不需要单独安装。
 - **插件系统**：`data/plugins/` 下的本地 Python 插件，带权限声明、事件、定时器、AI、截屏、设置和存储 API。
 - 插件管理界面：启用/停用/重载、删除（移入回收站并清理配置和状态）、权限展示、错误隔离、日志。
 - **插件市场**：从插件管理点「插件市场」，浏览站点全部插件，查看版本、权限和外部依赖，直接下载安装；安装后默认不运行，需要手动启用。
 - **自动更新**：从站点清单检查桌宠新版本，下载后校验 SHA-256，退出时由隐藏脚本替换程序文件并自动重启，`data/` 完整保留。右键桌宠、托盘菜单、设置页都能手动检查更新。
 - **插件更新**：读取插件库 `plugins.json`，支持单个或全部更新；同样校验 SHA-256，更新前自动备份旧插件。
+
+## Live2D 模型从哪来
+
+桌宠、插件和发布包都**不附带 Live2D 模型文件**。需要「深度求索娘（大肥鱼）」皮肤时：
+
+1. 到 B 站 **神宫凉子（UID：13737731）** 的主页下载 `DeepSeek免费公皮.zip`；
+2. 把 ZIP 放到 `D:\` 根目录、下载目录或桌面目录，插件会自动识别并解到 `data/models/deepseek_chan/`；
+3. 也可以安装 `plugins/lfelkeea.deepseek_chan` 后，在插件设置里手动选择 ZIP 或 `.model3.json`。
+
+原画及拆分：神宫凉子；Live2D 建模：霓虹猫_NeonNeko。粉丝二创，非 DeepSeek 官方形象。请不要把模型文件重新上传到网盘或素材站。
 
 ## 目录
 
@@ -33,6 +44,7 @@ desktop_pet/
 ├─ main.py                 # 入口，单实例
 ├─ app.py                  # 应用控制器，接线桌宠/聊天/语音/屏幕/插件
 ├─ pet.py                  # 桌宠窗口
+├─ live2d_model.py         # Live2D 渲染、动作片段与表情
 ├─ chat.py                 # 聊天窗口
 ├─ voice.py                # 录音与语音识别
 ├─ screen_watcher.py       # 屏幕观察、OCR、视觉请求
@@ -53,6 +65,7 @@ desktop_pet/
 ├─ plugins/                # 内置示例插件（首次运行复制到 data/plugins）
 ├─ docs/                   # 插件开发文档
 ├─ tests/                  # 单元测试与冒烟测试
+├─ vendor/                 # Live2D 运行库（live2d-py、GLFW）
 └─ LFELKEEA.spec           # PyInstaller 打包配置
 ```
 
