@@ -363,6 +363,50 @@ class OldHostTests(unittest.TestCase):
             self.assertIn("1.4.0", api.said[0])
 
 
+class MenuInstallTests(unittest.TestCase):
+    def _service(self, model):
+        from types import SimpleNamespace
+
+        from deepseek_chan.service import DeepSeekChanService
+
+        logs: list[str] = []
+        api = SimpleNamespace(
+            manager=SimpleNamespace(pet=object(), data_dir=tempfile.gettempdir()),
+            settings={},
+            storage={},
+            log=lambda text, *_args, **_kwargs: logs.append(str(text)),
+            say=lambda *_args, **_kwargs: None,
+            model=model,
+        )
+        return DeepSeekChanService(api), logs
+
+    def test_installs_groups_on_new_host(self) -> None:
+        captured: list[dict] = []
+        model = type("Model", (), {
+            "set_action_menu": lambda _self, groups: captured.extend(groups),
+            "clear_expression": lambda _self: None,
+        })()
+        service, _logs = self._service(model)
+        service.ready = True
+        service.clips = {"wave": {}, "nod": {}, "dance": {}}
+        service.expressions = {"blush": {}}
+
+        service._install_menu()
+
+        self.assertEqual([group["title"] for group in captured], ["常用", "表演", "表情"])
+        labels = [item["label"] for group in captured for item in group["items"]]
+        self.assertIn("挥手", labels)
+        self.assertIn("恢复默认表情", labels)
+
+    def test_old_host_without_menu_api_only_logs(self) -> None:
+        model = type("Model", (), {"clear_expression": lambda _self: None})()
+        service, logs = self._service(model)
+        service.ready = True
+        service.clips = {"wave": {}}
+        service._install_menu()
+        self.assertTrue(any("1.4.1" in text for text in logs), logs)
+
+
 class PackagingTests(unittest.TestCase):
     def test_plugin_ships_without_model_assets(self) -> None:
         banned = {".moc3", ".png", ".zip", ".psd", ".jpg", ".jpeg", ".wav", ".mp3"}
