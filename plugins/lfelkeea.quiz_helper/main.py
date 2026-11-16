@@ -105,6 +105,7 @@ _state: dict[str, Any] = {
     "busy": False,
     "seq": 0,
     "stage": "",
+    "ocr_failed": False,
     "ocr": None,
     "frame": None,
     "window": None,
@@ -168,6 +169,7 @@ def setup(api) -> None:
             "busy": False,
             "seq": 0,
             "stage": "",
+            "ocr_failed": False,
             "ocr": None,
             "frame": None,
             "window": None,
@@ -210,6 +212,7 @@ def teardown() -> None:
     _state["busy"] = False
     _state["seq"] = int(_state.get("seq") or 0) + 1
     _state["stage"] = ""
+    _state["ocr_failed"] = False
 
     task = _state.get("ocr")
     _state["ocr"] = None
@@ -221,6 +224,8 @@ def teardown() -> None:
 
     _drop_window()
     _state["frame"] = None
+
+
 def open_settings(api, parent=None):
     return QuizSettingsDialog(api, parent)
 
@@ -282,6 +287,7 @@ def _capture(api, restore=None) -> None:
     _state["busy"] = True
     _state["seq"] = int(_state.get("seq") or 0) + 1
     _state["stage"] = "capture"
+    _state["ocr_failed"] = False
     seq = int(_state["seq"])
     opts = _options(api)
 
@@ -351,6 +357,7 @@ def _ocr_timeout(api, seq: int) -> None:
     if opts["recognition"] == "text" or frame is None:
         _fail(api, "读屏幕文字超时了。可以再试一次，或把识别方式改成「图片」。", seq)
         return
+    _state["ocr_failed"] = True
     _ask_vision(api, seq, frame, opts)
 
 
@@ -374,6 +381,7 @@ def _after_ocr(api, seq: int, text: str, error: str) -> None:
             seq,
         )
         return
+    _state["ocr_failed"] = True
     _ask_vision(api, seq, frame, opts)
 
 
@@ -455,11 +463,18 @@ def _on_reply(api, seq: int, reply, error, vision: bool) -> None:
     if error:
         message = str(error or "")
         if vision and _looks_like_rejection(message):
-            _fail(
-                api,
-                "当前模型看不了图片。把识别方式改成「文字（OCR）」，或者换一个支持图片的模型。",
-                seq,
-            )
+            if _state.get("ocr_failed"):
+                _fail(
+                    api,
+                    "屏幕文字没读出来，当前模型也不支持图片。可以在 Windows 设置里安装中文 OCR 语言包，或换一个支持图片的模型。",
+                    seq,
+                )
+            else:
+                _fail(
+                    api,
+                    "当前模型看不了图片。把识别方式改成「文字（OCR）」，或者换一个支持图片的模型。",
+                    seq,
+                )
         else:
             _fail(api, f"AI 没给出结果：{message[:100]}", seq)
         return
@@ -555,6 +570,7 @@ def _finish(api, message: str | None) -> None:
     _state["busy"] = False
     _state["seq"] = int(_state.get("seq") or 0) + 1
     _state["stage"] = ""
+    _state["ocr_failed"] = False
     _state["ocr"] = None
     _state["frame"] = None
     if message:

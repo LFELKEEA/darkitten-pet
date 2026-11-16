@@ -242,6 +242,16 @@ class QuizHelperTests(unittest.TestCase):
         self.assertTrue(any("看不了图片" in text for text in api.said))
         self.assertEqual(api.storage, {})
 
+    def test_vision_rejection_after_empty_ocr_mentions_language_pack(self) -> None:
+        self.module._ocr_factory = lambda: FakeOcrTask
+        api = FakeAPI({"show_window": False, "recognition": "auto"})
+        self.module.setup(api)
+        self.trigger(api)
+        FakeOcrTask.last.signals.done.emit("", "")
+        api.callback(None, "接口返回 400。invalid content")
+
+        self.assertTrue(any("OCR 语言包" in text for text in api.said))
+
     def test_ocr_timeout_falls_back_to_image(self) -> None:
         self.module._ocr_factory = lambda: FakeOcrTask
         api = FakeAPI({"show_window": False, "recognition": "auto"})
