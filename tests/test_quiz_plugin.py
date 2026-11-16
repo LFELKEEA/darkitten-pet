@@ -325,6 +325,137 @@ class QuizHelperTests(unittest.TestCase):
         self.assertEqual(self.module._section(text, "解析"), "第一行 第二行")
         self.assertEqual(self.module._section(text, "不存在的字段"), "")
 
+    def test_choice_letter_variants(self) -> None:
+        choice = self.module._choice_letter
+        self.assertEqual(choice("B. 7"), "B")
+        self.assertEqual(choice("（C）8"), "C")
+        self.assertEqual(choice("答案：D"), "D")
+        self.assertEqual(choice("选项 A、B、C"), "A")
+        self.assertEqual(choice("选 C"), "C")
+        self.assertEqual(choice("42"), "")
+        self.assertEqual(choice("Because it works"), "")
+        self.assertEqual(choice(""), "")
+
+    def test_fill_payload_modes(self) -> None:
+        payload = self.module._fill_payload
+        self.assertEqual(payload("B. 7", "paste"), ("B. 7", "paste"))
+        self.assertEqual(payload("B. 7", "letter"), ("B", "paste"))
+        self.assertEqual(payload("B. 7", "key"), ("B", "key"))
+        self.assertEqual(payload("42", "letter"), ("42", "paste"))
+        self.assertEqual(payload("42", "clipboard"), ("42", "clipboard"))
+
+    def test_fill_options_defaults_and_clamping(self) -> None:
+        api = FakeAPI({"fill_delay": "99"})
+        opts = self.module._options(api)
+        self.assertFalse(opts["auto_fill"])
+        self.assertEqual(opts["fill_mode"], "paste")
+        self.assertEqual(opts["fill_delay"], 15)
+        self.assertFalse(opts["fill_enter"])
+
+        api = FakeAPI({"fill_mode": "magic", "fill_delay": "abc"})
+        opts = self.module._options(api)
+        self.assertEqual(opts["fill_mode"], "paste")
+        self.assertEqual(opts["fill_delay"], 3)
+
+    def _enable_fake_input(self) -> list:
+        pasted: list = []
+        self.module._user32 = lambda: object()
+        self.module._set_clipboard = lambda text: True
+        self.module._foreground_owned = lambda: False
+        self.module._foreground_hwnd = lambda: 0
+        self.module._paste_clipboard = lambda: pasted.append("paste")
+        self.module._tap_key = lambda vk: pasted.append(vk)
+        return pasted
+
+    def test_auto_fill_pastes_after_countdown(self) -> None:
+        pasted = self._enable_fake_input()
+        api = FakeAPI(
+            {
+                "show_window": False,
+                "auto_fill": True,
+                "fill_mode": "paste",
+                "fill_delay": 2,
+            }
+        )
+        self.module.setup(api)
+        self.trigger(api)
+        api.callback("【题目】1 + 1 = ?\n【答案】B. 2\n【解析】略", None)
+
+        self.assertEqual(pasted, [])
+        self.assertTrue(any("2 秒后自动填入" in text for text in api.said))
+        self.fire(2000)
+        self.assertEqual(pasted, ["paste"])
+
+    def test_auto_fill_key_mode_types_letter(self) -> None:
+        pressed = self._enable_fake_input()
+        api = FakeAPI(
+            {
+                "show_window": False,
+                "auto_fill": True,
+                "fill_mode": "key",
+                "fill_delay": 1,
+            }
+        )
+        self.module.setup(api)
+        self.trigger(api)
+        api.callback("【题目】选择题\n【答案】C. 8\n【解析】略", None)
+        self.fire(1000)
+        self.assertEqual(pressed, [ord("C")])
+
+    def test_auto_fill_refuses_when_pet_has_focus(self) -> None:
+        pasted = self._enable_fake_input()
+        self.module._foreground_owned = lambda: True
+        api = FakeAPI(
+            {
+                "show_window": False,
+                "auto_fill": True,
+                "fill_delay": 1,
+            }
+        )
+        self.module.setup(api)
+        self.trigger(api)
+        api.callback("【题目】1 + 1 = ?\n【答案】2\n【解析】略", None)
+        self.fire(1000)
+
+        self.assertEqual(pasted, [])
+        self.assertTrue(any("剪贴板" in text for text in api.said))
+
+    def test_teardown_cancels_pending_fill(self) -> None:
+        pasted = self._enable_fake_input()
+        api = FakeAPI(
+            {
+                "show_window": False,
+                "auto_fill": True,
+                "fill_delay": 3,
+            }
+        )
+        self.module.setup(api)
+        self.trigger(api)
+        api.callback("【题目】1 + 1 = ?\n【答案】2\n【解析】略", None)
+        self.module.teardown()
+        self.fire(3000)
+        self.assertEqual(pasted, [])
+
+    def test_result_window_fill_button_starts_manual_fill(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        pasted = self._enable_fake_input()
+        api = FakeAPI({"show_window": True, "fill_delay": 1})
+        self.module.setup(api)
+        self.trigger(api)
+        api.callback("【题目】1 + 1 = ?\n【答案】2\n【解析】略", None)
+
+        window = self.module._state["window"]
+        self.assertIsNotNone(window)
+        self.assertTrue(window.fill_btn.isEnabled())
+        window.fill_btn.click()
+        self.assertFalse(window.isVisible())
+        self.fire(1000)
+        self.assertEqual(pasted, ["paste"])
+        window.close()
+        window.deleteLater()
+
     def test_result_window_shows_full_reply(self) -> None:
         from PySide6.QtWidgets import QApplication
 
@@ -354,6 +485,12 @@ class QuizHelperTests(unittest.TestCase):
             dialog.detail_combo.setCurrentIndex(dialog.detail_combo.findData("detailed"))
             dialog.window_check.setChecked(False)
             dialog.poke_check.setChecked(True)
+            dialog.auto_fill_check.setChecked(True)
+            dialog.fill_mode_combo.setCurrentIndex(
+                dialog.fill_mode_combo.findData("letter")
+            )
+            dialog.fill_delay_spin.setValue(5)
+            dialog.fill_enter_check.setChecked(True)
             dialog.extra_edit.setText("只给答案")
             dialog._save()
 
@@ -363,6 +500,10 @@ class QuizHelperTests(unittest.TestCase):
             self.assertEqual(saved["detail"], "detailed")
             self.assertFalse(saved["show_window"])
             self.assertTrue(saved["poke_trigger"])
+            self.assertTrue(saved["auto_fill"])
+            self.assertEqual(saved["fill_mode"], "letter")
+            self.assertEqual(saved["fill_delay"], 5)
+            self.assertTrue(saved["fill_enter"])
             self.assertEqual(saved["extra"], "只给答案")
             self.assertTrue(any("设置已保存" in text for text in api.said))
         finally:

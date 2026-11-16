@@ -12,12 +12,19 @@ from __future__ import annotations
 - text：只把 OCR 文字发给 AI，适合 DeepSeek 等纯文本模型；
 - image：把压缩后的截图直接发给支持视觉的模型。
 
+自动填入：
+- 默认关闭；打开后答完会有一段倒计时，让你把光标放进答题框；
+- 通过 Windows 键盘模拟粘贴或输入选项字母，焦点仍是桌宠或没有切换窗口时会拒绝输入；
+- 只在本机执行，不额外联网。
+
 隐私：
 - 截图只在内存里压成 JPEG，不写磁盘；
 - OCR 文字和答题内容不写日志、不进本地存储，本地只累计答题数量；
 - 命中密码、验证码、银行卡等词的行会在发给 AI 前过滤掉。
 """
 
+import ctypes
+import os
 import re
 import time
 from typing import Any
@@ -34,6 +41,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -73,16 +81,29 @@ DETAILS = {
     "detailed": ("详细", "不超过 400 字的完整思路和关键步骤"),
 }
 
+FILL_MODES = (
+    ("粘贴答案全文", "paste"),
+    ("只粘贴选项字母", "letter"),
+    ("按下选项字母键", "key"),
+    ("只复制到剪贴板", "clipboard"),
+)
+FILL_MODE_VALUES = tuple(value for _, value in FILL_MODES)
+
+VK_CONTROL = 0x11
+VK_RETURN = 0x0D
+VK_V = 0x56
+KEYEVENTF_KEYUP = 0x0002
+
 DARK_QSS = """
 QDialog { background: #16181d; }
 QLabel { color: #e8ebf1; }
 QLabel#quiz_title { color: #f3f5f9; font-size: 17px; font-weight: 600; }
 QLabel#quiz_muted { color: #98a2b3; font-size: 12px; }
-QLineEdit, QComboBox {
+QLineEdit, QComboBox, QSpinBox {
     background: #1e2128; color: #e8ebf1; border: 1px solid #2d323d;
     border-radius: 6px; padding: 6px 8px; min-height: 20px;
 }
-QLineEdit:focus, QComboBox:focus { border-color: #5b8cff; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #5b8cff; }
 QComboBox QAbstractItemView { background: #1e2128; color: #e8ebf1; selection-background-color: #33405c; }
 QCheckBox { color: #d7dce5; spacing: 8px; }
 QPlainTextEdit {
@@ -109,6 +130,8 @@ _state: dict[str, Any] = {
     "ocr": None,
     "frame": None,
     "window": None,
+    "trigger_hwnd": 0,
+    "fill": 0,
 }
 
 
@@ -148,6 +171,15 @@ def _options(api) -> dict[str, Any]:
     if detail not in DETAILS:
         detail = "standard"
 
+    fill_mode = str(raw.get("fill_mode") or "paste").strip().lower()
+    if fill_mode not in FILL_MODE_VALUES:
+        fill_mode = "paste"
+    try:
+        fill_delay = int(raw.get("fill_delay", 3))
+    except Exception:
+        fill_delay = 3
+    fill_delay = max(1, min(15, fill_delay))
+
     return {
         "enabled": _as_bool(raw.get("enable_chat_trigger"), True),
         "triggers": triggers,
@@ -156,6 +188,10 @@ def _options(api) -> dict[str, Any]:
         "show_window": _as_bool(raw.get("show_window"), True),
         "poke_trigger": _as_bool(raw.get("poke_trigger"), False),
         "extra": str(raw.get("extra") or "").strip()[:200],
+        "auto_fill": _as_bool(raw.get("auto_fill"), False),
+        "fill_mode": fill_mode,
+        "fill_delay": fill_delay,
+        "fill_enter": _as_bool(raw.get("fill_enter"), False),
     }
 
 
@@ -173,6 +209,8 @@ def setup(api) -> None:
             "ocr": None,
             "frame": None,
             "window": None,
+            "trigger_hwnd": 0,
+            "fill": 0,
         }
     )
 
@@ -219,6 +257,7 @@ def teardown() -> None:
     _state["seq"] = int(_state.get("seq") or 0) + 1
     _state["stage"] = ""
     _state["ocr_failed"] = False
+    _cancel_fill()
 
     task = _state.get("ocr")
     _state["ocr"] = None
@@ -274,6 +313,11 @@ def _begin(api, source: str, restore=None) -> None:
     if _state["busy"]:
         api.say("上一道题还在看，等我一下。", 3000)
         return
+
+    _cancel_fill()
+
+    # 记下触发时最前面的窗口；填答案时如果还是它，说明主人没切到答题框。
+    _state["trigger_hwnd"] = _foreground_hwnd()
 
     # 先占住忙碌状态，避免 300ms 延迟里被第二个触发词重复截屏。
     _state["busy"] = True
@@ -404,6 +448,202 @@ def _clean_ocr(text: str) -> str:
     return "\n".join(lines)[:MAX_OCR_CHARS].strip()
 
 
+# ---------- 自动填入 ----------
+
+_CHOICE_HEAD_RE = re.compile(
+    r"^[\s（(\[【]*([A-Ha-h])(?=$|[\s.．、,，:：)）\]】])"
+)
+_CHOICE_KEYWORD_RE = re.compile(
+    r"(?:答案|选项|应选|选择|选)\s*(?:是|为|[:：])?\s*[（(\[【]*\s*"
+    r"([A-Ha-h])(?=$|[\s.．、,，:：)）\]】])"
+)
+
+
+def _user32():
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return None
+    try:
+        # 64 位系统上 HWND 是指针宽度，默认 c_int 返回值会被截断。
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        user32.keybd_event.argtypes = [
+            ctypes.c_ubyte,
+            ctypes.c_ubyte,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+        ]
+    except Exception:
+        pass
+    return user32
+
+
+def _foreground_hwnd() -> int:
+    user32 = _user32()
+    if user32 is None:
+        return 0
+    try:
+        return int(user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _foreground_unchanged() -> bool:
+    trigger = int(_state.get("trigger_hwnd") or 0)
+    if not trigger:
+        return False
+    return _foreground_hwnd() == trigger
+
+
+def _foreground_owned() -> bool:
+    """当前最前面的窗口是不是桌宠自己。"""
+    hwnd = _foreground_hwnd()
+    user32 = _user32()
+    if not hwnd or user32 is None:
+        return False
+    try:
+        pid = ctypes.c_ulong(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value) == os.getpid()
+    except Exception:
+        return False
+
+
+def _set_clipboard(text: str) -> bool:
+    try:
+        app = QApplication.instance()
+        if app is None:
+            return False
+        clipboard = app.clipboard()
+        if clipboard is None:
+            return False
+        clipboard.setText(str(text))
+        return True
+    except Exception:
+        return False
+
+
+def _tap_key(vk: int) -> None:
+    user32 = _user32()
+    if user32 is None:
+        return
+    try:
+        user32.keybd_event(int(vk), 0, 0, 0)
+        time.sleep(0.03)
+        user32.keybd_event(int(vk), 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        pass
+
+
+def _paste_clipboard() -> None:
+    user32 = _user32()
+    if user32 is None:
+        return
+    try:
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        time.sleep(0.03)
+        user32.keybd_event(VK_V, 0, 0, 0)
+        time.sleep(0.03)
+        user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.03)
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        pass
+
+
+def _choice_letter(answer: str) -> str:
+    """从答案里找出选项字母 A–H；没有就返回空串。"""
+    text = str(answer or "").strip()
+    if not text:
+        return ""
+    match = _CHOICE_HEAD_RE.match(text)
+    if match:
+        return match.group(1).upper()
+    match = _CHOICE_KEYWORD_RE.search(text)
+    if match:
+        return match.group(1).upper()
+    return ""
+
+
+def _fill_payload(answer: str, mode: str) -> tuple[str, str]:
+    """返回 (要输入的文字, 输入方式)，输入方式为 paste / key / clipboard。"""
+    text = str(answer or "").strip()
+    if mode == "clipboard":
+        return text, "clipboard"
+    if mode in ("letter", "key"):
+        letter = _choice_letter(text)
+        if letter:
+            return letter, "key" if mode == "key" else "paste"
+    return text, "paste"
+
+
+def _cancel_fill() -> None:
+    _state["fill"] = int(_state.get("fill") or 0) + 1
+
+
+def _schedule_fill(api, text: str, action: str, press_enter: bool, seconds: int) -> int:
+    token = int(_state.get("fill") or 0) + 1
+    _state["fill"] = token
+    delay = max(1, min(15, int(seconds)))
+    _schedule(delay * 1000, lambda: _do_fill(api, token, text, action, press_enter))
+    return token
+
+
+def _do_fill(api, token: int, text: str, action: str, press_enter: bool) -> None:
+    if int(_state.get("fill") or 0) != token or not _state["active"]:
+        return
+    if _user32() is None:
+        api.say("自动填入目前只支持 Windows，答案可以在解析窗口里复制。", 5000)
+        return
+
+    copied = _set_clipboard(text)
+    if _foreground_owned() or _foreground_unchanged():
+        if copied:
+            api.say(
+                "答题框还没选中，答案先放在剪贴板了，点一下输入框按 Ctrl+V 就行。",
+                7000,
+            )
+        else:
+            api.say("答题框还没选中，先点一下输入框再试一次。", 6000)
+        return
+
+    if action == "clipboard":
+        if copied:
+            api.say("答案已复制到剪贴板，按 Ctrl+V 粘贴。", 5000)
+        else:
+            api.say("复制答案失败，手动复制一下吧。", 5000)
+        return
+
+    if action == "key" and len(text) == 1 and text.isalpha():
+        _tap_key(ord(text.upper()))
+    else:
+        if not copied:
+            api.say("复制答案失败，没能填进去。", 5000)
+            return
+        _paste_clipboard()
+
+    if press_enter:
+        _schedule(150, lambda: _tap_key(VK_RETURN))
+        api.say("已经填好并按下回车，记得核对。", 5000)
+    else:
+        api.say("已经填进答题框了，核对后自己提交。", 5000)
+
+
+def _manual_fill(api, answer: str) -> None:
+    opts = _options(api)
+    text, action = _fill_payload(answer, opts["fill_mode"])
+    delay = int(opts["fill_delay"])
+    _schedule_fill(api, text, action, opts["fill_enter"], delay)
+    api.say(f"{delay} 秒后填入答案，快把光标放到答题框里。", delay * 1000 + 2000)
+
+
 # ---------- 请求 AI ----------
 
 
@@ -500,14 +740,25 @@ def _on_reply(api, seq: int, reply, error, vision: bool) -> None:
         return
 
     _bump_count(api)
-    shown = False
-    if _options(api)["show_window"]:
-        shown = _show_result(api, text)
-
+    opts = _options(api)
     say = f"答案：{answer}"
-    if shown:
-        say += "。完整解析我放在窗口里了。"
-    api.say(say, 10000)
+
+    if opts["auto_fill"] and _user32() is not None:
+        fill_text, action = _fill_payload(answer, opts["fill_mode"])
+        delay = int(opts["fill_delay"])
+        token = _schedule_fill(api, fill_text, action, opts["fill_enter"], delay)
+        say += f"。{delay} 秒后自动填入，快把光标放到答题框里"
+        if opts["show_window"]:
+            # 等填完再弹解析窗口，避免窗口抢走焦点。
+            _schedule(
+                delay * 1000 + 800,
+                lambda: _show_result_later(api, text, answer, token),
+            )
+    elif opts["show_window"]:
+        if _show_result(api, text, answer):
+            say += "。完整解析我放在窗口里了。"
+
+    api.say(say, max(10000, int(opts["fill_delay"]) * 1000 + 3000))
     try:
         api.action("nod")
     except Exception:
@@ -644,12 +895,24 @@ def _forget_window(window) -> None:
         _state["window"] = None
 
 
-def _show_result(api, text: str) -> bool:
+def _show_result_later(api, text: str, answer: str, token: int) -> None:
+    if int(_state.get("fill") or 0) != token or not _state["active"]:
+        return
+    _show_result(api, text, answer)
+
+
+def _show_result(api, text: str, answer: str = "") -> bool:
     if QApplication.instance() is None:
         return False
     _drop_window()
+    supported = _user32() is not None
     try:
-        window = QuizResultDialog(text, on_again=lambda: _begin(api, "manual"))
+        window = QuizResultDialog(
+            text,
+            on_again=lambda: _begin(api, "manual"),
+            on_fill=(lambda: _manual_fill(api, answer)) if answer else None,
+            fill_supported=supported,
+        )
     except Exception as exc:
         api.log(f"解析窗口打开失败：{str(exc)[:160]}")
         return False
@@ -668,10 +931,18 @@ def _show_result(api, text: str) -> bool:
 
 
 class QuizResultDialog(QDialog):
-    def __init__(self, text: str, on_again=None, parent=None) -> None:
+    def __init__(
+        self,
+        text: str,
+        on_again=None,
+        on_fill=None,
+        fill_supported: bool = False,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._text = text
         self._on_again = on_again
+        self._on_fill = on_fill
         self.setWindowTitle("做题助手 · 解析")
         self.setMinimumSize(640, 480)
         self.resize(760, 580)
@@ -699,15 +970,21 @@ class QuizResultDialog(QDialog):
         row = QHBoxLayout()
         row.setSpacing(8)
         self.again_btn = QPushButton("再答一题")
+        self.fill_btn = QPushButton("填入答案" if fill_supported else "填入答案（仅 Windows）")
+        self.fill_btn.setEnabled(bool(fill_supported and callable(on_fill)))
+        if fill_supported:
+            self.fill_btn.setToolTip("窗口会先隐藏并倒计时，把光标放到答题框里就会自动填入")
         self.copy_btn = QPushButton("复制解析")
         close_btn = QPushButton("关闭")
         close_btn.setObjectName("quiz_primary")
 
         self.again_btn.clicked.connect(self._again)
+        self.fill_btn.clicked.connect(self._fill)
         self.copy_btn.clicked.connect(self._copy)
         close_btn.clicked.connect(self.close)
 
         row.addWidget(self.again_btn)
+        row.addWidget(self.fill_btn)
         row.addWidget(self.copy_btn)
         row.addStretch(1)
         row.addWidget(close_btn)
@@ -717,6 +994,12 @@ class QuizResultDialog(QDialog):
         self.hide()
         if callable(self._on_again):
             self._on_again()
+
+    def _fill(self) -> None:
+        if not callable(self._on_fill):
+            return
+        self.hide()
+        self._on_fill()
 
     def _copy(self) -> None:
         clipboard = QGuiApplication.clipboard()
@@ -742,14 +1025,14 @@ class QuizSettingsDialog(QDialog):
         super().__init__(parent)
         self._api = api
         self.setWindowTitle("做题助手 · 设置")
-        self.setMinimumSize(560, 420)
-        self.resize(620, 470)
+        self.setMinimumSize(580, 540)
+        self.resize(640, 590)
         self.setStyleSheet(DARK_QSS)
 
         opts = _options(api)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         title = QLabel("做题助手")
         title.setObjectName("quiz_title")
@@ -758,6 +1041,7 @@ class QuizSettingsDialog(QDialog):
         desc = QLabel(
             "截图只在本机压缩后交给当前配置的 AI，不会写进磁盘。"
             "按「识别屏幕上的题目」前，先把题目窗口切到最前面。"
+            "自动填入通过 Windows 键盘模拟完成，只在本机执行。"
         )
         desc.setObjectName("quiz_muted")
         desc.setWordWrap(True)
@@ -793,6 +1077,30 @@ class QuizSettingsDialog(QDialog):
         self.poke_check = QCheckBox("戳一戳桌宠也识别题目")
         self.poke_check.setChecked(opts["poke_trigger"])
         layout.addWidget(self.poke_check)
+
+        self.auto_fill_check = QCheckBox("答完后自动填入答案（Windows）")
+        self.auto_fill_check.setChecked(opts["auto_fill"])
+        layout.addWidget(self.auto_fill_check)
+
+        fill_row = QHBoxLayout()
+        fill_row.setSpacing(8)
+        fill_row.addWidget(QLabel("填入方式"))
+        self.fill_mode_combo = QComboBox()
+        for label, value in FILL_MODES:
+            self.fill_mode_combo.addItem(label, value)
+        self._select(self.fill_mode_combo, opts["fill_mode"])
+        fill_row.addWidget(self.fill_mode_combo, 1)
+        fill_row.addWidget(QLabel("倒计时"))
+        self.fill_delay_spin = QSpinBox()
+        self.fill_delay_spin.setRange(1, 15)
+        self.fill_delay_spin.setSuffix(" 秒")
+        self.fill_delay_spin.setValue(opts["fill_delay"])
+        fill_row.addWidget(self.fill_delay_spin)
+        layout.addLayout(fill_row)
+
+        self.fill_enter_check = QCheckBox("填入后自动按回车（可能直接提交，谨慎开启）")
+        self.fill_enter_check.setChecked(opts["fill_enter"])
+        layout.addWidget(self.fill_enter_check)
 
         layout.addWidget(QLabel("额外要求（可选）"))
         self.extra_edit = QLineEdit(opts["extra"])
@@ -846,6 +1154,10 @@ class QuizSettingsDialog(QDialog):
             "detail": self.detail_combo.currentData(),
             "show_window": self.window_check.isChecked(),
             "poke_trigger": self.poke_check.isChecked(),
+            "auto_fill": self.auto_fill_check.isChecked(),
+            "fill_mode": self.fill_mode_combo.currentData(),
+            "fill_delay": int(self.fill_delay_spin.value()),
+            "fill_enter": self.fill_enter_check.isChecked(),
             "extra": self.extra_edit.text().strip(),
         }
         try:
@@ -862,6 +1174,10 @@ class QuizSettingsDialog(QDialog):
 
     def _capture_now(self) -> None:
         self.hide()
+        if _options(self._api)["auto_fill"] and _user32() is not None:
+            # 自动填入时不再把设置窗口弹回来，免得倒计时结束时它抢着焦点。
+            _begin(self._api, "manual")
+            return
 
         def restore() -> None:
             try:
