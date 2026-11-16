@@ -121,6 +121,11 @@ class QuizHelperTests(unittest.TestCase):
         self.timers: list[tuple[int, object]] = []
         self.module._schedule = lambda delay, callback: self.timers.append((delay, callback))
         self.module._ocr_factory = lambda: None
+
+        def fake_scan(api) -> None:
+            self.module._reset_fields()
+
+        self.module._start_fields_scan = fake_scan
         FakeOcrTask.last = None
 
     def fire(self, delay: int) -> None:
@@ -456,6 +461,183 @@ class QuizHelperTests(unittest.TestCase):
 
         self.assertEqual(pasted, ["paste"])
 
+    def _fields(self) -> list[dict]:
+        return [
+            {"x": 100, "y": 200, "w": 100, "h": 30, "label": "Row one", "value": ""},
+            {"x": 100, "y": 300, "w": 100, "h": 30, "label": "Row two", "value": ""},
+        ]
+
+    def test_fields_block_lists_labels(self) -> None:
+        block = self.module._fields_block(self._fields())
+        self.assertIn("2 个", block)
+        self.assertIn("1. Row one", block)
+        self.assertIn("2. Row two", block)
+        self.assertEqual(self.module._fields_block([]), "")
+
+    def test_fill_map_parses_numbered_lines(self) -> None:
+        text = (
+            "【答案】见填写\n【解析】略\n"
+            "【填写】\n1=第一处\n2：第二处\n9=越界\n3=没有这个框\n"
+        )
+        pairs = self.module._fill_map(text, self._fields())
+        self.assertEqual([pair[1] for pair in pairs], ["第一处", "第二处"])
+        self.assertEqual(pairs[0][0]["label"], "Row one")
+
+    def test_fill_map_accepts_dot_and_dash_prefixes(self) -> None:
+        text = "【填写】\n1. - 甲\n2) 乙"
+        pairs = self.module._fill_map(text, self._fields())
+        self.assertEqual([pair[1] for pair in pairs], ["甲", "乙"])
+
+    def test_fill_map_without_section(self) -> None:
+        self.assertEqual(self.module._fill_map("【答案】42", self._fields()), [])
+
+    def test_prompt_includes_fields_and_fill_rule(self) -> None:
+        self.module._ocr_factory = lambda: FakeOcrTask
+        api = FakeAPI({"show_window": False, "auto_fill": True, "recognition": "auto"})
+        self.module.setup(api)
+        self.trigger(api)
+        self.module._state["fields"] = self._fields()
+        self.module._state["fields_done"] = True
+        FakeOcrTask.last.signals.done.emit("Self-assessment 表格，五行需要填写", "")
+
+        system = api.chats[0][0]["content"]
+        user = api.chats[0][1]["content"]
+        self.assertIn("【填写】", system)
+        self.assertIn("可填写位置", user)
+        self.assertIn("1. Row one", user)
+
+    def test_prompt_omits_fields_when_disabled(self) -> None:
+        self.module._ocr_factory = lambda: FakeOcrTask
+        api = FakeAPI(
+            {"show_window": False, "auto_fill": True, "auto_target": False, "recognition": "auto"}
+        )
+        self.module.setup(api)
+        self.trigger(api)
+        self.module._state["fields"] = self._fields()
+        self.module._state["fields_done"] = True
+        FakeOcrTask.last.signals.done.emit("Self-assessment 表格，五行需要填写", "")
+
+        self.assertNotIn("可填写位置", api.chats[0][1]["content"])
+        self.assertNotIn("【填写】", api.chats[0][0]["content"])
+
+    def test_auto_fill_fills_each_detected_field(self) -> None:
+        calls: list = []
+        self.module._user32 = lambda: object()
+        self.module._focus_window = lambda hwnd: calls.append(("focus", hwnd))
+        self.module._click_at = lambda x, y: calls.append(("click", int(x), int(y))) or True
+        self.module._select_all = lambda: calls.append(("select_all",))
+        self.module._set_clipboard = lambda text: calls.append(("copy", text)) or True
+        self.module._paste_clipboard = lambda: calls.append(("paste",))
+        self.module._cursor_pos = lambda: (10, 10)
+        self.module._move_cursor = lambda position: calls.append(("restore", position))
+        self.module._foreground_hwnd = lambda: 777
+        self.module._window_under = lambda x, y: 777
+        self.module._window_info = lambda hwnd: {
+            "hwnd": hwnd,
+            "x": 0,
+            "y": 0,
+            "w": 1200,
+            "h": 900,
+            "title": "quiz",
+            "class": "Chrome_WidgetWin_1",
+        }
+
+        api = FakeAPI(
+            {"show_window": False, "auto_fill": True, "fill_delay": 1}
+        )
+        self.module.setup(api)
+        self.trigger(api)
+        self.module._state["fields"] = self._fields()
+        self.module._state["fields_hwnd"] = 777
+        self.module._state["fields_rect"] = (0, 0, 1200, 900)
+        self.module._state["fields_done"] = True
+        api.callback(
+            "【题目】表格\n【答案】见填写\n【解析】略\n"
+            "【填写】\n1=First answer\n2=Second answer",
+            None,
+        )
+
+        self.assertTrue(any("填入 2 处" in text for text in api.said))
+        self.fire(1000)
+        self.assertIn(("focus", 777), calls)
+        self.assertIn(("click", 150, 215), calls)
+        self.assertIn(("copy", "First answer"), calls)
+
+        self.fire(450)
+        self.assertIn(("click", 150, 315), calls)
+        self.assertIn(("copy", "Second answer"), calls)
+
+        self.fire(450)
+        self.assertIn(("restore", (10, 10)), calls)
+        self.assertTrue(any("填了 2 处" in text for text in api.said))
+
+    def test_auto_fill_aborts_when_window_is_covered(self) -> None:
+        calls: list = []
+        self.module._user32 = lambda: object()
+        self.module._focus_window = lambda hwnd: None
+        self.module._click_at = lambda x, y: calls.append(("click", x, y)) or True
+        self.module._cursor_pos = lambda: (10, 10)
+        self.module._move_cursor = lambda position: None
+        self.module._foreground_hwnd = lambda: 777
+        self.module._window_under = lambda x, y: 999
+        self.module._window_info = lambda hwnd: {
+            "hwnd": hwnd,
+            "x": 0,
+            "y": 0,
+            "w": 1200,
+            "h": 900,
+            "title": "quiz",
+            "class": "Chrome_WidgetWin_1",
+        }
+        api = FakeAPI({"show_window": False, "auto_fill": True, "fill_delay": 1})
+        self.module.setup(api)
+        self.trigger(api)
+        self.module._state["fields"] = self._fields()
+        self.module._state["fields_hwnd"] = 777
+        self.module._state["fields_rect"] = (0, 0, 1200, 900)
+        api.callback("【题目】表格\n【答案】见填写\n【解析】略\n【填写】\n1=甲", None)
+
+        self.fire(1000)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("挡住" in text for text in api.said))
+
+    def test_auto_fill_aborts_when_window_moved(self) -> None:
+        calls: list = []
+        self.module._user32 = lambda: object()
+        self.module._focus_window = lambda hwnd: None
+        self.module._click_at = lambda x, y: calls.append(("click", x, y)) or True
+        self.module._window_info = lambda hwnd: {
+            "hwnd": hwnd,
+            "x": 40,
+            "y": 0,
+            "w": 1200,
+            "h": 900,
+            "title": "quiz",
+            "class": "Chrome_WidgetWin_1",
+        }
+        api = FakeAPI({"show_window": False, "auto_fill": True, "fill_delay": 1})
+        self.module.setup(api)
+        self.trigger(api)
+        self.module._state["fields"] = self._fields()
+        self.module._state["fields_hwnd"] = 777
+        self.module._state["fields_rect"] = (0, 0, 1200, 900)
+        api.callback("【题目】表格\n【答案】见填写\n【解析】略\n【填写】\n1=甲", None)
+
+        self.fire(1000)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("移动" in text for text in api.said))
+
+    def test_auto_fill_falls_back_to_focus_paste_without_fields(self) -> None:
+        pasted = self._enable_fake_input()
+        api = FakeAPI({"show_window": False, "auto_fill": True, "fill_delay": 1})
+        self.module.setup(api)
+        self.trigger(api)
+        api.callback("【题目】1 + 1 = ?\n【答案】2\n【解析】略", None)
+
+        self.assertTrue(any("光标放到答题框" in text for text in api.said))
+        self.fire(1000)
+        self.assertEqual(pasted, ["paste"])
+
     def test_teardown_cancels_pending_fill(self) -> None:
         pasted = self._enable_fake_input()
         api = FakeAPI(
@@ -522,6 +704,7 @@ class QuizHelperTests(unittest.TestCase):
             dialog.window_check.setChecked(False)
             dialog.poke_check.setChecked(True)
             dialog.auto_fill_check.setChecked(True)
+            dialog.auto_target_check.setChecked(False)
             dialog.fill_mode_combo.setCurrentIndex(
                 dialog.fill_mode_combo.findData("letter")
             )
@@ -537,6 +720,7 @@ class QuizHelperTests(unittest.TestCase):
             self.assertFalse(saved["show_window"])
             self.assertTrue(saved["poke_trigger"])
             self.assertTrue(saved["auto_fill"])
+            self.assertFalse(saved["auto_target"])
             self.assertEqual(saved["fill_mode"], "letter")
             self.assertEqual(saved["fill_delay"], 5)
             self.assertTrue(saved["fill_enter"])

@@ -13,9 +13,11 @@ from __future__ import annotations
 - image：把压缩后的截图直接发给支持视觉的模型。
 
 自动填入：
-- 默认关闭；打开后答完会有一段倒计时，让你把光标放进答题框；
-- 通过 Windows 键盘模拟粘贴或输入选项字母，焦点仍是桌宠或没有切换窗口时会拒绝输入；
-- 只在本机执行，不额外联网。
+- 默认关闭；打开后先用 Windows UI Automation 扫描当前页面里的输入框和旁边的标签，
+  把这份「可填写位置」一起发给 AI，由 AI 决定每个位置该填什么；
+- 答完等一小段倒计时，再依次点进每个输入框、清空并粘贴对应内容；
+- 扫描不到输入框时退回原来的做法：把答案放进剪贴板，让你自己点输入框粘贴；
+- 全部通过 Windows 鼠标/键盘模拟完成，只在本机执行，不额外联网。
 
 隐私：
 - 截图只在内存里压成 JPEG，不写磁盘；
@@ -24,9 +26,15 @@ from __future__ import annotations
 """
 
 import ctypes
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
@@ -72,7 +80,16 @@ SYSTEM_PROMPT = (
     "【答案】最终答案（选择题写选项字母和内容；填空题写应填内容；计算题写结果）\n"
     "【解析】{detail}\n"
     "3. 不要编造题干、选项或已知条件；不确定时在解析里说明。\n"
-    "4. 使用简体中文，答案尽量简短。"
+    "4. 使用简体中文，答案尽量简短；如果题目本身是英文或要求用英文作答，就按题目要求回答。\n"
+)
+
+FILL_RULE = (
+    "5. 用户消息里可能附带【可填写位置】，那是系统从页面上扫到的输入框，按从上到下编号。"
+    "需要在多个框里分别作答时，在【解析】之后再输出一节：\n"
+    "【填写】\n"
+    "编号=该位置要填的简短内容\n"
+    "每个位置一行，只写这个位置需要的内容，不要带编号、题目或解释；"
+    "按题意把答案分配到最合适的位置，没有合适位置就整节省略。\n"
 )
 
 DETAILS = {
@@ -92,7 +109,41 @@ FILL_MODE_VALUES = tuple(value for _, value in FILL_MODES)
 VK_CONTROL = 0x11
 VK_RETURN = 0x0D
 VK_V = 0x56
+VK_A = 0x41
 KEYEVENTF_KEYUP = 0x0002
+
+GW_HWNDNEXT = 2
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+
+FIELD_WAIT_SECONDS = 4.5
+FIELD_SCAN_BUDGET = 15.0
+MAX_FIELDS = 20
+SKIP_WINDOW_CLASSES = (
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "Windows.UI.Core.CoreWindow",
+    "ApplicationManager_DesktopShellWindow",
+    "ForegroundStaging",
+    "MultitaskingViewFrame",
+)
+BROWSER_CLASS_HINTS = ("Chrome_WidgetWin_1", "MozillaWindowClass", "ApplicationFrameWindow")
+BROWSER_TITLE_WORDS = ("chrome", "edge", "firefox", "浏览", "浏览器")
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 DARK_QSS = """
 QDialog { background: #16181d; }
@@ -133,6 +184,15 @@ _state: dict[str, Any] = {
     "trigger_hwnd": 0,
     "trigger_source": "",
     "fill": 0,
+    "fields": None,
+    "fields_hwnd": 0,
+    "fields_rect": None,
+    "fields_title": "",
+    "fields_error": "",
+    "fields_token": 0,
+    "fields_done": True,
+    "fill_dialog": None,
+    "fill_text": "",
 }
 
 
@@ -190,6 +250,7 @@ def _options(api) -> dict[str, Any]:
         "poke_trigger": _as_bool(raw.get("poke_trigger"), False),
         "extra": str(raw.get("extra") or "").strip()[:200],
         "auto_fill": _as_bool(raw.get("auto_fill"), False),
+        "auto_target": _as_bool(raw.get("auto_target"), True),
         "fill_mode": fill_mode,
         "fill_delay": fill_delay,
         "fill_enter": _as_bool(raw.get("fill_enter"), False),
@@ -213,6 +274,13 @@ def setup(api) -> None:
             "trigger_hwnd": 0,
             "trigger_source": "",
             "fill": 0,
+            "fields": None,
+            "fields_hwnd": 0,
+            "fields_rect": None,
+            "fields_title": "",
+            "fields_error": "",
+            "fields_done": True,
+            "fill_dialog": None,
         }
     )
 
@@ -261,6 +329,7 @@ def teardown() -> None:
     _state["ocr_failed"] = False
     _state["trigger_source"] = ""
     _cancel_fill()
+    _reset_fields()
 
     task = _state.get("ocr")
     _state["ocr"] = None
@@ -327,6 +396,14 @@ def _begin(api, source: str, restore=None) -> None:
     # 先占住忙碌状态，避免 300ms 延迟里被第二个触发词重复截屏。
     _state["busy"] = True
     _hide_window()
+
+    # 截屏和扫描同时进行：扫描比较慢，等 OCR 完成时通常已经拿到输入框位置。
+    opts = _options(api)
+    if opts["auto_fill"] and opts["auto_target"]:
+        _start_fields_scan(api)
+    else:
+        _reset_fields()
+
     if source != "chat":
         api.say("我看看屏幕上的题目。", 2500)
 
@@ -474,11 +551,48 @@ def _user32():
     try:
         # 64 位系统上 HWND 是指针宽度，默认 c_int 返回值会被截断。
         user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetTopWindow.argtypes = [ctypes.c_void_p]
+        user32.GetTopWindow.restype = ctypes.c_void_p
+        user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetWindow.restype = ctypes.c_void_p
         user32.GetWindowThreadProcessId.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_ulong),
         ]
         user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        user32.GetWindowTextW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetClassNameW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+        user32.GetWindowRect.restype = ctypes.c_bool
+        user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        user32.IsWindowVisible.restype = ctypes.c_bool
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.SetForegroundWindow.restype = ctypes.c_bool
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.SetCursorPos.restype = ctypes.c_bool
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+        user32.GetCursorPos.restype = ctypes.c_bool
+        user32.mouse_event.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_ulong,
+        ]
+        user32.WindowFromPoint.argtypes = [_POINT]
+        user32.WindowFromPoint.restype = ctypes.c_void_p
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
         user32.keybd_event.argtypes = [
             ctypes.c_ubyte,
             ctypes.c_ubyte,
@@ -524,6 +638,270 @@ def _foreground_owned() -> bool:
         return False
 
 
+def _window_info(hwnd: int) -> dict[str, Any] | None:
+    """取窗口标题、类名、屏幕矩形；拿不到就返回 None。"""
+    user32 = _user32()
+    if user32 is None or not hwnd:
+        return None
+    try:
+        if not user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
+            return None
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(ctypes.c_void_p(hwnd), buf, 512)
+        title = buf.value.strip()
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(ctypes.c_void_p(hwnd), cls, 256)
+        rect = _RECT()
+        if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+            return None
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width <= 0 or height <= 0:
+            return None
+        return {
+            "hwnd": int(hwnd),
+            "title": title,
+            "class": cls.value.strip(),
+            "x": int(rect.left),
+            "y": int(rect.top),
+            "w": width,
+            "h": height,
+        }
+    except Exception:
+        return None
+
+
+def _is_browser_window(info: dict[str, Any]) -> bool:
+    cls = str(info.get("class") or "")
+    if cls in BROWSER_CLASS_HINTS:
+        return True
+    title = str(info.get("title") or "").casefold()
+    return any(word in title for word in BROWSER_TITLE_WORDS)
+
+
+def _target_candidates() -> list[dict[str, Any]]:
+    """按 z 序找可能的题目窗口：跳过桌宠自己和桌面外壳，优先浏览器。"""
+    user32 = _user32()
+    if user32 is None:
+        return []
+    own_pid = os.getpid()
+    trigger = int(_state.get("trigger_hwnd") or 0)
+    found: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    try:
+        hwnd = user32.GetTopWindow(None)
+        for order in range(80):
+            if not hwnd:
+                break
+            value = int(hwnd)
+            if value in seen:
+                break
+            seen.add(value)
+
+            pid = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(ctypes.c_void_p(value), ctypes.byref(pid))
+            if int(pid.value) != own_pid:
+                info = _window_info(value)
+                if info is not None and info["class"] not in SKIP_WINDOW_CLASSES:
+                    if info["title"] and info["w"] >= 700 and info["h"] >= 450:
+                        info["order"] = order
+                        info["browser"] = _is_browser_window(info)
+                        found.append(info)
+            hwnd = user32.GetWindow(ctypes.c_void_p(value), GW_HWNDNEXT)
+    except Exception:
+        return []
+    found.sort(
+        key=lambda item: (
+            0 if item["hwnd"] == trigger else 1,
+            0 if item["browser"] else 1,
+            item["order"],
+        )
+    )
+    return found[:4]
+
+
+def _field_script() -> Path:
+    return Path(__file__).resolve().parent / "assets" / "uia_fields.ps1"
+
+
+def _powershell() -> str:
+    found = shutil.which("powershell")
+    if found:
+        return found
+    fallback = Path(os.environ.get("SystemRoot", r"C:\Windows")) / (
+        "System32/WindowsPowerShell/v1.0/powershell.exe"
+    )
+    return str(fallback)
+
+
+def _scan_fields(hwnd: int) -> tuple[list[dict[str, Any]], str, str]:
+    """跑一次 UIA 扫描，返回 (输入框列表, 窗口标题, 错误)。"""
+    script = _field_script()
+    if not script.is_file():
+        return [], "", "缺少 uia_fields.ps1"
+    out = Path(tempfile.gettempdir()) / f"quiz_uia_{os.getpid()}_{hwnd}_{int(time.time() * 1000)}.json"
+    cmd = [
+        _powershell(),
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script),
+        "-Hwnd",
+        str(int(hwnd)),
+        "-OutputPath",
+        str(out),
+    ]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.run(
+            cmd,
+            timeout=12,
+            creationflags=flags,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        raw = out.read_text(encoding="utf-8-sig", errors="replace")
+        data = json.loads(raw)
+    except Exception as exc:
+        return [], "", str(exc)[:160]
+    finally:
+        try:
+            out.unlink()
+        except Exception:
+            pass
+
+    if not isinstance(data, dict):
+        return [], "", "扫描结果格式不对"
+    items = data.get("fields") or []
+    if isinstance(items, dict):
+        items = [items]
+    fields: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            x = float(item.get("x"))
+            y = float(item.get("y"))
+            w = float(item.get("w"))
+            h = float(item.get("h"))
+        except Exception:
+            continue
+        if w < 6 or h < 6:
+            continue
+        fields.append(
+            {
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "label": re.sub(r"\s+", " ", str(item.get("label") or "")).strip()[:120],
+                "value": re.sub(r"\s+", " ", str(item.get("value") or "")).strip()[:80],
+            }
+        )
+        if len(fields) >= MAX_FIELDS:
+            break
+    fields.sort(key=lambda field: (field["y"], field["x"]))
+    return fields, str(data.get("title") or ""), ""
+
+
+def _reset_fields() -> None:
+    _state["fields_token"] = int(_state.get("fields_token") or 0) + 1
+    _state["fields"] = None
+    _state["fields_hwnd"] = 0
+    _state["fields_rect"] = None
+    _state["fields_title"] = ""
+    _state["fields_error"] = ""
+    _state["fields_done"] = True
+
+
+def _start_fields_scan(api) -> None:
+    """后台扫描当前页面里的输入框，主线程只等结果，不阻塞界面。"""
+    _reset_fields()
+    if _user32() is None:
+        return
+    if not _field_script().is_file():
+        api.log("缺少 assets/uia_fields.ps1，跳过输入框扫描")
+        return
+    token = int(_state["fields_token"]) + 1
+    _state["fields_token"] = token
+    _state["fields_done"] = False
+
+    thread = threading.Thread(
+        target=_fields_worker,
+        args=(api, token),
+        name="quiz-uia-scan",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _fields_worker(api, token: int) -> None:
+    fields: list[dict[str, Any]] = []
+    hwnd = 0
+    rect = None
+    title = ""
+    error = ""
+    started = time.time()
+    try:
+        candidates = _target_candidates()
+        if not candidates:
+            error = "没找到可扫描的窗口"
+        for info in candidates:
+            if int(_state.get("fields_token") or 0) != token:
+                return
+            if time.time() - started > FIELD_SCAN_BUDGET:
+                error = error or "扫描超时"
+                break
+            got, got_title, got_error = _scan_fields(int(info["hwnd"]))
+            if got:
+                fields = got
+                hwnd = int(info["hwnd"])
+                rect = (info["x"], info["y"], info["w"], info["h"])
+                title = got_title or str(info.get("title") or "")
+                error = ""
+                break
+            error = got_error or error
+    except Exception as exc:
+        error = str(exc)[:160]
+
+    if int(_state.get("fields_token") or 0) != token:
+        return
+    _state["fields"] = fields or None
+    _state["fields_hwnd"] = hwnd
+    _state["fields_rect"] = rect
+    _state["fields_title"] = title
+    _state["fields_error"] = error
+    _state["fields_done"] = True
+    if fields:
+        api.log(f"扫到 {len(fields)} 个输入框：{title[:60]}")
+    elif error:
+        api.log(f"输入框扫描未命中：{error[:120]}")
+
+
+def _with_fields(api, seq: int, callback) -> None:
+    """等扫描结果（最多几秒），拿到再发请求；超时就按没有输入框处理。"""
+    if _state.get("fields_done"):
+        callback()
+        return
+    _state["stage"] = "fields"
+    deadline = time.time() + FIELD_WAIT_SECONDS
+
+    def poll() -> None:
+        if not _alive(seq):
+            return
+        if _state.get("fields_done") or time.time() >= deadline:
+            _state["fields_done"] = True
+            callback()
+            return
+        _schedule(150, poll)
+
+    _schedule(150, poll)
+
+
 def _set_clipboard(text: str) -> bool:
     try:
         app = QApplication.instance()
@@ -550,18 +928,96 @@ def _tap_key(vk: int) -> None:
         pass
 
 
-def _paste_clipboard() -> None:
+def _send_ctrl_key(vk: int) -> None:
     user32 = _user32()
     if user32 is None:
         return
     try:
         user32.keybd_event(VK_CONTROL, 0, 0, 0)
         time.sleep(0.03)
-        user32.keybd_event(VK_V, 0, 0, 0)
+        user32.keybd_event(int(vk), 0, 0, 0)
         time.sleep(0.03)
-        user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(int(vk), 0, KEYEVENTF_KEYUP, 0)
         time.sleep(0.03)
         user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        pass
+
+
+def _paste_clipboard() -> None:
+    _send_ctrl_key(VK_V)
+
+
+def _select_all() -> None:
+    _send_ctrl_key(VK_A)
+
+
+def _cursor_pos() -> tuple[int, int] | None:
+    user32 = _user32()
+    if user32 is None:
+        return None
+    try:
+        point = _POINT()
+        if user32.GetCursorPos(ctypes.byref(point)):
+            return int(point.x), int(point.y)
+    except Exception:
+        pass
+    return None
+
+
+def _move_cursor(position: tuple[int, int] | None) -> None:
+    if not position:
+        return
+    user32 = _user32()
+    if user32 is None:
+        return
+    try:
+        user32.SetCursorPos(int(position[0]), int(position[1]))
+    except Exception:
+        pass
+
+
+def _click_at(x: float, y: float) -> bool:
+    user32 = _user32()
+    if user32 is None:
+        return False
+    try:
+        if not user32.SetCursorPos(int(x), int(y)):
+            return False
+        time.sleep(0.05)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.03)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _window_under(x: float, y: float) -> int:
+    """屏幕坐标下面最上层窗口的顶层句柄，用来确认点击不会落到别的程序。"""
+    user32 = _user32()
+    if user32 is None:
+        return 0
+    try:
+        point = _POINT(int(x), int(y))
+        hwnd = user32.WindowFromPoint(point)
+        if not hwnd:
+            return 0
+        root = user32.GetAncestor(ctypes.c_void_p(int(hwnd)), 2)
+        return int(root or hwnd)
+    except Exception:
+        return 0
+
+
+def _focus_window(hwnd: int) -> None:
+    user32 = _user32()
+    if user32 is None or not hwnd:
+        return
+    try:
+        if int(user32.GetForegroundWindow() or 0) == int(hwnd):
+            return
+        user32.SetForegroundWindow(ctypes.c_void_p(int(hwnd)))
+        time.sleep(0.25)
     except Exception:
         pass
 
@@ -592,15 +1048,89 @@ def _fill_payload(answer: str, mode: str) -> tuple[str, str]:
     return text, "paste"
 
 
+def _fields_block(fields: list[dict[str, Any]]) -> str:
+    """把扫描到的输入框编号写给 AI，让它决定每个位置填什么。"""
+    if not fields:
+        return ""
+    lines = [f"【可填写位置】当前页面有 {len(fields)} 个可输入的框，按从上到下编号："]
+    for index, field in enumerate(fields, 1):
+        label = str(field.get("label") or "").strip()
+        value = str(field.get("value") or "").strip()
+        if label and value:
+            desc = f"{label}（当前内容：{value}）"
+        elif label:
+            desc = f"{label}（当前为空）"
+        elif value:
+            desc = f"（当前内容：{value}）"
+        else:
+            desc = "（没有文字标签，按位置和上下文判断）"
+        lines.append(f"{index}. {desc}")
+    if not any(str(field.get("label") or "").strip() for field in fields):
+        lines.append("注意：这些框没有可靠标签时，优先按行号、上下顺序和题目结构判断。")
+    return "\n".join(lines)
+
+
+_FILL_LINE_RE = re.compile(r"^\s*(\d{1,2})\s*(?:[=＝:：]|[.、)）])\s*(.+?)\s*$")
+
+
+def _fill_map(text: str, fields: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    """解析回复里的【填写】节，返回 [(输入框, 内容)]，按页面顺序。"""
+    if not fields:
+        return []
+    raw = _raw_section(text, "填写")
+    if not raw:
+        return []
+    picked: dict[int, str] = {}
+    for line in raw.splitlines():
+        match = _FILL_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        try:
+            index = int(match.group(1))
+        except Exception:
+            continue
+        if index < 1 or index > len(fields):
+            continue
+        content = match.group(2).strip()
+        content = re.sub(r"^[-*·]\s*", "", content)
+        if not content:
+            continue
+        picked.setdefault(index, content[:600])
+    return [(fields[index - 1], content) for index, content in sorted(picked.items())]
+
+
+def _fill_targets(text: str, fields: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    if not fields or _user32() is None:
+        return []
+    return _fill_map(text, fields)
+
+
 def _cancel_fill() -> None:
     _state["fill"] = int(_state.get("fill") or 0) + 1
+    _state["fill_dialog"] = None
 
 
 def _schedule_fill(api, text: str, action: str, press_enter: bool, seconds: int) -> int:
     token = int(_state.get("fill") or 0) + 1
     _state["fill"] = token
+    _state["fill_dialog"] = None
     delay = max(1, min(15, int(seconds)))
     _schedule(delay * 1000, lambda: _do_fill(api, token, text, action, press_enter))
+    return token
+
+
+def _schedule_multi_fill(
+    api,
+    pairs: list[tuple[dict[str, Any], str]],
+    press_enter: bool,
+    seconds: int,
+    dialog: tuple[str, str] | None = None,
+) -> int:
+    token = int(_state.get("fill") or 0) + 1
+    _state["fill"] = token
+    _state["fill_dialog"] = dialog
+    delay = max(1, min(15, int(seconds)))
+    _schedule(delay * 1000, lambda: _do_multi_fill(api, token, pairs, press_enter))
     return token
 
 
@@ -644,8 +1174,105 @@ def _do_fill(api, token: int, text: str, action: str, press_enter: bool) -> None
         api.say("已经填进答题框了，核对后自己提交。", 5000)
 
 
+def _do_multi_fill(
+    api,
+    token: int,
+    pairs: list[tuple[dict[str, Any], str]],
+    press_enter: bool,
+) -> None:
+    """按扫描到的坐标逐个点进输入框、清空、粘贴对应内容。"""
+    if int(_state.get("fill") or 0) != token or not _state["active"]:
+        return
+    if _user32() is None:
+        api.say("自动填入目前只支持 Windows。", 5000)
+        return
+    if not pairs:
+        return
+
+    hwnd = int(_state.get("fields_hwnd") or 0)
+    info = _window_info(hwnd) if hwnd else None
+    if info is None:
+        api.say("题目窗口找不到了，答案留在剪贴板里，手动粘贴一下吧。", 6000)
+        _set_clipboard("\n".join(content for _, content in pairs))
+        return
+
+    rect = _state.get("fields_rect")
+    if rect and (
+        abs(info["x"] - int(rect[0])) > 4
+        or abs(info["y"] - int(rect[1])) > 4
+        or abs(info["w"] - int(rect[2])) > 4
+        or abs(info["h"] - int(rect[3])) > 4
+    ):
+        api.say("页面窗口移动或缩放过了，重新识别一次再填。", 6000)
+        return
+
+    _focus_window(hwnd)
+    if _foreground_hwnd() != hwnd:
+        api.say("没能把题目窗口切到最前面，先手动点一下再试。", 6000)
+        return
+
+    cursor = _cursor_pos()
+    _fill_next(api, token, pairs, 0, press_enter, cursor)
+
+
+def _fill_next(
+    api,
+    token: int,
+    pairs: list[tuple[dict[str, Any], str]],
+    position: int,
+    press_enter: bool,
+    cursor: tuple[int, int] | None,
+) -> None:
+    if int(_state.get("fill") or 0) != token or not _state["active"]:
+        return
+
+    if position >= len(pairs):
+        _move_cursor(cursor)
+        if press_enter:
+            _schedule(120, lambda: _tap_key(VK_RETURN))
+        api.say(f"已经按页面上的位置填了 {len(pairs)} 处，核对后自己提交。", 6000)
+        dialog = _state.get("fill_dialog")
+        _state["fill_dialog"] = None
+        if dialog and int(_state.get("fill") or 0) == token:
+            text, answer = dialog
+            _show_result_later(api, text, answer, token)
+        return
+
+    field, content = pairs[position]
+    width = float(field.get("w") or 0)
+    height = float(field.get("h") or 0)
+    x = float(field.get("x") or 0) + width / 2
+    y = float(field.get("y") or 0) + height / 2
+    hwnd = int(_state.get("fields_hwnd") or 0)
+    if width > 4 and height > 4:
+        under = _window_under(x, y)
+        if hwnd and under != hwnd:
+            _move_cursor(cursor)
+            api.say("页面被别的窗口挡住了，先把它切到最前面再试。", 6000)
+            return
+        _click_at(x, y)
+        time.sleep(0.08)
+        _select_all()
+        time.sleep(0.03)
+        if _set_clipboard(content):
+            _paste_clipboard()
+
+    _schedule(
+        450,
+        lambda: _fill_next(api, token, pairs, position + 1, press_enter, cursor),
+    )
+
+
 def _manual_fill(api, answer: str) -> None:
     opts = _options(api)
+    fields = _state.get("fields") or []
+    pairs = _fill_targets(_state.get("fill_text") or "", fields) if fields else []
+    if pairs:
+        delay = int(opts["fill_delay"])
+        _schedule_multi_fill(api, pairs, opts["fill_enter"], delay)
+        api.say(f"{delay} 秒后按页面上的位置填入 {len(pairs)} 处。", delay * 1000 + 2000)
+        return
+
     text, action = _fill_payload(answer, opts["fill_mode"])
     delay = int(opts["fill_delay"])
     _schedule_fill(api, text, action, opts["fill_enter"], delay)
@@ -655,25 +1282,38 @@ def _manual_fill(api, answer: str) -> None:
 # ---------- 请求 AI ----------
 
 
-def _system_prompt(opts: dict[str, Any]) -> str:
+def _system_prompt(opts: dict[str, Any], has_fields: bool = False) -> str:
     prompt = SYSTEM_PROMPT.format(detail=DETAILS[opts["detail"]][1])
+    extra_index = 5
+    if has_fields:
+        prompt += FILL_RULE
+        extra_index = 6
     if opts["extra"]:
-        prompt += f"\n5. 主人的额外要求：{opts['extra']}"
+        prompt += f"\n{extra_index}. 主人的额外要求：{opts['extra']}"
     return prompt
 
 
+def _fields_prompt_block(opts: dict[str, Any]) -> str:
+    if not (opts["auto_fill"] and opts["auto_target"]):
+        return ""
+    fields = _state.get("fields") or []
+    return _fields_block(fields)
+
+
 def _ask_text(api, seq: int, text: str, opts: dict[str, Any]) -> None:
-    messages = [
-        {"role": "system", "content": _system_prompt(opts)},
-        {
-            "role": "user",
-            "content": (
-                "以下是屏幕 OCR 文本（可能夹杂网页导航等无关内容）：\n"
-                f"{text}\n\n请找出主人正在做的那一道题并作答。"
-            ),
-        },
-    ]
-    _send(api, seq, messages, vision=False)
+    def build() -> None:
+        block = _fields_prompt_block(opts)
+        content = "以下是屏幕 OCR 文本（可能夹杂网页导航等无关内容）：\n" f"{text}\n"
+        if block:
+            content += f"\n{block}\n"
+        content += "\n请找出主人正在做的那一道题并作答。"
+        messages = [
+            {"role": "system", "content": _system_prompt(opts, bool(block))},
+            {"role": "user", "content": content},
+        ]
+        _send(api, seq, messages, vision=False)
+
+    _with_fields(api, seq, build)
 
 
 def _ask_vision(api, seq: int, frame, opts: dict[str, Any]) -> None:
@@ -685,17 +1325,24 @@ def _ask_vision(api, seq: int, frame, opts: dict[str, Any]) -> None:
         _fail(api, "截图没有生成出来，再试一次吧。", seq)
         return
 
-    messages = [
-        {"role": "system", "content": _system_prompt(opts)},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "这是当前屏幕截图，请找出主人正在做的题目并作答。"},
-                {"type": "image_url", "image_url": {"url": data_uri}},
-            ],
-        },
-    ]
-    _send(api, seq, messages, vision=True)
+    def build() -> None:
+        block = _fields_prompt_block(opts)
+        prompt = "这是当前屏幕截图，请找出主人正在做的题目并作答。"
+        if block:
+            prompt += f"\n\n{block}"
+        messages = [
+            {"role": "system", "content": _system_prompt(opts, bool(block))},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            },
+        ]
+        _send(api, seq, messages, vision=True)
+
+    _with_fields(api, seq, build)
 
 
 def _send(api, seq: int, messages: list[dict[str, Any]], vision: bool) -> None:
@@ -749,19 +1396,38 @@ def _on_reply(api, seq: int, reply, error, vision: bool) -> None:
 
     _bump_count(api)
     opts = _options(api)
+    fields = _state.get("fields") or []
+    targets = _fill_targets(text, fields) if opts["auto_fill"] else []
+    _state["fill_text"] = text
     say = f"答案：{answer}"
 
     if opts["auto_fill"] and _user32() is not None:
-        fill_text, action = _fill_payload(answer, opts["fill_mode"])
         delay = int(opts["fill_delay"])
-        token = _schedule_fill(api, fill_text, action, opts["fill_enter"], delay)
-        say += f"。{delay} 秒后自动填入，快把光标放到答题框里"
-        if opts["show_window"]:
-            # 等填完再弹解析窗口，避免窗口抢走焦点。
-            _schedule(
-                delay * 1000 + 800,
-                lambda: _show_result_later(api, text, answer, token),
+        if targets:
+            token = _schedule_multi_fill(
+                api,
+                targets,
+                opts["fill_enter"],
+                delay,
+                dialog=(text, answer) if opts["show_window"] else None,
             )
+            say += f"。{delay} 秒后按页面上的位置填入 {len(targets)} 处"
+            if opts["show_window"]:
+                # 正常情况由 _fill_next 填完后弹窗；这里兜一层，防止中途被打断。
+                _schedule(
+                    delay * 1000 + 900 + 520 * len(targets),
+                    lambda: _show_result_later(api, text, answer, token),
+                )
+        else:
+            fill_text, action = _fill_payload(answer, opts["fill_mode"])
+            token = _schedule_fill(api, fill_text, action, opts["fill_enter"], delay)
+            say += f"。{delay} 秒后自动填入，快把光标放到答题框里"
+            if opts["show_window"]:
+                # 等填完再弹解析窗口，避免窗口抢走焦点。
+                _schedule(
+                    delay * 1000 + 800,
+                    lambda: _show_result_later(api, text, answer, token),
+                )
     elif opts["show_window"]:
         if _show_result(api, text, answer):
             say += "。完整解析我放在窗口里了。"
@@ -814,6 +1480,16 @@ def _section(text: str, name: str) -> str:
     if not match:
         return ""
     return " ".join(match.group(1).split())
+
+
+def _raw_section(text: str, name: str) -> str:
+    """取某一节的原始多行内容，保留换行。"""
+    match = re.search(
+        rf"【\s*{re.escape(name)}\s*】[ \t]*\r?\n?(.*?)(?=\r?\n\s*【|\Z)", text, re.S
+    )
+    if not match:
+        return ""
+    return match.group(1).strip()
 
 
 def _first_line(text: str) -> str:
@@ -906,6 +1582,8 @@ def _forget_window(window) -> None:
 def _show_result_later(api, text: str, answer: str, token: int) -> None:
     if int(_state.get("fill") or 0) != token or not _state["active"]:
         return
+    if _state.get("window") is not None:
+        return
     _show_result(api, text, answer)
 
 
@@ -914,12 +1592,15 @@ def _show_result(api, text: str, answer: str = "") -> bool:
         return False
     _drop_window()
     supported = _user32() is not None
+    fields = _state.get("fields") or []
+    count = len(_fill_targets(text, fields)) if (supported and fields) else 0
     try:
         window = QuizResultDialog(
             text,
             on_again=lambda: _begin(api, "manual"),
             on_fill=(lambda: _manual_fill(api, answer)) if answer else None,
             fill_supported=supported,
+            fill_count=count,
         )
     except Exception as exc:
         api.log(f"解析窗口打开失败：{str(exc)[:160]}")
@@ -945,6 +1626,7 @@ class QuizResultDialog(QDialog):
         on_again=None,
         on_fill=None,
         fill_supported: bool = False,
+        fill_count: int = 0,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -978,10 +1660,19 @@ class QuizResultDialog(QDialog):
         row = QHBoxLayout()
         row.setSpacing(8)
         self.again_btn = QPushButton("再答一题")
-        self.fill_btn = QPushButton("填入答案" if fill_supported else "填入答案（仅 Windows）")
+        if not fill_supported:
+            label = "填入答案（仅 Windows）"
+        elif fill_count:
+            label = f"填入 {fill_count} 处"
+        else:
+            label = "填入答案"
+        self.fill_btn = QPushButton(label)
         self.fill_btn.setEnabled(bool(fill_supported and callable(on_fill)))
         if fill_supported:
-            self.fill_btn.setToolTip("窗口会先隐藏并倒计时，把光标放到答题框里就会自动填入")
+            if fill_count:
+                self.fill_btn.setToolTip("会按刚才扫描到的输入框位置逐个点击并粘贴")
+            else:
+                self.fill_btn.setToolTip("窗口会先隐藏并倒计时，把光标放到答题框里就会自动填入")
         self.copy_btn = QPushButton("复制解析")
         close_btn = QPushButton("关闭")
         close_btn.setObjectName("quiz_primary")
@@ -1033,8 +1724,8 @@ class QuizSettingsDialog(QDialog):
         super().__init__(parent)
         self._api = api
         self.setWindowTitle("做题助手 · 设置")
-        self.setMinimumSize(580, 600)
-        self.resize(640, 660)
+        self.setMinimumSize(580, 640)
+        self.resize(640, 700)
         self.setStyleSheet(DARK_QSS)
 
         opts = _options(api)
@@ -1049,7 +1740,9 @@ class QuizSettingsDialog(QDialog):
         desc = QLabel(
             "截图只在本机压缩后交给当前配置的 AI，不会写进磁盘。"
             "按「识别屏幕上的题目」前，先把题目窗口切到最前面。"
-            "自动填入通过 Windows 键盘模拟完成，只在本机执行。"
+            "自动填入通过 Windows 鼠标/键盘模拟完成，只在本机执行。"
+            "自动定位会先用系统接口读取页面上的输入框和标签，"
+            "把位置一并交给 AI 决定每个框填什么，不会上传页面结构以外的东西。"
         )
         desc.setObjectName("quiz_muted")
         desc.setWordWrap(True)
@@ -1089,6 +1782,14 @@ class QuizSettingsDialog(QDialog):
         self.auto_fill_check = QCheckBox("答完后自动填入答案（Windows）")
         self.auto_fill_check.setChecked(opts["auto_fill"])
         layout.addWidget(self.auto_fill_check)
+
+        self.auto_target_check = QCheckBox("自动定位页面上的答题框，逐个填入")
+        self.auto_target_check.setChecked(opts["auto_target"])
+        self.auto_target_check.setToolTip(
+            "扫描当前页面里的输入框和旁边的标签，由 AI 判断每个位置填什么；"
+            "扫描不到时退回剪贴板方式"
+        )
+        layout.addWidget(self.auto_target_check)
 
         fill_row = QHBoxLayout()
         fill_row.setSpacing(8)
@@ -1163,6 +1864,7 @@ class QuizSettingsDialog(QDialog):
             "show_window": self.window_check.isChecked(),
             "poke_trigger": self.poke_check.isChecked(),
             "auto_fill": self.auto_fill_check.isChecked(),
+            "auto_target": self.auto_target_check.isChecked(),
             "fill_mode": self.fill_mode_combo.currentData(),
             "fill_delay": int(self.fill_delay_spin.value()),
             "fill_enter": self.fill_enter_check.isChecked(),
