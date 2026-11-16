@@ -420,6 +420,42 @@ class QuizHelperTests(unittest.TestCase):
         self.assertEqual(pasted, [])
         self.assertTrue(any("剪贴板" in text for text in api.said))
 
+    def test_chat_trigger_with_unchanged_focus_refuses_fill(self) -> None:
+        pasted = self._enable_fake_input()
+        self.module._foreground_hwnd = lambda: 4321
+        api = FakeAPI(
+            {
+                "show_window": False,
+                "auto_fill": True,
+                "fill_delay": 1,
+            }
+        )
+        self.module.setup(api)
+        self.trigger(api)
+        api.callback("【题目】1 + 1 = ?\n【答案】2\n【解析】略", None)
+        self.fire(1000)
+
+        self.assertEqual(pasted, [])
+        self.assertTrue(any("剪贴板" in text for text in api.said))
+
+    def test_menu_trigger_does_not_require_focus_change(self) -> None:
+        pasted = self._enable_fake_input()
+        self.module._foreground_hwnd = lambda: 4321
+        api = FakeAPI(
+            {
+                "show_window": False,
+                "auto_fill": True,
+                "fill_delay": 1,
+            }
+        )
+        self.module.setup(api)
+        api.menu_items[0][1]()
+        self.fire(300)
+        api.callback("【题目】1 + 1 = ?\n【答案】2\n【解析】略", None)
+        self.fire(1000)
+
+        self.assertEqual(pasted, ["paste"])
+
     def test_teardown_cancels_pending_fill(self) -> None:
         pasted = self._enable_fake_input()
         api = FakeAPI(

@@ -131,6 +131,7 @@ _state: dict[str, Any] = {
     "frame": None,
     "window": None,
     "trigger_hwnd": 0,
+    "trigger_source": "",
     "fill": 0,
 }
 
@@ -210,6 +211,7 @@ def setup(api) -> None:
             "frame": None,
             "window": None,
             "trigger_hwnd": 0,
+            "trigger_source": "",
             "fill": 0,
         }
     )
@@ -257,6 +259,7 @@ def teardown() -> None:
     _state["seq"] = int(_state.get("seq") or 0) + 1
     _state["stage"] = ""
     _state["ocr_failed"] = False
+    _state["trigger_source"] = ""
     _cancel_fill()
 
     task = _state.get("ocr")
@@ -316,7 +319,9 @@ def _begin(api, source: str, restore=None) -> None:
 
     _cancel_fill()
 
-    # 记下触发时最前面的窗口；填答案时如果还是它，说明主人没切到答题框。
+    # 聊天气泡/输入框触发时，焦点原来就在聊天窗口；填答案时如果还停在那里，
+# 说明主人没切到答题框，粘贴进去只会污染输入框。菜单和戳一戳不做这个限制。
+    _state["trigger_source"] = str(source)
     _state["trigger_hwnd"] = _foreground_hwnd()
 
     # 先占住忙碌状态，避免 300ms 延迟里被第二个触发词重复截屏。
@@ -496,6 +501,9 @@ def _foreground_hwnd() -> int:
 
 
 def _foreground_unchanged() -> bool:
+    """聊天触发时，焦点若一直没离开聊天窗口就拒绝填入。"""
+    if _state.get("trigger_source") != "chat":
+        return False
     trigger = int(_state.get("trigger_hwnd") or 0)
     if not trigger:
         return False
