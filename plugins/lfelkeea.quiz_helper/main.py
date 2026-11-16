@@ -85,11 +85,13 @@ SYSTEM_PROMPT = (
 
 FILL_RULE = (
     "5. 用户消息里可能附带【可填写位置】，那是系统从页面上扫到的输入框，按从上到下编号。"
-    "需要在多个框里分别作答时，在【解析】之后再输出一节：\n"
+    "这种情况下必须把【填写】写在【解析】前面，格式是：\n"
     "【填写】\n"
-    "编号=该位置要填的简短内容\n"
-    "每个位置一行，只写这个位置需要的内容，不要带编号、题目或解释；"
-    "按题意把答案分配到最合适的位置，没有合适位置就整节省略。\n"
+    "编号=该位置要填的内容\n"
+    "每个空着的位置都要给一行，一行一个位置，不要漏；已经有内容的位置不要重写。\n"
+    "内容用页面语言作答（英文表格就写英文），是完整的一句话，"
+    "不要写中文说明、不要写「见上」「同上」「按表格填写」这类话、不要用省略号。\n"
+    "这一节的篇幅最重要；后面的【解析】最多写 60 字，写不下就省略。\n"
 )
 
 DETAILS = {
@@ -193,6 +195,7 @@ _state: dict[str, Any] = {
     "fields_done": True,
     "fill_dialog": None,
     "fill_text": "",
+    "retry_token": 0,
 }
 
 
@@ -281,6 +284,8 @@ def setup(api) -> None:
             "fields_error": "",
             "fields_done": True,
             "fill_dialog": None,
+            "fill_text": "",
+            "retry_token": 0,
         }
     )
 
@@ -1048,12 +1053,25 @@ def _fill_payload(answer: str, mode: str) -> tuple[str, str]:
     return text, "paste"
 
 
-def _fields_block(fields: list[dict[str, Any]]) -> str:
-    """把扫描到的输入框编号写给 AI，让它决定每个位置填什么。"""
+def _fields_block(
+    fields: list[dict[str, Any]],
+    only: list[int] | None = None,
+) -> str:
+    """把扫描到的输入框编号写给 AI，让它决定每个位置填什么。
+
+    only 是要列出的 1 起始编号；补填时只列还没填的位置。
+    """
     if not fields:
         return ""
-    lines = [f"【可填写位置】当前页面有 {len(fields)} 个可输入的框，按从上到下编号："]
-    for index, field in enumerate(fields, 1):
+    targets = [
+        (index, field)
+        for index, field in enumerate(fields, 1)
+        if only is None or index in only
+    ]
+    if not targets:
+        return ""
+    lines = [f"【可填写位置】当前页面共 {len(fields)} 个可输入的框，以下是需要处理的位置："]
+    for index, field in targets:
         label = str(field.get("label") or "").strip()
         value = str(field.get("value") or "").strip()
         if label and value:
@@ -1065,16 +1083,20 @@ def _fields_block(fields: list[dict[str, Any]]) -> str:
         else:
             desc = "（没有文字标签，按位置和上下文判断）"
         lines.append(f"{index}. {desc}")
-    if not any(str(field.get("label") or "").strip() for field in fields):
+    if not any(str(field.get("label") or "").strip() for _, field in targets):
         lines.append("注意：这些框没有可靠标签时，优先按行号、上下顺序和题目结构判断。")
     return "\n".join(lines)
 
 
 _FILL_LINE_RE = re.compile(r"^\s*(\d{1,2})\s*(?:[=＝:：]|[.、)）])\s*(.+?)\s*$")
+_TAIL_DOTS_RE = re.compile(r"(?:\s*(?:\.{3,}|…+|。{3,}))+\s*$")
+_FILL_SCAFFOLD_WORDS = ("见填写", "见上", "同上", "按表格", "此处", "填写内容", "无需填写")
 
 
-def _fill_map(text: str, fields: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
-    """解析回复里的【填写】节，返回 [(输入框, 内容)]，按页面顺序。"""
+def _fill_map_indexed(
+    text: str, fields: list[dict[str, Any]]
+) -> list[tuple[int, dict[str, Any], str]]:
+    """解析【填写】节，返回 [(1 起始编号, 输入框, 内容)]。"""
     if not fields:
         return []
     raw = _raw_section(text, "填写")
@@ -1096,18 +1118,77 @@ def _fill_map(text: str, fields: list[dict[str, Any]]) -> list[tuple[dict[str, A
         if not content:
             continue
         picked.setdefault(index, content[:600])
-    return [(fields[index - 1], content) for index, content in sorted(picked.items())]
+    return [(index, fields[index - 1], content) for index, content in sorted(picked.items())]
+
+
+def _fill_map(text: str, fields: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    """解析回复里的【填写】节，返回 [(输入框, 内容)]，按页面顺序。"""
+    return [(field, content) for _, field, content in _fill_map_indexed(text, fields)]
 
 
 def _fill_targets(text: str, fields: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
     if not fields or _user32() is None:
         return []
-    return _fill_map(text, fields)
+    open_fields = {id(field) for field in fields if _field_open(field)}
+    return [
+        (field, content)
+        for field, content in _fill_map(text, fields)
+        if id(field) in open_fields and not _fill_problem(field, content)
+    ]
+
+
+def _strip_tail_dots(text: str) -> str:
+    return _TAIL_DOTS_RE.sub("", str(text or "")).strip()
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in str(text or ""))
+
+
+def _has_latin(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", str(text or "")))
+
+
+def _fill_problem(field: dict[str, Any], content: str) -> str:
+    """判断一条填写内容能不能直接用；返回空串表示可用。"""
+    text = str(content or "").strip()
+    if not text:
+        return "empty"
+    if re.search(r"(?:\.{3,}|…+)\s*$", text):
+        return "incomplete"
+    if len(text) <= 2:
+        return "incomplete"
+    for word in _FILL_SCAFFOLD_WORDS:
+        if word in text and len(text) <= 14:
+            return "scaffold"
+    label = str(field.get("label") or "")
+    if _has_latin(label) and not _has_latin(text) and _has_cjk(text):
+        # 英文表头却给了纯中文说明，多半是模型在复述规则。
+        return "language"
+    return ""
+
+
+def _field_open(field: dict[str, Any]) -> bool:
+    """返回 True 表示这个位置需要填写；已有正常内容的位置不覆盖。"""
+    value = str(field.get("value") or "").strip()
+    if not value:
+        return True
+    if _TAIL_DOTS_RE.search(value):
+        # 上一次被截断的句子，值得重写一遍。
+        return True
+    if len(value) <= 14 and any(word in value for word in _FILL_SCAFFOLD_WORDS):
+        return True
+    label = str(field.get("label") or "")
+    if _has_latin(label) and not _has_latin(value):
+        # 英文表头里出现纯中文，基本是之前误填的说明文字。
+        return True
+    return False
 
 
 def _cancel_fill() -> None:
     _state["fill"] = int(_state.get("fill") or 0) + 1
     _state["fill_dialog"] = None
+    _state["retry_token"] = int(_state.get("retry_token") or 0) + 1
 
 
 def _schedule_fill(api, text: str, action: str, press_enter: bool, seconds: int) -> int:
@@ -1397,47 +1478,181 @@ def _on_reply(api, seq: int, reply, error, vision: bool) -> None:
     _bump_count(api)
     opts = _options(api)
     fields = _state.get("fields") or []
-    targets = _fill_targets(text, fields) if opts["auto_fill"] else []
     _state["fill_text"] = text
     say = f"答案：{answer}"
 
     if opts["auto_fill"] and _user32() is not None:
+        if fields:
+            _plan_fill(api, seq, text, answer, opts, fields, say)
+            return
+        fill_text, action = _fill_payload(answer, opts["fill_mode"])
         delay = int(opts["fill_delay"])
-        if targets:
-            token = _schedule_multi_fill(
-                api,
-                targets,
-                opts["fill_enter"],
-                delay,
-                dialog=(text, answer) if opts["show_window"] else None,
+        token = _schedule_fill(api, fill_text, action, opts["fill_enter"], delay)
+        say += f"。{delay} 秒后自动填入，快把光标放到答题框里"
+        if opts["show_window"]:
+            # 等填完再弹解析窗口，避免窗口抢走焦点。
+            _schedule(
+                delay * 1000 + 800,
+                lambda: _show_result_later(api, text, answer, token),
             )
-            say += f"。{delay} 秒后按页面上的位置填入 {len(targets)} 处"
-            if opts["show_window"]:
-                # 正常情况由 _fill_next 填完后弹窗；这里兜一层，防止中途被打断。
-                _schedule(
-                    delay * 1000 + 900 + 520 * len(targets),
-                    lambda: _show_result_later(api, text, answer, token),
-                )
-        else:
-            fill_text, action = _fill_payload(answer, opts["fill_mode"])
-            token = _schedule_fill(api, fill_text, action, opts["fill_enter"], delay)
-            say += f"。{delay} 秒后自动填入，快把光标放到答题框里"
-            if opts["show_window"]:
-                # 等填完再弹解析窗口，避免窗口抢走焦点。
-                _schedule(
-                    delay * 1000 + 800,
-                    lambda: _show_result_later(api, text, answer, token),
-                )
     elif opts["show_window"]:
         if _show_result(api, text, answer):
             say += "。完整解析我放在窗口里了。"
 
-    api.say(say, max(10000, int(opts["fill_delay"]) * 1000 + 3000))
+    _finish_answer(api, say, opts)
+
+
+def _finish_answer(api, message: str, opts: dict[str, Any]) -> None:
+    api.say(message, max(10000, int(opts["fill_delay"]) * 1000 + 3000))
     try:
         api.action("nod")
     except Exception:
         pass
     _finish(api, None)
+
+
+def _field_position(fields: list[dict[str, Any]], field: dict[str, Any]) -> int:
+    for position, item in enumerate(fields, 1):
+        if item is field:
+            return position
+    return len(fields) + 1
+
+
+def _plan_fill(api, seq, text, answer, opts, fields, say) -> None:
+    """页面里有输入框时：只填空着的位置，内容不合格就补问一次。"""
+    empty = [i for i, f in enumerate(fields, 1) if _field_open(f)]
+    filled = [i for i, f in enumerate(fields, 1) if not _field_open(f)]
+    targets = _fill_targets(text, fields)
+    covered = {id(field) for field, _ in targets}
+    missing = [i for i in empty if id(fields[i - 1]) not in covered]
+    if missing:
+        _retry_fills(api, seq, text, answer, opts, fields, targets, missing, filled, say)
+        return
+    _apply_fill_plan(api, text, answer, opts, fields, targets, [], filled, say)
+
+
+def _retry_fills(
+    api,
+    seq,
+    text,
+    answer,
+    opts,
+    fields,
+    targets,
+    missing,
+    filled,
+    say,
+) -> None:
+    """第一轮回复被截断或漏了位置时，只针对缺的位置再问一次。"""
+    block = _fields_block(fields, only=missing)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是表格填写助手。只输出【填写】一节，每行一个「编号=内容」，"
+                "不要输出任何其他内容。内容用页面语言写完整的短句，"
+                "不要用省略号，不要写中文说明。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"页面内容：\n{text[:2500]}\n\n{block}\n\n"
+                "只补全上面列出的位置，每个位置一行。"
+            ),
+        },
+    ]
+
+    token = int(_state.get("retry_token") or 0) + 1
+    _state["retry_token"] = token
+    _state["stage"] = "retry"
+
+    def callback(reply, error) -> None:
+        _on_retry_reply(
+            api, seq, token, reply, error, text, answer, opts, fields, targets, missing, filled, say
+        )
+
+    def timeout() -> None:
+        if int(_state.get("retry_token") or 0) != token:
+            return
+        _state["retry_token"] = token + 1
+        _apply_fill_plan(
+            api, text, answer, opts, fields, targets, missing, filled, say + "。补填请求超时了"
+        )
+
+    try:
+        api.chat(messages, callback)
+    except Exception:
+        _apply_fill_plan(api, text, answer, opts, fields, targets, missing, filled, say)
+        return
+    _schedule(26000, timeout)
+
+
+def _on_retry_reply(
+    api, seq, token, reply, error, text, answer, opts, fields, targets, missing, filled, say
+) -> None:
+    if int(_state.get("retry_token") or 0) != token or not _alive(seq):
+        return
+    _state["retry_token"] = token + 1
+
+    merged = list(targets)
+    seen = {id(field) for field, _ in merged}
+    if not error:
+        for index, field, content in _fill_map_indexed(_clean_reply(reply), fields):
+            if index not in missing or id(field) in seen:
+                continue
+            problem = _fill_problem(field, content)
+            if problem == "incomplete":
+                cleaned = _strip_tail_dots(content)
+                if len(cleaned) > 2:
+                    merged.append((field, cleaned))
+                    seen.add(id(field))
+                continue
+            if problem:
+                continue
+            merged.append((field, content))
+            seen.add(id(field))
+
+    merged.sort(key=lambda pair: _field_position(fields, pair[0]))
+    remaining = [i for i in missing if id(fields[i - 1]) not in seen]
+    _apply_fill_plan(api, text, answer, opts, fields, merged, remaining, filled, say)
+
+
+def _apply_fill_plan(
+    api, text, answer, opts, fields, targets, missing, filled, say
+) -> None:
+    delay = int(opts["fill_delay"])
+    if targets:
+        token = _schedule_multi_fill(
+            api,
+            targets,
+            opts["fill_enter"],
+            delay,
+            dialog=(text, answer) if opts["show_window"] else None,
+        )
+        message = f"{say}。{delay} 秒后填入 {len(targets)} 处"
+        if missing:
+            message += f"，第 {'、'.join(str(i) for i in missing)} 处没拿到可用内容"
+        if filled:
+            message += f"，第 {'、'.join(str(i) for i in filled)} 处已有内容，跳过"
+        if opts["show_window"]:
+            # 正常情况由 _fill_next 填完后弹窗；这里兜一层，防止中途被打断。
+            _schedule(
+                delay * 1000 + 900 + 520 * len(targets),
+                lambda: _show_result_later(api, text, answer, token),
+            )
+        _finish_answer(api, message, opts)
+        return
+
+    if missing:
+        # 没有可用的逐格内容时不能往焦点里盲粘，否则会把中文说明填进页面。
+        _set_clipboard(answer)
+        message = f"{say}。没拿到每个位置该填的内容，答案已复制到剪贴板，请手动粘贴"
+    else:
+        message = f"{say}。这几处都已经有内容了，没有需要补的位置"
+    if opts["show_window"]:
+        _show_result(api, text, answer)
+    _finish_answer(api, message, opts)
 
 
 def _looks_like_rejection(error: str) -> bool:

@@ -571,6 +571,110 @@ class QuizHelperTests(unittest.TestCase):
         self.assertIn(("restore", (10, 10)), calls)
         self.assertTrue(any("填了 2 处" in text for text in api.said))
 
+    def _stub_multi_fill(self) -> list:
+        calls: list = []
+        self.module._user32 = lambda: object()
+        self.module._focus_window = lambda hwnd: calls.append(("focus", hwnd))
+        self.module._click_at = lambda x, y: calls.append(("click", int(x), int(y))) or True
+        self.module._select_all = lambda: calls.append(("select_all",))
+        self.module._set_clipboard = lambda text: calls.append(("copy", text)) or True
+        self.module._paste_clipboard = lambda: calls.append(("paste",))
+        self.module._cursor_pos = lambda: (10, 10)
+        self.module._move_cursor = lambda position: calls.append(("restore", position))
+        self.module._foreground_hwnd = lambda: 777
+        self.module._window_under = lambda x, y: 777
+        self.module._window_info = lambda hwnd: {
+            "hwnd": hwnd,
+            "x": 0,
+            "y": 0,
+            "w": 1200,
+            "h": 900,
+            "title": "quiz",
+            "class": "Chrome_WidgetWin_1",
+        }
+        return calls
+
+    def _prepare_fields(self, api: FakeAPI, fields: list[dict]) -> None:
+        self.module.setup(api)
+        self.trigger(api)
+        self.module._state["fields"] = fields
+        self.module._state["fields_hwnd"] = 777
+        self.module._state["fields_rect"] = (0, 0, 1200, 900)
+        self.module._state["fields_done"] = True
+
+    def test_fill_problem_rejects_ellipsis_and_scaffold(self) -> None:
+        field = {"label": "Row one", "value": ""}
+        self.assertEqual(self.module._fill_problem(field, "Good vocabulary"), "")
+        self.assertEqual(
+            self.module._fill_problem(field, "Limited vocabulary and monotonous sente......"),
+            "incomplete",
+        )
+        self.assertEqual(self.module._fill_problem(field, "按表格四行分别填写"), "scaffold")
+        self.assertEqual(self.module._fill_problem(field, "甲"), "incomplete")
+        self.assertEqual(self.module._fill_problem(field, "可以"), "incomplete")
+        self.assertEqual(
+            self.module._fill_problem({"label": "第一行", "value": ""}, "词汇量还可以"), ""
+        )
+
+    def test_fields_block_only_lists_missing_positions(self) -> None:
+        block = self.module._fields_block(self._fields(), only=[2])
+        self.assertIn("2. Row two", block)
+        self.assertNotIn("Row one", block)
+
+    def test_fill_plan_skips_fields_with_existing_value(self) -> None:
+        calls = self._stub_multi_fill()
+        fields = self._fields()
+        fields[1]["value"] = "Old answer"
+        api = FakeAPI({"show_window": False, "auto_fill": True, "fill_delay": 1})
+        self._prepare_fields(api, fields)
+        api.callback(
+            "【题目】表格\n【答案】见填写\n【解析】略\n"
+            "【填写】\n1=First answer\n2=Second answer",
+            None,
+        )
+
+        self.assertTrue(any("第 2 处已有内容，跳过" in text for text in api.said))
+        self.fire(1000)
+        self.assertIn(("copy", "First answer"), calls)
+        self.assertNotIn(("click", 150, 315), calls)
+
+    def test_fill_plan_retries_truncated_sentence(self) -> None:
+        calls = self._stub_multi_fill()
+        api = FakeAPI({"show_window": False, "auto_fill": True, "fill_delay": 1})
+        self._prepare_fields(api, self._fields())
+        api.callback(
+            "【题目】表格\n【答案】见填写\n【解析】略\n"
+            "【填写】\n1=First answer\n2=Second answer is cut off...",
+            None,
+        )
+
+        self.assertEqual(len(api.chats), 2)
+        self.assertIn("2. Row two", api.chats[1][1]["content"])
+        self.assertNotIn("1. Row one", api.chats[1][1]["content"])
+        api.callback("【填写】\n2=Second answer is complete.", None)
+
+        self.assertTrue(any("填入 2 处" in text for text in api.said))
+        self.fire(1000)
+        self.assertIn(("copy", "First answer"), calls)
+        self.fire(450)
+        self.assertIn(("copy", "Second answer is complete."), calls)
+
+    def test_fill_without_valid_mapping_never_pastes_into_focus(self) -> None:
+        calls = self._stub_multi_fill()
+        pasted: list = []
+        self.module._paste_clipboard = lambda: pasted.append("paste")
+        api = FakeAPI({"show_window": False, "auto_fill": True, "fill_delay": 1})
+        self._prepare_fields(api, self._fields())
+        api.callback(
+            "【题目】表格\n【答案】2\n【解析】略\n【填写】\n1=按表格填写\n2=见上",
+            None,
+        )
+        api.callback("【填写】\n1=同上\n2=见上", None)
+
+        self.assertEqual(pasted, [])
+        self.assertIn(("copy", "2"), calls)
+        self.assertTrue(any("剪贴板" in text for text in api.said))
+
     def test_auto_fill_aborts_when_window_is_covered(self) -> None:
         calls: list = []
         self.module._user32 = lambda: object()
@@ -595,7 +699,11 @@ class QuizHelperTests(unittest.TestCase):
         self.module._state["fields"] = self._fields()
         self.module._state["fields_hwnd"] = 777
         self.module._state["fields_rect"] = (0, 0, 1200, 900)
-        api.callback("【题目】表格\n【答案】见填写\n【解析】略\n【填写】\n1=甲", None)
+        api.callback(
+            "【题目】表格\n【答案】见填写\n【解析】略\n"
+            "【填写】\n1=First answer\n2=Second answer",
+            None,
+        )
 
         self.fire(1000)
         self.assertEqual(calls, [])
@@ -621,7 +729,11 @@ class QuizHelperTests(unittest.TestCase):
         self.module._state["fields"] = self._fields()
         self.module._state["fields_hwnd"] = 777
         self.module._state["fields_rect"] = (0, 0, 1200, 900)
-        api.callback("【题目】表格\n【答案】见填写\n【解析】略\n【填写】\n1=甲", None)
+        api.callback(
+            "【题目】表格\n【答案】见填写\n【解析】略\n"
+            "【填写】\n1=First answer\n2=Second answer",
+            None,
+        )
 
         self.fire(1000)
         self.assertEqual(calls, [])
