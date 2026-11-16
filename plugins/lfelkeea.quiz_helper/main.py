@@ -1033,8 +1033,8 @@ class QuizSettingsDialog(QDialog):
         super().__init__(parent)
         self._api = api
         self.setWindowTitle("做题助手 · 设置")
-        self.setMinimumSize(580, 540)
-        self.resize(640, 590)
+        self.setMinimumSize(580, 600)
+        self.resize(640, 660)
         self.setStyleSheet(DARK_QSS)
 
         opts = _options(api)

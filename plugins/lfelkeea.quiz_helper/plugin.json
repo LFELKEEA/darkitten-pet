@@ -1,7 +1,7 @@
 {
   "id": "lfelkeea.quiz_helper",
   "name": "做题助手",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "api_version": 1,
   "entry": "main.py",
   "description": "截取当前屏幕，识别题目并让 AI 给出答案与解析；支持 Windows OCR 和图片理解，右键菜单可直接触发，答完可自动填入答题框。",
