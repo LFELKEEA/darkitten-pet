@@ -36,6 +36,7 @@ class PetApp(QObject):
         self.update_dialog: UpdateDialog | None = None
         self.update_manager = UpdateManager(self)
         self.plugins = PluginManager(self.config, self.pet, self.conversation, self)
+        self.pet.set_menu_provider(self.plugins.menu_entries)
         self.screen = ScreenWatcher(
             self.config, self.pet, self.conversation, self.plugins, self
         )

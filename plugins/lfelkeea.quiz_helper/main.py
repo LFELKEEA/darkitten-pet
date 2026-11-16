@@ -204,7 +204,13 @@ def setup(api) -> None:
     register = getattr(api, "register_prompt_provider", None)
     if callable(register):
         register(context_provider)
-    api.log("做题助手已启动：聊天里说「做题」或到插件设置里手动识别屏幕题目")
+    add_menu = getattr(api, "add_menu_item", None)
+    if callable(add_menu):
+        try:
+            add_menu("识别屏幕上的题目", lambda: _begin(api, "menu"))
+        except Exception as exc:
+            api.log(f"注册右键菜单失败：{str(exc)[:120]}")
+    api.log("做题助手已启动：聊天里说「做题」、右键「识别屏幕上的题目」或到插件设置里手动识别")
 
 
 def teardown() -> None:

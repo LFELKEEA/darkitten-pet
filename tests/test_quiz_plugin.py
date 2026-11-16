@@ -66,10 +66,18 @@ class FakeAPI:
         self.callback = None
         self.frame = FakeFrame()
         self.prompt_provider = None
+        self.menu_items: list[tuple[str, object]] = []
 
     def register_prompt_provider(self, callback):
         self.prompt_provider = callback
         return callback
+
+    def add_menu_item(self, label, callback):
+        self.menu_items.append((label, callback))
+        return SimpleNamespace(label=label, callback=callback)
+
+    def remove_menu_item(self, item) -> None:
+        self.menu_items = [entry for entry in self.menu_items if entry[1] is not item.callback]
 
     def say(self, text: str, duration: int = 5000) -> None:
         self.said.append(text)
@@ -134,6 +142,17 @@ class QuizHelperTests(unittest.TestCase):
         self.assertIn("pet.poke", api.handlers)
         self.assertIn("screen.context", api.handlers)
         self.assertTrue(api.logs)
+
+    def test_setup_registers_context_menu_item(self) -> None:
+        api = FakeAPI()
+        self.module.setup(api)
+        self.assertEqual(len(api.menu_items), 1)
+        label, callback = api.menu_items[0]
+        self.assertEqual(label, "识别屏幕上的题目")
+        callback()
+        self.assertEqual(api.said[-1], "我看看屏幕上的题目。")
+        self.fire(300)
+        self.assertEqual(api.captures, 1)
 
     def test_trigger_captures_and_answers(self) -> None:
         api = FakeAPI({"show_window": False})

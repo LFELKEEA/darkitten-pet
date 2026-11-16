@@ -101,6 +101,7 @@ class PetWindow(QWidget):
         self._gaze_tick = 0
         self._line_override = None
         self._line_override_owner = ""
+        self.menu_provider = None
         self._action_menu_groups: list[dict] = []
         self._action_menu_owner = ""
         self._action_name = ""
@@ -904,6 +905,36 @@ class PetWindow(QWidget):
         self._apply_metrics()
         self.update()
 
+    def set_menu_provider(self, provider) -> None:
+        """由插件管理器提供右键菜单项；返回对象需带 label 与 callback。"""
+        self.menu_provider = provider if callable(provider) else None
+
+    def _add_plugin_menu_entries(self, menu) -> dict:
+        actions: dict[object, object] = {}
+        provider = getattr(self, "menu_provider", None)
+        if not callable(provider):
+            return actions
+        try:
+            entries = provider() or []
+        except Exception:
+            return actions
+        first = None
+        for entry in entries:
+            label = str(getattr(entry, "label", "") or "").strip()
+            callback = getattr(entry, "callback", None)
+            if not label or not callable(callback):
+                continue
+            action = menu.addAction(label)
+            if first is None:
+                first = action
+            actions[action] = callback
+        if first is not None:
+            try:
+                menu.insertSeparator(first)
+            except Exception:
+                pass
+        return actions
+
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         self._pending_click_token += 1
         self._cancel_voice_hold(notify=True)
@@ -915,6 +946,7 @@ class PetWindow(QWidget):
         pat_action = menu.addAction("摸摸头")
         chat_action = menu.addAction("和 LFELKEEA 聊天")
         observe_action = menu.addAction("看看屏幕，说句话")
+        plugin_actions = self._add_plugin_menu_entries(menu)
         voice_help_action = menu.addAction("长按我：语音对话")
         menu.addSeparator()
 
@@ -959,6 +991,8 @@ class PetWindow(QWidget):
             self.chat_requested.emit()
         elif chosen is observe_action:
             self.observe_screen_requested.emit()
+        elif chosen in plugin_actions:
+            plugin_actions[chosen]()
         elif chosen is plugins_action:
             self.plugins_requested.emit()
         elif chosen is update_action:

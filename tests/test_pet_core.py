@@ -223,6 +223,57 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.pet.action_menu_owner, "demo.menu")
         self.assertEqual(self.pet.action_menu[0]["title"], "常用")
 
+    def test_plugin_can_add_context_menu_item(self) -> None:
+        write_plugin(
+            self.plugins_root,
+            "demo.tools",
+            "def setup(api):\n"
+            "    api.add_menu_item('识别屏幕上的题目', lambda: api.say('menu'))\n",
+            permissions=["pet.say", "pet.menu"],
+        )
+        self.manager.discover()
+        self.assertTrue(self.manager.load_plugin("demo.tools"))
+        entries = self.manager.menu_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].label, "识别屏幕上的题目")
+        self.assertEqual(entries[0].plugin_id, "demo.tools")
+        entries[0].callback()
+        self.assertEqual(self.pet.said, ["menu"])
+
+        self.manager.set_enabled("demo.tools", False)
+        self.assertEqual(self.manager.menu_entries(), [])
+
+    def test_context_menu_requires_permission(self) -> None:
+        write_plugin(
+            self.plugins_root,
+            "demo.nomenu",
+            "def setup(api):\n"
+            "    api.add_menu_item('不该出现', lambda: None)\n",
+            permissions=[],
+        )
+        self.manager.discover()
+        self.assertFalse(self.manager.load_plugin("demo.nomenu"))
+        self.assertIn("pet.menu", self.manager.get("demo.nomenu").error)
+        self.assertEqual(self.manager.menu_entries(), [])
+
+    def test_context_menu_callback_errors_are_isolated(self) -> None:
+        write_plugin(
+            self.plugins_root,
+            "demo.badmenu",
+            "def setup(api):\n"
+            "    api.add_menu_item('会出错', explode)\n"
+            "def explode():\n"
+            "    raise RuntimeError('boom')\n",
+            permissions=["pet.menu"],
+        )
+        self.manager.discover()
+        self.assertTrue(self.manager.load_plugin("demo.badmenu"))
+        entries = self.manager.menu_entries()
+        self.assertEqual(len(entries), 1)
+        entries[0].callback()
+        info = self.manager.get("demo.badmenu")
+        self.assertIn("boom", info.error)
+
     def test_action_menu_needs_permission(self) -> None:
         write_plugin(
             self.plugins_root,
@@ -359,6 +410,68 @@ class ActionMenuTests(unittest.TestCase):
         )
         self.assertEqual(len(window._action_menu_groups), 1)
         self.assertEqual(window._action_menu_groups[0]["title"], "常用")
+
+
+class PluginMenuEntryTests(unittest.TestCase):
+    """插件注册的右键菜单项要插在「看看屏幕」下面，并带一条分隔线。"""
+
+    def _bare_window(self):
+        from pet import PetWindow
+
+        return PetWindow.__new__(PetWindow)
+
+    def test_entries_are_inserted_with_separator(self) -> None:
+        from PySide6.QtWidgets import QMenu
+
+        window = self._bare_window()
+        calls = []
+
+        class Entry:
+            label = "识别屏幕上的题目"
+            callback = staticmethod(lambda: calls.append("quiz"))
+
+        window.set_menu_provider(lambda: [Entry()])
+        menu = QMenu()
+        actions = window._add_plugin_menu_entries(menu)
+
+        self.assertEqual(len(actions), 1)
+        labels = [action.text() for action in menu.actions()]
+        self.assertTrue(menu.actions()[0].isSeparator())
+        self.assertEqual(labels[1], "识别屏幕上的题目")
+        next(iter(actions.values()))()
+        self.assertEqual(calls, ["quiz"])
+
+    def test_missing_or_broken_provider_is_ignored(self) -> None:
+        from PySide6.QtWidgets import QMenu
+
+        window = self._bare_window()
+        menu = QMenu()
+        self.assertEqual(window._add_plugin_menu_entries(menu), {})
+        self.assertEqual(menu.actions(), [])
+
+        def broken():
+            raise RuntimeError("no menu")
+
+        window.set_menu_provider(broken)
+        self.assertEqual(window._add_plugin_menu_entries(menu), {})
+        self.assertEqual(menu.actions(), [])
+
+    def test_invalid_entries_are_skipped(self) -> None:
+        from PySide6.QtWidgets import QMenu
+
+        class Bad:
+            label = "坏项"
+            callback = None
+
+        class NoTitle:
+            label = "  "
+            callback = staticmethod(lambda: None)
+
+        window = self._bare_window()
+        window.set_menu_provider(lambda: [Bad(), NoTitle()])
+        menu = QMenu()
+        self.assertEqual(window._add_plugin_menu_entries(menu), {})
+        self.assertEqual(menu.actions(), [])
 
 
 class AIClientTests(unittest.TestCase):

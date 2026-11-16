@@ -40,6 +40,7 @@ PERMISSION_LABELS = {
     "pet.action": "触发桌宠动作",
     "pet.model": "替换桌宠模型与模型动作",
     "pet.persona": "替换桌宠内置台词",
+    "pet.menu": "在右键菜单中加入入口",
     "ai.chat": "调用 AI 对话",
     "chat.context": "向聊天注入上下文",
     "screen.capture": "截取屏幕",
@@ -103,6 +104,24 @@ class LoadedPlugin:
     info: PluginInfo
     module: Any
     api: "PluginAPI"
+
+
+@dataclass
+class PluginMenuItem:
+    """插件注册到桌宠右键菜单的一项。"""
+
+    plugin_id: str
+    label: str
+    callback: Callable[[], Any]
+
+
+@dataclass
+class PluginMenuEntry:
+    """交给桌宠界面渲染的菜单项，回调已做异常隔离。"""
+
+    label: str
+    callback: Callable[[], Any]
+    plugin_id: str
 
 
 class _ChatBridge(QObject):
@@ -460,6 +479,29 @@ class PluginAPI(QObject):
         self._assert_main_thread()
         self.manager.unregister_prompt_provider(self.info.id, handle)
 
+    # ---------- 右键菜单 ----------
+
+    def add_menu_item(
+        self, label: str, callback: Callable[[], Any]
+    ) -> PluginMenuItem:
+        """在桌宠右键菜单里加一项，返回句柄；插件卸载时自动移除。
+
+        callback 在桌宠主线程执行，异常会被隔离并记录到插件日志。
+        """
+        self._require("pet.menu")
+        self._assert_main_thread()
+        if not callable(callback):
+            raise PluginError("add_menu_item 的 callback 必须可调用。")
+        text = " ".join(str(label or "").split())
+        if not text:
+            raise PluginError("add_menu_item 需要一个菜单标题。")
+        return self.manager.add_menu_item(self.info.id, text[:32], callback)
+
+    def remove_menu_item(self, item: PluginMenuItem) -> None:
+        self._require("pet.menu")
+        self._assert_main_thread()
+        self.manager.remove_menu_item(self.info.id, item)
+
     # ---------- 设置与存储 ----------
 
     @property
@@ -508,6 +550,10 @@ class PluginAPI(QObject):
             self.manager.unregister_prompt_provider(self.info.id)
         except Exception:
             pass
+        try:
+            self.manager.clear_menu_items(self.info.id)
+        except Exception:
+            pass
         if self._model_api is not None:
             try:
                 self.manager.pet.unload_live2d(self.info.id)
@@ -554,6 +600,7 @@ class PluginManager(QObject):
         self._errors: dict[str, int] = {}
         self._ui_windows: dict[str, Any] = {}
         self._prompt_providers: dict[str, list[Callable[..., Any]]] = {}
+        self._menu_items: dict[str, list[PluginMenuItem]] = {}
         self._releases: dict[str, PluginRelease] = {}
         self._marketplace: dict[str, PluginRelease] = {}
         self._marketplace_loading = False
@@ -798,6 +845,7 @@ class PluginManager(QObject):
                 self.record_error(loaded.info, exc, "teardown")
         loaded.api.shutdown()
         self._prompt_providers.pop(plugin_id, None)
+        self._menu_items.pop(plugin_id, None)
         module_name = getattr(loaded.module, "__name__", "")
         if module_name in sys.modules:
             sys.modules.pop(module_name, None)
@@ -1290,6 +1338,66 @@ class PluginManager(QObject):
                 if text:
                     blocks.append(text)
         return "\n\n".join(blocks)
+
+    # ---------- 右键菜单 ----------
+
+    def add_menu_item(
+        self, plugin_id: str, label: str, callback: Callable[[], Any]
+    ) -> PluginMenuItem:
+        item = PluginMenuItem(plugin_id=str(plugin_id), label=str(label), callback=callback)
+        bucket = self._menu_items.setdefault(plugin_id, [])
+        if len(bucket) >= 8:
+            raise PluginError("每个插件最多注册 8 个右键菜单项。")
+        bucket.append(item)
+        self.changed.emit()
+        return item
+
+    def remove_menu_item(self, plugin_id: str, item: PluginMenuItem) -> None:
+        bucket = self._menu_items.get(plugin_id)
+        if not bucket:
+            return
+        remaining = [entry for entry in bucket if entry is not item]
+        if len(remaining) == len(bucket):
+            return
+        if remaining:
+            self._menu_items[plugin_id] = remaining
+        else:
+            self._menu_items.pop(plugin_id, None)
+        self.changed.emit()
+
+    def clear_menu_items(self, plugin_id: str) -> None:
+        if self._menu_items.pop(plugin_id, None) is not None:
+            self.changed.emit()
+
+    def menu_entries(self) -> list[PluginMenuEntry]:
+        entries: list[PluginMenuEntry] = []
+        for plugin_id, items in list(self._menu_items.items()):
+            if plugin_id not in self._loaded:
+                continue
+            for item in list(items):
+                entries.append(
+                    PluginMenuEntry(
+                        label=item.label,
+                        callback=self._menu_runner(plugin_id, item.label, item.callback),
+                        plugin_id=plugin_id,
+                    )
+                )
+        return entries
+
+    def _menu_runner(
+        self, plugin_id: str, label: str, callback: Callable[[], Any]
+    ) -> Callable[[], None]:
+        def run() -> None:
+            try:
+                callback()
+            except Exception as exc:
+                info = self._infos.get(plugin_id)
+                if info is not None:
+                    self.record_error(info, exc, f"右键菜单「{label}」")
+                else:
+                    self.log(plugin_id, f"右键菜单「{label}」异常：{self._short_error(exc)}")
+
+        return run
 
     # ---------- 设置 / 存储 ----------
 
