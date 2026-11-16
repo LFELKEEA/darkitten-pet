@@ -1,0 +1,21 @@
+{
+  "id": "lfelkeea.quiz_helper",
+  "name": "做题助手",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.py",
+  "description": "截取当前屏幕，识别题目并让 AI 给出答案与解析；支持 Windows OCR 文字识别和图片理解。",
+  "author": "LFELKEEA",
+  "permissions": ["pet.say", "pet.action", "ai.chat", "chat.context", "screen.capture", "events", "settings", "storage"],
+  "highlights": [
+    {"label": "触发", "value": "聊天里说「做题」"},
+    {"label": "识别", "value": "OCR / 图片理解"},
+    {"label": "输出", "value": "答案 + 解析窗口"}
+  ],
+  "settings": {
+    "trigger_words": "做题,答题,这题怎么做,拍题,看题",
+    "recognition": "auto",
+    "detail": "standard",
+    "show_window": true
+  }
+}

@@ -6,7 +6,7 @@
 
 - 下载安装包：[pet-v1.4.1](https://github.com/LFELKEEA/darkitten-launcher/releases/tag/pet-v1.4.1)
 - 插件库：[lfelkeea.github.io/darkitten-launcher/plugins.html](https://lfelkeea.github.io/darkitten-launcher/plugins.html)
-- 插件源码：[`plugins/`](plugins)（示例插件、专注守护、QQ 桥接）
+- 插件源码：[`plugins/`](plugins)（示例插件、专注守护、做题助手、QQ 桥接）
 
 ## 功能
 
