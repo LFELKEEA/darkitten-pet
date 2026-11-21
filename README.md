@@ -43,7 +43,7 @@
 ## 目录
 
 ```text
-desktop_pet/
+LFELKEEA/
 ├─ main.py                 # 入口，单实例
 ├─ app.py                  # 应用控制器，接线桌宠/聊天/语音/屏幕/插件
 ├─ pet.py                  # 桌宠窗口
@@ -65,7 +65,7 @@ desktop_pet/
 ├─ version.py              # 版本号常量
 ├─ version.json            # 打包进程序的版本标记，更新时用于校验
 ├─ assets/                 # 人物图、图标、OCR/语音脚本、本地模型
-├─ plugins/                # 内置示例插件（首次运行复制到 data/plugins）
+├─ plugins/                # 内置插件源码（首次运行复制到 data/plugins）
 ├─ docs/                   # 插件开发文档
 ├─ tests/                  # 单元测试与冒烟测试
 ├─ vendor/                 # Live2D 运行库（live2d-py、GLFW）
